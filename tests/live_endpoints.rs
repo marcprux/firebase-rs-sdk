@@ -878,11 +878,21 @@ async fn functions_callable_protocol_against_live_host() {
         let callable = functions
             .https_callable::<serde_json::Value, serde_json::Value>(name)
             .expect("callable reference");
-        let response = callable
+        match callable
             .call_async(&serde_json::json!({ "message": "hello from firebase-rs-sdk" }))
             .await
-            .unwrap_or_else(|err| panic!("callable {name} failed: {err}"));
-        eprintln!("callable {name} responded: {response}");
+        {
+            Ok(response) => eprintln!("callable {name} responded: {response}"),
+            Err(err) if err.code == FunctionsErrorCode::NotFound => skip(
+                "functions_callable_protocol_against_live_host",
+                &format!(
+                    "FIREBASE_TEST_CALLABLE names `{name}` but no such function is deployed in us-central1. \
+                     Deploy it or unset the variable / delete the secret."
+                ),
+                err.message(),
+            ),
+            Err(err) => panic!("callable {name} failed: {err}"),
+        }
     } else {
         eprintln!("functions: set FIREBASE_TEST_CALLABLE=<name> to also exercise a deployed callable");
     }
