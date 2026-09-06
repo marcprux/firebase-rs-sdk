@@ -217,6 +217,13 @@ impl RestClient {
 
     async fn request_failed(&self, request_name: &str, response: Response) -> InstallationsError {
         let status = response.status();
+        self.request_failed_inner(request_name, response)
+            .await
+            .with_server_code(status)
+    }
+
+    async fn request_failed_inner(&self, request_name: &str, response: Response) -> InstallationsError {
+        let status = response.status();
         match self.response_text(&response).await {
             Ok(body) => match serde_json::from_str::<super::ErrorResponse>(&body) {
                 Ok(parsed) => request_failed_err(format!(

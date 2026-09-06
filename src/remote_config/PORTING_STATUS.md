@@ -12,6 +12,7 @@ I’d put the Remote Config port around 25 % complete. We now mirror the JS SD
 
 
 ## Implemented
+- Fetch requests target the `firebase` namespace (`/v1/projects/{project}/namespaces/firebase:fetch`) as the JS SDK does; verified against the live backend by `tests/live_endpoints.rs`.
 
 - Component registration for `remote-config`, allowing `get_remote_config` to resolve instances through the shared
   component container (src/remote_config/api.rs, packages/remote-config/src/register.ts).

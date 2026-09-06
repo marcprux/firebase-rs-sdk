@@ -1,0 +1,54 @@
+name: live-tests
+
+# Exercises the real Firebase backends with the credentials stored in repository secrets.
+#
+# Required secret:
+#   FIREBASE_GOOGLE_SERVICES_JSON  - the full contents of the app's google-services.json
+#                                    (Firebase console > Project settings > Your apps > Download).
+# Optional secret:
+#   FIREBASE_TEST_CALLABLE         - name of a deployed callable function to invoke.
+#
+# Secrets are not exposed to pull requests from forks, so the job only runs on pushes to main,
+# on pull requests from branches of this repository, and on manual dispatch. When the secret is
+# absent the tests skip themselves (see tests/live_endpoints.rs); on main they are required.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"   # weekly, catches backend drift
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-tests-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  live:
+    # Fork PRs cannot read secrets; skip rather than fail.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FIREBASE_GOOGLE_SERVICES_JSON: ${{ secrets.FIREBASE_GOOGLE_SERVICES_JSON }}
+      FIREBASE_TEST_CALLABLE: ${{ secrets.FIREBASE_TEST_CALLABLE }}
+      # Fail loudly on main if the secret is missing; elsewhere the tests skip gracefully.
+      FIREBASE_LIVE_TESTS_REQUIRED: ${{ github.ref == 'refs/heads/main' && '1' || '0' }}
+      # Keep the installations cache out of the checkout.
+      FIREBASE_INSTALLATIONS_CACHE_DIR: ${{ runner.temp }}/firebase-installations
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run live endpoint tests
+        run: cargo test --test live_endpoints -- --ignored --nocapture --test-threads=2

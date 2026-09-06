@@ -124,3 +124,29 @@ The code you contribute MUST be licensed under Apache 2.0.
 ## Testing
 
 In the analytics module a unit test that exercises the dispatcher is skipped by default unless `FIREBASE_NETWORK_TESTS=1` is set.
+
+## Live endpoint tests
+
+`tests/live_endpoints.rs` exercises the real Firebase backends (Installations, Remote Config,
+Authentication, Firestore, Cloud Storage and callable Functions) through the public API. The tests
+are `#[ignore]`d so `cargo test` stays offline; run them with:
+
+```bash
+cargo test --test live_endpoints -- --ignored --nocapture
+```
+
+Credentials are never committed. Provide one of:
+
+- `google-services.json` at the crate root (or `FIREBASE_GOOGLE_SERVICES_FILE=/path`, or the raw
+  JSON in `FIREBASE_GOOGLE_SERVICES_JSON`, which is how CI injects the secret);
+- a `.env.firebase` dot file with `FIREBASE_API_KEY`, `FIREBASE_PROJECT_ID`, `FIREBASE_APP_ID`
+  (plus optional `FIREBASE_PROJECT_NUMBER`, `FIREBASE_STORAGE_BUCKET`, `FIREBASE_DATABASE_URL`,
+  `FIREBASE_TEST_CALLABLE`);
+- the same variables in the environment.
+
+Both files are gitignored. Products that are not enabled on the project (for example Firebase Auth
+not initialised or the Firestore API disabled) make the affected test print a `SKIP:` line with the
+console action needed and pass; the `live_project_probe` test prints a one-screen summary of what
+the credentials can reach. `.github/workflows/live-tests.yml` runs the suite on pushes to `main`,
+same-repository pull requests, a weekly schedule and manual dispatch using the
+`FIREBASE_GOOGLE_SERVICES_JSON` repository secret.

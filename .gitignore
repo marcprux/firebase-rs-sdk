@@ -25,3 +25,10 @@ target
 publish.bat
 
 
+
+# Live-test credentials (see tests/live_endpoints.rs). Never commit these.
+google-services.json
+GoogleService-Info.plist
+.env
+.env.*
+.firebase/

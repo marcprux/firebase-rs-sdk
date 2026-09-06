@@ -182,6 +182,13 @@ impl RestClient {
 
     async fn request_failed(&self, request_name: &str, response: Response) -> InstallationsError {
         let status = response.status();
+        self.request_failed_inner(request_name, response)
+            .await
+            .with_server_code(status.as_u16())
+    }
+
+    async fn request_failed_inner(&self, request_name: &str, response: Response) -> InstallationsError {
+        let status = response.status();
         let bytes = match response.bytes().await {
             Ok(bytes) => bytes,
             Err(err) => {

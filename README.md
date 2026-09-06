@@ -151,6 +151,16 @@ fn field_as_i64(data: &BTreeMap<String, FirestoreValue>, field: &str) -> Option<
 
 For further details, refer to the example [`./examples/firestore_select_documents.rs`](https://github.com/dgasparri/firebase-rs-sdk/blob/main/examples/firestore_select_documents.rs) or run `cargo run --example firestore_select_documents`.
 
+## Live endpoint tests
+
+Besides the offline unit tests, `tests/live_endpoints.rs` talks to the real Firebase services using
+credentials from a gitignored `google-services.json` or `.env.firebase` (see
+[`CONTRIBUTING.md`](https://github.com/dgasparri/firebase-rs-sdk/blob/main/CONTRIBUTING.md#live-endpoint-tests)):
+
+```bash
+cargo test --test live_endpoints -- --ignored --nocapture
+```
+
 ## Copyright
 
 This library is licensed under the Apache License, Version 2.0.

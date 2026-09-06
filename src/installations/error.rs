@@ -21,6 +21,7 @@ impl InstallationsErrorCode {
 pub struct InstallationsError {
     pub code: InstallationsErrorCode,
     message: String,
+    server_code: Option<u16>,
 }
 
 impl InstallationsError {
@@ -28,7 +29,22 @@ impl InstallationsError {
         Self {
             code,
             message: message.into(),
+            server_code: None,
         }
+    }
+
+    /// Attaches the HTTP status code returned by the Installations backend.
+    ///
+    /// Mirrors `customData.serverCode` on the JS `FirebaseError` so callers (and the SDK's own
+    /// token refresh logic) can distinguish "installation not found" from other failures.
+    pub fn with_server_code(mut self, status: u16) -> Self {
+        self.server_code = Some(status);
+        self
+    }
+
+    /// HTTP status code returned by the backend, when the error originated from a response.
+    pub fn server_code(&self) -> Option<u16> {
+        self.server_code
     }
 
     pub fn code_str(&self) -> &'static str {

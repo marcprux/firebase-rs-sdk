@@ -203,11 +203,24 @@ impl Installations {
 
         let fid = entry.fid.clone();
         let refresh_token = entry.refresh_token.clone();
-        let new_token = self
+        let new_token = match self
             .inner
             .rest_client
             .generate_auth_token(&self.inner.config, &fid, &refresh_token)
-            .await?;
+            .await
+        {
+            Ok(token) => token,
+            Err(err) if matches!(err.server_code(), Some(401) | Some(404)) => {
+                // The backend no longer recognises this installation (deleted server-side, or the
+                // registration has not propagated yet). The JS SDK drops the local entry so that the
+                // next call registers a fresh FID; we do the same and re-register immediately so the
+                // caller still receives a valid token.
+                self.forget_local_entry().await?;
+                let fresh = self.ensure_entry().await?;
+                return Ok(fresh.auth_token);
+            }
+            Err(err) => return Err(err),
+        };
 
         {
             let mut state = self.inner.state.lock().await;
@@ -390,6 +403,18 @@ impl Installations {
         if let Some(entry) = current {
             self.persist_entry(&entry).await?;
         }
+        Ok(())
+    }
+
+    /// Drops the cached and persisted installation entry without contacting the backend, so the
+    /// next `ensure_entry` registers a brand new FID. Mirrors `remove(appConfig)` in
+    /// `packages/installations/src/api/get-token.ts`.
+    async fn forget_local_entry(&self) -> InstallationsResult<()> {
+        self.inner.persistence.clear(self.inner.app.name()).await?;
+        let mut state = self.inner.state.lock().await;
+        state.entry = None;
+        state.loaded = true;
+        state.initializing = false;
         Ok(())
     }
 
@@ -804,6 +829,83 @@ mod tests {
             return;
         }
         assert_eq!(hits, 1);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_token_reregisters_when_backend_reports_not_found() {
+        let _env_guard = env_guard();
+        let Some(server) = try_start_server() else {
+            eprintln!("Skipping get_token_reregisters_when_backend_reports_not_found: unable to start mock server");
+            return;
+        };
+        // First registration hands out `stale-fid`; the backend then answers 404 for its token
+        // refresh (deleted server-side, or not yet propagated). The SDK must drop the entry and
+        // register again, receiving `fresh-fid` and its token.
+        let stale_refresh_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/projects/project/installations/stale-fid/authTokens:generate");
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "error": { "code": 404, "message": "Requested entity was not found.", "status": "NOT_FOUND" }
+                }));
+        });
+        let create_mock = server.mock(|when, then| {
+            when.method(POST).path("/projects/project/installations");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "fid": "fresh-fid",
+                    "refreshToken": "fresh-refresh",
+                    "authToken": { "token": "fresh-token", "expiresIn": "3600s" }
+                }));
+        });
+
+        let cache_dir = unique_cache_dir();
+        let persistence = FilePersistence::new(cache_dir.clone()).unwrap();
+        let settings = unique_settings();
+        let app_name = settings.name.clone().unwrap_or_else(|| "[DEFAULT]".to_string());
+        let stale = InstallationEntry {
+            fid: "stale-fid".into(),
+            refresh_token: "stale-refresh".into(),
+            auth_token: InstallationToken {
+                token: "stale-token".into(),
+                expires_at: SystemTime::now() + Duration::from_secs(600),
+            },
+        };
+        persistence
+            .write(&app_name, &stale.to_persisted().unwrap())
+            .await
+            .unwrap();
+
+        std::env::set_var("FIREBASE_INSTALLATIONS_API_URL", server.base_url());
+        std::env::set_var("FIREBASE_INSTALLATIONS_CACHE_DIR", &cache_dir);
+        let app = initialize_app(base_options(), Some(settings)).await.unwrap();
+        let installations = get_installations(Some(app.clone())).unwrap();
+        std::env::remove_var("FIREBASE_INSTALLATIONS_API_URL");
+        std::env::remove_var("FIREBASE_INSTALLATIONS_CACHE_DIR");
+
+        assert_eq!(installations.get_id().await.unwrap(), "stale-fid");
+        let token = installations.get_token(true).await.unwrap();
+
+        if stale_refresh_mock.hits() == 0 {
+            eprintln!(
+                "Skipping assertions in get_token_reregisters_when_backend_reports_not_found: \
+                 local HTTP requests appear to be blocked"
+            );
+            let _ = fs::remove_dir_all(cache_dir);
+            return;
+        }
+        assert_eq!(token.token, "fresh-token");
+        assert_eq!(create_mock.hits(), 1);
+        assert_eq!(installations.get_id().await.unwrap(), "fresh-fid");
+        let persisted = persistence
+            .read(&app_name)
+            .await
+            .unwrap()
+            .expect("fresh entry persisted");
+        assert_eq!(persisted.fid, "fresh-fid");
         let _ = fs::remove_dir_all(cache_dir);
     }
 

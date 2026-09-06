@@ -17,6 +17,7 @@ I’m reviewing the Rust and JS implementations to compare their feature coverag
 
 
 ## Implemented
+- `get_token` drops the local entry and re-registers when the backend answers 401/404 for `authTokens:generate` (JS `refreshAuthToken` behaviour); `InstallationsError::server_code()` exposes the HTTP status.
 - Component registration exposing `get_installations` with per-app caching (`src/installations/api.rs:146`).
 - App config extraction and validation mirroring the JS helper (`src/installations/config.rs:6`).
 - Async REST client with a native `reqwest` implementation and a WASM `fetch` backend behind the `wasm-web` feature (`src/installations/rest/native.rs:1`, `src/installations/rest/wasm.rs:1`).

@@ -448,7 +448,8 @@ fn build_fetch_client(app: &FirebaseApp) -> RemoteConfigResult<Arc<dyn RemoteCon
         .app_id
         .clone()
         .ok_or_else(|| internal_error("Remote Config requires appId in FirebaseOptions"))?;
-    let namespace = project_id.clone();
+    // Client fetches always target the `firebase` namespace (JS: `packages/remote-config/src/constants.ts`).
+    let namespace = String::from("firebase");
     let language_code = std::env::var("FIREBASE_REMOTE_CONFIG_LANGUAGE_CODE").unwrap_or_else(|_| "en-US".to_string());
     let sdk_version = format!("w:{}", crate::app::SDK_VERSION);
     let base_url =

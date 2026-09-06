@@ -2548,12 +2548,17 @@ fn auth_factory(
 /// Retrieves the `Auth` service for the provided app, initializing if needed.
 pub fn auth_for_app(app: FirebaseApp) -> AuthResult<Arc<Auth>> {
     let provider = app.container().get_provider("auth");
-    provider.get_immediate::<Auth>().ok_or_else(|| {
-        AuthError::App(AppError::ComponentFailure {
+    match provider.get_immediate_with_options::<Auth>(None, false) {
+        Ok(Some(auth)) => Ok(auth),
+        Ok(None) => Err(AuthError::App(AppError::ComponentFailure {
             component: "auth".to_string(),
-            message: "Auth service not initialized".to_string(),
-        })
-    })
+            message: "Auth service not initialized (is register_auth_component() called?)".to_string(),
+        })),
+        Err(err) => Err(AuthError::App(AppError::ComponentFailure {
+            component: "auth".to_string(),
+            message: format!("Auth service failed to initialize: {err}"),
+        })),
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
