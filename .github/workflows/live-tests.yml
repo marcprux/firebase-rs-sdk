@@ -38,8 +38,6 @@ jobs:
       FIREBASE_TEST_CALLABLE: ${{ secrets.FIREBASE_TEST_CALLABLE }}
       # Fail loudly on main if the secret is missing; elsewhere the tests skip gracefully.
       FIREBASE_LIVE_TESTS_REQUIRED: ${{ github.ref == 'refs/heads/main' && '1' || '0' }}
-      # Keep the installations cache out of the checkout.
-      FIREBASE_INSTALLATIONS_CACHE_DIR: ${{ runner.temp }}/firebase-installations
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -51,4 +49,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run live endpoint tests
+        env:
+          # Keep the installations cache out of the checkout (runner context is step-scoped).
+          FIREBASE_INSTALLATIONS_CACHE_DIR: ${{ runner.temp }}/firebase-installations
         run: cargo test --test live_endpoints -- --ignored --nocapture --test-threads=2
