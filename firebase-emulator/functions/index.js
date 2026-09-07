@@ -17,3 +17,35 @@ exports.alwaysFails = functions.https.onCall(() => {
     reason: "test-fixture",
   });
 });
+
+// ---- 2nd-gen callables used by the streaming / options tests ----
+const { onCall, HttpsError } = require("firebase-functions/v2/https");
+
+// Streams `count` chunks {n: i} then returns the sum. Non-streaming clients only get the result.
+exports.streamNumbers = onCall({}, async (request, response) => {
+  const count = (request.data && request.data.count) || 3;
+  let total = 0;
+  for (let i = 1; i <= count; i++) {
+    total += i;
+    if (request.acceptsStreaming) {
+      response.sendChunk({ n: i });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  return { total, streamed: Boolean(request.acceptsStreaming) };
+});
+
+// Sends one chunk and then fails, so the client sees a typed error mid-stream.
+exports.streamThenFail = onCall({}, async (request, response) => {
+  if (request.acceptsStreaming) {
+    response.sendChunk({ n: 1 });
+  }
+  throw new HttpsError("resource-exhausted", "stream failed midway", { after: 1 });
+});
+
+// Waits `delayMs` before answering, for client timeout tests.
+exports.slowEcho = onCall({}, async (request) => {
+  const delayMs = (request.data && request.data.delayMs) || 2000;
+  await new Promise((resolve) => setTimeout(resolve, delayMs));
+  return { done: true, delayMs };
+});

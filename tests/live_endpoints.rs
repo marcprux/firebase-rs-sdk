@@ -2041,6 +2041,73 @@ async fn functions_callable_protocol_against_live_host() {
         assert_eq!(err.message(), "This callable always fails");
         assert_eq!(err.details().and_then(|d| d["reason"].as_str()), Some("test-fixture"));
 
+        // Streaming callable: chunks arrive as server-sent events, then the final result.
+        let streaming = functions
+            .https_callable::<serde_json::Value, serde_json::Value>("streamNumbers")
+            .expect("callable reference");
+        let mut stream = streaming
+            .stream_async(&serde_json::json!({ "count": 4 }))
+            .await
+            .expect("stream_async");
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next_message().await.expect("next_message") {
+            chunks.push(chunk["n"].as_i64().expect("n"));
+        }
+        assert_eq!(chunks, vec![1, 2, 3, 4]);
+        let result = stream.result().await.expect("stream result");
+        assert_eq!(result["total"], 10);
+        assert_eq!(result["streamed"], true, "server must see Accept: text/event-stream");
+        // The same function answers a plain call without streaming.
+        let plain = streaming
+            .call_async(&serde_json::json!({ "count": 2 }))
+            .await
+            .expect("plain call to a streaming function");
+        assert_eq!(plain["total"], 3);
+        assert_eq!(plain["streamed"], false);
+
+        // An error raised after the first chunk surfaces as a typed error from the stream.
+        let failing_stream = functions
+            .https_callable::<serde_json::Value, serde_json::Value>("streamThenFail")
+            .expect("callable reference");
+        let mut stream = failing_stream.stream_async(&serde_json::json!({})).await.expect("open");
+        let first = stream.next_message().await.expect("first chunk").expect("one chunk");
+        assert_eq!(first["n"], 1);
+        let err = stream.next_message().await.expect_err("error after the chunk");
+        assert_eq!(err.code, FunctionsErrorCode::ResourceExhausted, "got {err}");
+        assert_eq!(err.message(), "stream failed midway");
+        assert_eq!(err.details().and_then(|d| d["after"].as_i64()), Some(1));
+
+        // HttpsCallableOptions.timeout maps to deadline-exceeded.
+        let slow = functions
+            .https_callable_with_options::<serde_json::Value, serde_json::Value>(
+                "slowEcho",
+                firebase_rs_sdk::functions::HttpsCallableOptions {
+                    timeout: Duration::from_millis(400),
+                    ..Default::default()
+                },
+            )
+            .expect("callable reference");
+        let err = slow
+            .call_async(&serde_json::json!({ "delayMs": 3000 }))
+            .await
+            .expect_err("must time out");
+        assert_eq!(err.code, FunctionsErrorCode::DeadlineExceeded, "got {err}");
+
+        // httpsCallableFromURL: the same helloWorld through its absolute emulator URL.
+        let host = config.emulators.functions.as_deref().unwrap();
+        let by_url = functions
+            .https_callable_from_url::<serde_json::Value, serde_json::Value>(&format!(
+                "http://{host}/{}/us-central1/helloWorld",
+                config.project_id
+            ))
+            .expect("callable from url");
+        let response = by_url
+            .call_async(&serde_json::json!({ "message": "by-url" }))
+            .await
+            .expect("helloWorld by URL");
+        assert_eq!(response["message"], "Hello, by-url!");
+        assert_eq!(response["uid"], uid, "auth headers are attached to URL callables too");
+
         cleanup_auth(&auth).await;
     } else if let Some(name) = &config.test_callable {
         let callable = functions

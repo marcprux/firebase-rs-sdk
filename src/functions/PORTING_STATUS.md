@@ -7,6 +7,7 @@ October 20th, 2025.)
 
 
 ## Implemented
+- Streaming callables (`CallableFunction::stream_async` -> `CallableStream` with `next_message` / `next_message_as` / `result`, parsing the `data: {message|result|error}` server-sent events exactly like `packages/functions/src/service.ts`), `https_callable_from_url`, `HttpsCallableOptions` (timeout, limited-use App Check tokens) via `https_callable_with_options`, and `connect_functions_emulator`. Verified against the Functions emulator fixtures in `firebase-emulator/functions`.
 
 - Component registration so `Functions` instances can be resolved from a `FirebaseApp` container.
 - Native HTTPS callable transport backed by async `reqwest::Client`, exposed through an async

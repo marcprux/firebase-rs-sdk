@@ -92,6 +92,66 @@ impl Functions {
         Ok(CallableFunction {
             functions: self.clone(),
             name: name.trim().trim_matches('/').to_string(),
+            url: None,
+            options: HttpsCallableOptions::default(),
+            _request: std::marker::PhantomData,
+            _response: std::marker::PhantomData,
+        })
+    }
+
+    /// Like [`https_callable`](Self::https_callable) with explicit [`HttpsCallableOptions`].
+    pub fn https_callable_with_options<Request, Response>(
+        &self,
+        name: &str,
+        options: HttpsCallableOptions,
+    ) -> FunctionsResult<CallableFunction<Request, Response>>
+    where
+        Request: serde::Serialize + 'static,
+        Response: serde::de::DeserializeOwned + 'static,
+    {
+        let mut callable = self.https_callable(name)?;
+        callable.options = options;
+        Ok(callable)
+    }
+
+    /// Creates a callable for an absolute URL, e.g. a custom domain or a 2nd-gen function's
+    /// `run.app` address. Mirrors `httpsCallableFromURL` in the JS SDK.
+    pub fn https_callable_from_url<Request, Response>(
+        &self,
+        url: &str,
+    ) -> FunctionsResult<CallableFunction<Request, Response>>
+    where
+        Request: serde::Serialize + 'static,
+        Response: serde::de::DeserializeOwned + 'static,
+    {
+        self.https_callable_from_url_with_options(url, HttpsCallableOptions::default())
+    }
+
+    /// Like [`https_callable_from_url`](Self::https_callable_from_url) with explicit options.
+    pub fn https_callable_from_url_with_options<Request, Response>(
+        &self,
+        url: &str,
+        options: HttpsCallableOptions,
+    ) -> FunctionsResult<CallableFunction<Request, Response>>
+    where
+        Request: serde::Serialize + 'static,
+        Response: serde::de::DeserializeOwned + 'static,
+    {
+        let parsed = Url::parse(url).map_err(|err| invalid_argument(format!("invalid callable URL `{url}`: {err}")))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(invalid_argument(format!("callable URL `{url}` must use http or https")));
+        }
+        Ok(CallableFunction {
+            functions: self.clone(),
+            name: parsed
+                .path()
+                .trim_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+            url: Some(url.to_string()),
+            options,
             _request: std::marker::PhantomData,
             _response: std::marker::PhantomData,
         })
@@ -124,6 +184,165 @@ impl Functions {
     }
 }
 
+/// Per-callable settings. Mirrors `HttpsCallableOptions` in the JS SDK.
+#[derive(Clone, Debug)]
+pub struct HttpsCallableOptions {
+    /// Maximum time to wait for a (non-streaming) call to complete. Defaults to 70 seconds.
+    pub timeout: Duration,
+    /// Send a limited-use App Check token instead of the cached one, for functions that enforce
+    /// replay protection.
+    pub limited_use_app_check_tokens: bool,
+}
+
+impl Default for HttpsCallableOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+            limited_use_app_check_tokens: false,
+        }
+    }
+}
+
+/// A streaming callable in progress: server-sent `message` chunks followed by a final result.
+///
+/// Mirrors the `HttpsCallableStreamResult` of the JS SDK's `httpsCallable(...).stream()`:
+/// iterate chunks with [`next_message`](Self::next_message) (or the typed
+/// [`next_message_as`](Self::next_message_as)), then take the result with
+/// [`result`](Self::result). Native targets only.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct CallableStream<Response> {
+    body: crate::functions::transport::StreamingBody,
+    buffer: String,
+    finished: bool,
+    result: Option<FunctionsResult<Response>>,
+    _response: std::marker::PhantomData<Response>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<Response> CallableStream<Response>
+where
+    Response: serde::de::DeserializeOwned,
+{
+    fn new(body: crate::functions::transport::StreamingBody) -> Self {
+        Self {
+            body,
+            buffer: String::new(),
+            finished: false,
+            result: None,
+            _response: std::marker::PhantomData,
+        }
+    }
+
+    /// The next `message` chunk, or `Ok(None)` once the server has finished. A server-side
+    /// error ends the stream with `Err`.
+    pub async fn next_message(&mut self) -> FunctionsResult<Option<JsonValue>> {
+        use futures_util::StreamExt as _;
+        loop {
+            // Drain complete lines already buffered.
+            while let Some(newline) = self.buffer.find('\n') {
+                let line = self.buffer[..newline].trim().to_string();
+                self.buffer.drain(..=newline);
+                match self.process_line(&line)? {
+                    StreamEvent::Message(message) => return Ok(Some(message)),
+                    StreamEvent::Nothing | StreamEvent::Result => {}
+                }
+            }
+            if self.finished {
+                return Ok(None);
+            }
+            match self.body.next().await {
+                Some(Ok(bytes)) => self.buffer.push_str(&String::from_utf8_lossy(&bytes)),
+                Some(Err(err)) => {
+                    self.finished = true;
+                    let error = internal_error(format!("callable stream interrupted: {err}"));
+                    self.result.get_or_insert(Err(error.clone()));
+                    return Err(error);
+                }
+                None => {
+                    self.finished = true;
+                    let trailing = std::mem::take(&mut self.buffer);
+                    let trailing = trailing.trim().to_string();
+                    if !trailing.is_empty() {
+                        if let StreamEvent::Message(message) = self.process_line(&trailing)? {
+                            return Ok(Some(message));
+                        }
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    /// Like [`next_message`](Self::next_message), deserializing each chunk into `M`.
+    pub async fn next_message_as<M: serde::de::DeserializeOwned>(&mut self) -> FunctionsResult<Option<M>> {
+        match self.next_message().await? {
+            Some(value) => serde_json::from_value(value)
+                .map(Some)
+                .map_err(|err| internal_error(format!("Failed to deserialize stream message: {err}"))),
+            None => Ok(None),
+        }
+    }
+
+    /// Consumes any remaining chunks and returns the function's final result.
+    pub async fn result(mut self) -> FunctionsResult<Response> {
+        while self.next_message().await?.is_some() {}
+        self.result
+            .take()
+            .unwrap_or_else(|| Err(internal_error("callable stream ended without a result")))
+    }
+
+    fn process_line(&mut self, line: &str) -> FunctionsResult<StreamEvent> {
+        // JS: /^data: (.*?)(?:\n|$)/ ; other SSE fields (event:, id:, comments) are ignored.
+        let Some(data) = line.strip_prefix("data:") else {
+            return Ok(StreamEvent::Nothing);
+        };
+        let data = data.trim();
+        if data.is_empty() {
+            return Ok(StreamEvent::Nothing);
+        }
+        let json: JsonValue = serde_json::from_str(data)
+            .map_err(|err| internal_error(format!("callable stream sent invalid JSON: {err}")))?;
+        let Some(object) = json.as_object() else {
+            return Ok(StreamEvent::Nothing);
+        };
+        if let Some(result) = object.get("result") {
+            let decoded = serde_json::from_value::<Response>(result.clone())
+                .map_err(|err| internal_error(format!("Failed to deserialize callable result: {err}")));
+            self.result = Some(decoded);
+            return Ok(StreamEvent::Result);
+        }
+        if let Some(message) = object.get("message") {
+            return Ok(StreamEvent::Message(message.clone()));
+        }
+        if object.contains_key("error") {
+            let error = crate::functions::error::error_for_http_response(0, Some(&json))
+                .unwrap_or_else(|| internal_error("callable stream reported an error"));
+            self.finished = true;
+            self.result = Some(Err(error.clone()));
+            return Err(error);
+        }
+        Ok(StreamEvent::Nothing)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<Response> std::fmt::Debug for CallableStream<Response> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallableStream")
+            .field("finished", &self.finished)
+            .field("has_result", &self.result.is_some())
+            .field("buffered_bytes", &self.buffer.len())
+            .finish()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+enum StreamEvent {
+    Message(JsonValue),
+    Result,
+    Nothing,
+}
+
 /// Callable Cloud Function handle that can be invoked with typed payloads.
 ///
 /// The shape follows the JavaScript `HttpsCallable` returned from
@@ -132,6 +351,9 @@ impl Functions {
 pub struct CallableFunction<Request, Response> {
     functions: Functions,
     name: String,
+    /// Absolute endpoint for callables created with `https_callable_from_url`.
+    url: Option<String>,
+    options: HttpsCallableOptions,
     _request: std::marker::PhantomData<Request>,
     _response: std::marker::PhantomData<Response>,
 }
@@ -150,16 +372,61 @@ where
     /// This method is available on all targets and should be awaited within the caller's async
     /// runtime.
     pub async fn call_async(&self, data: &Request) -> FunctionsResult<Response> {
+        let request = self.build_request(data, None).await?;
+        let response_body = invoke_callable_async(request).await?;
+        extract_data(response_body)
+    }
+
+    /// Invokes a streaming callable: the function's `sendChunk` messages arrive through
+    /// [`CallableStream::next_message`] and its return value through [`CallableStream::result`].
+    /// Mirrors `httpsCallable(...).stream()` in the JS SDK (server-sent events with
+    /// `Accept: text/event-stream`). The configured timeout does not apply to the stream itself,
+    /// only to establishing it.
+    ///
+    /// ```no_run
+    /// # use firebase_rs_sdk::functions::Functions;
+    /// # async fn demo(functions: Functions) -> firebase_rs_sdk::functions::error::FunctionsResult<()> {
+    /// let callable = functions.https_callable::<serde_json::Value, serde_json::Value>("generate")?;
+    /// let mut stream = callable.stream_async(&serde_json::json!({ "prompt": "hi" })).await?;
+    /// while let Some(chunk) = stream.next_message().await? {
+    ///     println!("chunk: {chunk}");
+    /// }
+    /// let result = stream.result().await?;
+    /// # Ok(()) }
+    /// ```
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn stream_async(&self, data: &Request) -> FunctionsResult<CallableStream<Response>> {
+        let request = self.build_request(data, Some("text/event-stream")).await?;
+        let body = crate::functions::transport::open_callable_stream(request).await?;
+        Ok(CallableStream::new(body))
+    }
+
+    /// The options this callable was created with.
+    pub fn options(&self) -> &HttpsCallableOptions {
+        &self.options
+    }
+
+    async fn build_request(&self, data: &Request, accept: Option<&str>) -> FunctionsResult<CallableRequest> {
         let payload = serde_json::to_value(data)
             .map_err(|err| internal_error(format!("Failed to serialize callable payload: {err}")))?;
         let body = json!({ "data": payload });
-        let url = self.functions.callable_url(&self.name)?;
-        let mut request = CallableRequest::new(url, body, Duration::from_millis(DEFAULT_TIMEOUT_MS));
+        let url = match &self.url {
+            Some(url) => url.clone(),
+            None => self.functions.callable_url(&self.name)?,
+        };
+        let mut request = CallableRequest::new(url, body, self.options.timeout);
         request
             .headers
             .insert("Content-Type".to_string(), "application/json".to_string());
+        if let Some(accept) = accept {
+            request.headers.insert("Accept".to_string(), accept.to_string());
+        }
 
-        let context = self.functions.context().get_context_async(false).await;
+        let context = self
+            .functions
+            .context()
+            .get_context_async(self.options.limited_use_app_check_tokens)
+            .await;
         if let Some(token) = context.auth_token {
             if !token.is_empty() {
                 request
@@ -177,15 +444,12 @@ where
                 request.headers.insert("X-Firebase-AppCheck".to_string(), token);
             }
         }
-
         if let Some(header) = context.app_check_heartbeat {
             if !header.is_empty() {
                 request.headers.insert("X-Firebase-Client".to_string(), header);
             }
         }
-
-        let response_body = invoke_callable_async(request).await?;
-        extract_data(response_body)
+        Ok(request)
     }
 
     pub fn name(&self) -> &str {
@@ -354,6 +618,7 @@ mod tests {
     use super::*;
     use crate::app::initialize_app;
     use crate::app::{FirebaseAppSettings, FirebaseOptions};
+    use crate::functions::error::FunctionsErrorCode;
     use httpmock::Method::POST;
     use httpmock::MockServer;
     use std::panic;
@@ -365,6 +630,143 @@ mod tests {
             name: Some(format!("functions-{}", COUNTER.fetch_add(1, Ordering::SeqCst))),
             ..Default::default()
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_parses_server_sent_events_and_result() {
+        let server = match panic::catch_unwind(|| MockServer::start()) {
+            Ok(server) => server,
+            Err(_) => return,
+        };
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/demo-project/us-central1/streamer")
+                .header("Accept", "text/event-stream")
+                .json_body(serde_json::json!({ "data": { "count": 2 } }));
+            then.status(200).header("content-type", "text/event-stream").body(
+                "event: ping\n\ndata: {\"message\":{\"n\":1}}\n\n: comment\ndata: {\"message\":{\"n\":2}}\ndata: {\"result\":{\"total\":3}}\n",
+            );
+        });
+        let app = initialize_app(
+            FirebaseOptions {
+                project_id: Some("demo-project".into()),
+                ..Default::default()
+            },
+            Some(unique_settings()),
+        )
+        .await
+        .unwrap();
+        let functions = get_functions(Some(app), None).await.unwrap();
+        let (host, port) = server
+            .address()
+            .to_string()
+            .rsplit_once(':')
+            .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap()))
+            .unwrap();
+        functions.connect_emulator(&host, port);
+        let callable = functions
+            .https_callable::<serde_json::Value, serde_json::Value>("streamer")
+            .unwrap();
+        let mut stream = callable.stream_async(&serde_json::json!({ "count": 2 })).await.unwrap();
+        let mut seen = Vec::new();
+        while let Some(chunk) = stream.next_message().await.unwrap() {
+            seen.push(chunk["n"].as_i64().unwrap());
+        }
+        assert_eq!(seen, vec![1, 2]);
+        assert_eq!(stream.result().await.unwrap()["total"], 3);
+        mock.assert();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_surfaces_mid_stream_errors_and_non_2xx() {
+        let server = match panic::catch_unwind(|| MockServer::start()) {
+            Ok(server) => server,
+            Err(_) => return,
+        };
+        server.mock(|when, then| {
+            when.method(POST).path("/demo-project/us-central1/failing");
+            then.status(200).header("content-type", "text/event-stream").body(
+                "data: {\"message\":\"first\"}\ndata: {\"error\":{\"status\":\"RESOURCE_EXHAUSTED\",\"message\":\"too much\",\"details\":{\"after\":1}}}\n",
+            );
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/demo-project/us-central1/missing");
+            then.status(404).body("not here");
+        });
+        let app = initialize_app(
+            FirebaseOptions {
+                project_id: Some("demo-project".into()),
+                ..Default::default()
+            },
+            Some(unique_settings()),
+        )
+        .await
+        .unwrap();
+        let functions = get_functions(Some(app), None).await.unwrap();
+        let (host, port) = server
+            .address()
+            .to_string()
+            .rsplit_once(':')
+            .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap()))
+            .unwrap();
+        functions.connect_emulator(&host, port);
+
+        let mut stream = functions
+            .https_callable::<serde_json::Value, serde_json::Value>("failing")
+            .unwrap()
+            .stream_async(&serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(stream.next_message().await.unwrap().unwrap(), "first");
+        let err = stream.next_message().await.unwrap_err();
+        assert_eq!(err.code, FunctionsErrorCode::ResourceExhausted);
+        assert_eq!(err.message(), "too much");
+        assert_eq!(stream.result().await.unwrap_err().code, FunctionsErrorCode::ResourceExhausted);
+
+        let err = functions
+            .https_callable::<serde_json::Value, serde_json::Value>("missing")
+            .unwrap()
+            .stream_async(&serde_json::json!({}))
+            .await
+            .expect_err("404 must fail before streaming");
+        assert_eq!(err.code, FunctionsErrorCode::NotFound);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn callable_from_url_and_options() {
+        let app = initialize_app(
+            FirebaseOptions {
+                project_id: Some("demo-project".into()),
+                ..Default::default()
+            },
+            Some(unique_settings()),
+        )
+        .await
+        .unwrap();
+        let functions = get_functions(Some(app), None).await.unwrap();
+        let callable = functions
+            .https_callable_from_url_with_options::<serde_json::Value, serde_json::Value>(
+                "https://example.com/api/echo/",
+                HttpsCallableOptions {
+                    timeout: Duration::from_secs(5),
+                    limited_use_app_check_tokens: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(callable.name(), "echo");
+        assert_eq!(callable.options().timeout, Duration::from_secs(5));
+        assert!(callable.options().limited_use_app_check_tokens);
+        assert!(functions
+            .https_callable_from_url::<serde_json::Value, serde_json::Value>("ftp://example.com/x")
+            .is_err());
+        assert_eq!(
+            functions
+                .https_callable::<serde_json::Value, serde_json::Value>("plain")
+                .unwrap()
+                .options()
+                .timeout,
+            Duration::from_millis(DEFAULT_TIMEOUT_MS)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

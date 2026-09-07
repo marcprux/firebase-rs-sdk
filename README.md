@@ -49,7 +49,7 @@ percentages are estimates and deliberately stricter than the ones in each module
 | app | 70% | n/a | yes | app lifecycle, options, component container, heartbeat header |
 | data_connect | 65% | real (`firebasedataconnect.googleapis.com/v1`) | no | executeQuery / executeMutation, emulator, subscriptions |
 | auth | 75% | real (Identity Toolkit v1/v2 + securetoken) | emulator + online | email, phone, custom-token, IdP credential and MFA flows verified end to end; typed error codes; listeners; OAuth popup/redirect UI flows still delegated to the host |
-| functions | 50% | real (`cloudfunctions.net` / custom domain) | yes | callable protocol with auth, App Check and FID headers; no streaming |
+| functions | 75% | real (`cloudfunctions.net` / custom domain / emulator) | emulator + online | callable protocol with auth, App Check and FID headers, streaming callables, URL callables, timeouts |
 | remote_config | 50% | real (`firebaseremoteconfig.googleapis.com/v1`) | yes | fetch, ETag-based activate, defaults with correct value sources, custom signals, typed getters |
 | app_check | 45% | real exchange endpoint, untested | no | custom provider and refresher only on native; reCAPTCHA is wasm-only |
 | firestore | 50% | real REST for one-shot ops; realtime is simulated | emulator + online | CRUD, composite queries, snapshot cursors, batches, aggregates, optimistic transactions, serde structs; no `onSnapshot` or offline |
@@ -147,9 +147,9 @@ percentages are estimates and deliberately stricter than the ones in each module
 | `getFunctions` (region or custom domain), `httpsCallable` | implemented |
 | Callable protocol: `data` / `result` envelope, gRPC status error mapping | implemented |
 | `Authorization`, `Firebase-Instance-ID-Token`, `X-Firebase-AppCheck`, `X-Firebase-Client` headers | implemented |
-| `httpsCallable(...).stream()` (server-sent events) | missing |
+| `httpsCallable(...).stream()` (server-sent events) | implemented natively (`stream_async` -> `CallableStream`), verified against the Functions emulator |
 | `connectFunctionsEmulator` | implemented, verified against the Functions emulator |
-| `httpsCallableFromURL`, `HttpsCallableOptions` (timeout, limited-use App Check) | missing |
+| `httpsCallableFromURL`, `HttpsCallableOptions` (timeout, limited-use App Check) | implemented |
 | `@type` `Int64Value` / `UInt64Value` decoding | missing |
 
 ### remote_config

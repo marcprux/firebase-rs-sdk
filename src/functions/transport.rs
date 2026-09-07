@@ -36,6 +36,18 @@ pub async fn invoke_callable_async(request: CallableRequest) -> FunctionsResult<
     callable_transport().invoke(request).await
 }
 
+/// Raw response body of a streaming callable.
+#[cfg(not(target_arch = "wasm32"))]
+pub type StreamingBody =
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
+
+/// Opens a streaming callable request and returns its body once the response headers confirm
+/// success; a non-2xx status is mapped to a `FunctionsError` exactly like a unary call.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn open_callable_stream(request: CallableRequest) -> FunctionsResult<StreamingBody> {
+    native::open_stream(request).await
+}
+
 pub fn callable_transport() -> &'static dyn CallableTransport {
     &*TRANSPORT
 }
@@ -140,6 +152,36 @@ mod native {
             .map_err(map_reqwest_error)?;
 
         handle_response(response).await
+    }
+
+    pub(super) async fn open_stream(request: CallableRequest) -> FunctionsResult<super::StreamingBody> {
+        let CallableRequest {
+            url,
+            payload,
+            timeout,
+            headers,
+        } = request;
+        let header_map = build_headers(&headers)?;
+        let client = client().clone();
+        // Only the connection and response headers are bounded by the timeout; the stream may
+        // legitimately outlive it (JS applies no timeout to streams at all).
+        let response = tokio::time::timeout(timeout, client.post(url).headers(header_map).json(&payload).send())
+            .await
+            .map_err(|_| {
+                FunctionsError::new(
+                    FunctionsErrorCode::DeadlineExceeded,
+                    "callable stream request timed out before the response started",
+                )
+            })?
+            .map_err(map_reqwest_error)?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let bytes = response.bytes().await.unwrap_or_default();
+            let body = serde_json::from_slice::<JsonValue>(&bytes).ok();
+            return Err(error_for_http_response(status.as_u16(), body.as_ref())
+                .unwrap_or_else(|| internal_error(format!("callable stream failed with status {status}"))));
+        }
+        Ok(Box::pin(response.bytes_stream()))
     }
 
     async fn handle_response(response: Response) -> FunctionsResult<JsonValue> {
