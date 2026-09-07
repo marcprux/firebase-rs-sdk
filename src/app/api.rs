@@ -401,10 +401,9 @@ mod tests {
     use crate::component::types::{ComponentType, DynService, InstanceFactory, InstantiationMode};
     use crate::component::Component;
     use crate::platform::runtime;
-    use futures::lock::Mutex as AsyncMutex;
     use std::future::Future;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, LazyLock};
+    use std::sync::Arc;
     use std::time::Duration;
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
