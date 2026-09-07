@@ -13,8 +13,8 @@ mod types;
 
 #[doc(inline)]
 pub use api::{
-    auth_for_app, connect_auth_emulator, refresh_id_token, refresh_id_token_with_endpoint, register_auth_component,
-    Auth, AuthBuilder, RefreshTokenResponse,
+    auth_for_app, connect_auth_emulator, parse_id_token_result, refresh_id_token, refresh_id_token_with_endpoint,
+    register_auth_component, Auth, AuthBuilder, RefreshTokenResponse,
 };
 
 #[allow(unused_imports)]
@@ -42,8 +42,8 @@ pub use oauth::{
     pkce::PkcePair,
     provider::OAuthProvider,
     providers::{
-        oauth_access_token_map, AppleAuthProvider, FacebookAuthProvider, GitHubAuthProvider, GoogleAuthProvider,
-        MicrosoftAuthProvider, OAuthProviderFactory, TwitterAuthProvider, YahooAuthProvider,
+        oauth_access_token_map, oauth_credential, AppleAuthProvider, FacebookAuthProvider, GitHubAuthProvider,
+        GoogleAuthProvider, MicrosoftAuthProvider, OAuthProviderFactory, TwitterAuthProvider, YahooAuthProvider,
     },
     redirect::{InMemoryRedirectPersistence, PendingRedirectEvent, RedirectOperation, RedirectPersistence},
     OAuthPopupHandler, OAuthRedirectHandler, OAuthRequest,

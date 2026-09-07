@@ -42,6 +42,9 @@ pub struct SignInWithIdpRequest {
     pub return_idp_credential: bool,
     #[serde(rename = "returnSecureToken")]
     pub return_secure_token: bool,
+    /// `false` for reauthentication: the account must already exist (JS `_getReauthenticationResolver`).
+    #[serde(rename = "autoCreate", skip_serializing_if = "Option::is_none")]
+    pub auto_create: Option<bool>,
     #[serde(rename = "idToken", skip_serializing_if = "Option::is_none")]
     pub id_token: Option<String>,
 }

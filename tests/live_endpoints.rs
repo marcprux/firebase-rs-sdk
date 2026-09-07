@@ -915,6 +915,7 @@ fn auth_error_variant(err: &AuthError) -> &'static str {
         AuthError::MultiFactorRequired(_) => "MultiFactorRequired",
         AuthError::MultiFactor(_) => "MultiFactor",
         AuthError::Server(_) => "Server",
+        _ => "Other",
     }
 }
 
@@ -1712,4 +1713,659 @@ async fn functions_callable_protocol_against_live_host() {
         );
     }
     delete_app(&app).await.expect("delete_app");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Authentication flows that need the Auth emulator's out-of-band code, SMS code, custom token
+// and fake IdP support. All of these skip without the emulator.
+// ---------------------------------------------------------------------------------------------
+
+/// Client for the Auth emulator's administrative REST endpoints
+/// (`/emulator/v1/projects/{project}/...`), which expose what production would send by email
+/// or SMS.
+struct EmulatorAuthAdmin {
+    base: String,
+    client: reqwest::Client,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct OobCode {
+    email: String,
+    #[serde(rename = "oobCode")]
+    oob_code: String,
+    #[serde(rename = "oobLink")]
+    oob_link: String,
+    #[serde(rename = "requestType")]
+    request_type: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct SmsCode {
+    code: String,
+    #[serde(rename = "phoneNumber")]
+    phone_number: String,
+}
+
+impl EmulatorAuthAdmin {
+    fn new(config: &LiveConfig) -> Option<Self> {
+        let host = config.emulators.auth.as_ref()?;
+        Some(Self {
+            base: format!("http://{host}/emulator/v1/projects/{}", config.project_id),
+            client: reqwest::Client::new(),
+        })
+    }
+
+    async fn oob_codes(&self) -> Vec<OobCode> {
+        #[derive(serde::Deserialize)]
+        struct Body {
+            #[serde(rename = "oobCodes", default)]
+            oob_codes: Vec<OobCode>,
+        }
+        let body: Body = self
+            .client
+            .get(format!("{}/oobCodes", self.base))
+            .send()
+            .await
+            .expect("emulator oobCodes")
+            .json()
+            .await
+            .expect("oobCodes json");
+        body.oob_codes
+    }
+
+    /// The most recent code of `request_type` issued for `email`.
+    async fn latest_oob(&self, email: &str, request_type: &str) -> OobCode {
+        self.oob_codes()
+            .await
+            .into_iter()
+            .filter(|code| code.email.eq_ignore_ascii_case(email) && code.request_type == request_type)
+            .last()
+            .unwrap_or_else(|| panic!("no {request_type} code for {email} in the emulator"))
+    }
+
+    async fn latest_sms_code(&self, phone_number: &str) -> String {
+        #[derive(serde::Deserialize)]
+        struct Body {
+            #[serde(rename = "verificationCodes", default)]
+            codes: Vec<SmsCode>,
+        }
+        let body: Body = self
+            .client
+            .get(format!("{}/verificationCodes", self.base))
+            .send()
+            .await
+            .expect("emulator verificationCodes")
+            .json()
+            .await
+            .expect("verificationCodes json");
+        body.codes
+            .into_iter()
+            .filter(|c| c.phone_number == phone_number)
+            .last()
+            .map(|c| c.code)
+            .unwrap_or_else(|| panic!("no SMS code for {phone_number} in the emulator"))
+    }
+}
+
+/// The emulator ignores reCAPTCHA, so any token satisfies the phone endpoints.
+struct EmulatorVerifier;
+
+impl firebase_rs_sdk::auth::ApplicationVerifier for EmulatorVerifier {
+    fn verify(&self) -> firebase_rs_sdk::auth::AuthResult<String> {
+        Ok("emulator-recaptcha-token".to_string())
+    }
+
+    fn verifier_type(&self) -> &str {
+        "recaptcha"
+    }
+}
+
+/// Builds an unsigned custom token (`alg: none`), which the emulator accepts in place of one
+/// minted by the Admin SDK.
+fn unsigned_custom_token(uid: &str, claims: serde_json::Value) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+    let payload = serde_json::json!({
+        "iss": "firebase-adminsdk@demo.iam.gserviceaccount.com",
+        "sub": "firebase-adminsdk@demo.iam.gserviceaccount.com",
+        "aud": "https://identitytoolkit.googleapis.com/google.identity.identitytoolkit.v1.IdentityToolkit",
+        "iat": now,
+        "exp": now + 3600,
+        "uid": uid,
+        "claims": claims,
+    });
+    let payload = URL_SAFE_NO_PAD.encode(payload.to_string());
+    format!("{header}.{payload}.")
+}
+
+/// Fake Google credential for the emulator: the "ID token" is a JSON profile.
+fn emulator_google_credential(sub: &str, email: &str, name: &str) -> firebase_rs_sdk::auth::AuthCredential {
+    let profile = serde_json::json!({ "sub": sub, "email": email, "email_verified": true, "name": name });
+    firebase_rs_sdk::auth::GoogleAuthProvider::credential(Some(&profile.to_string()), None)
+}
+
+/// Common setup for the emulator-only auth tests. Returns `None` (after printing a skip) when
+/// the Auth emulator is not running.
+async fn emulator_auth(
+    test: &str,
+) -> Option<(
+    LiveConfig,
+    FirebaseApp,
+    Arc<User>,
+    Arc<firebase_rs_sdk::auth::Auth>,
+    EmulatorAuthAdmin,
+)> {
+    let config = require_config(test)?;
+    let Some(admin) = EmulatorAuthAdmin::new(&config) else {
+        skip(test, "needs the Auth emulator (scripts/emulator_test.sh)", "n/a");
+        return None;
+    };
+    let app = live_app(&config, "auth-emu").await;
+    let auth = auth_for(&config, &app);
+    // Seed an email/password user so every flow starts from a real account.
+    let email = format!("emu-{}@example.com", nonce());
+    let credential = auth
+        .create_user_with_email_and_password(&email, "correct-horse-battery")
+        .await
+        .expect("create user");
+    Some((config, app, credential.user.clone(), auth, admin))
+}
+
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn auth_emulator_password_reset_round_trip() {
+    let test = "auth_emulator_password_reset_round_trip";
+    let Some((_config, app, user, auth, admin)) = emulator_auth(test).await else {
+        return;
+    };
+    let email = user.info().email.clone().unwrap();
+    auth.sign_out();
+
+    auth.send_password_reset_email(&email)
+        .await
+        .expect("send_password_reset_email");
+    let oob = admin.latest_oob(&email, "PASSWORD_RESET").await;
+    assert!(oob.oob_link.contains("mode=resetPassword"), "link: {}", oob.oob_link);
+
+    let verified_email = auth
+        .verify_password_reset_code(&oob.oob_code)
+        .await
+        .expect("verify code");
+    assert_eq!(verified_email.to_lowercase(), email.to_lowercase());
+    let info = auth.check_action_code(&oob.oob_code).await.expect("check_action_code");
+    assert_eq!(info.operation, firebase_rs_sdk::auth::ActionCodeOperation::PasswordReset);
+
+    auth.confirm_password_reset(&oob.oob_code, "new-password-42")
+        .await
+        .expect("confirm_password_reset");
+
+    let stale = auth
+        .sign_in_with_email_and_password(&email, "correct-horse-battery")
+        .await
+        .expect_err("old password must be rejected");
+    assert!(
+        matches!(
+            stale.code(),
+            Some(AuthErrorCode::WrongPassword | AuthErrorCode::InvalidCredential)
+        ),
+        "got {stale}"
+    );
+    let fresh = auth
+        .sign_in_with_email_and_password(&email, "new-password-42")
+        .await
+        .expect("new password works");
+    assert_eq!(fresh.user.uid(), user.uid());
+
+    // A used code is rejected.
+    let reused = auth
+        .verify_password_reset_code(&oob.oob_code)
+        .await
+        .expect_err("used code");
+    assert!(
+        matches!(
+            reused.code(),
+            Some(AuthErrorCode::InvalidActionCode | AuthErrorCode::ExpiredActionCode)
+        ),
+        "got {reused}"
+    );
+
+    assert_eq!(auth.fetch_sign_in_methods_for_email(&email).await.unwrap(), vec!["password"]);
+    assert!(auth
+        .fetch_sign_in_methods_for_email("nobody-here@example.com")
+        .await
+        .unwrap()
+        .is_empty());
+
+    auth.delete_user().await.expect("cleanup");
+    delete_app(&app).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn auth_emulator_email_verification_and_reload() {
+    let test = "auth_emulator_email_verification_and_reload";
+    let Some((_config, app, user, auth, admin)) = emulator_auth(test).await else {
+        return;
+    };
+    let email = user.info().email.clone().unwrap();
+    assert!(!user.email_verified());
+
+    auth.send_email_verification().await.expect("send_email_verification");
+    let oob = admin.latest_oob(&email, "VERIFY_EMAIL").await;
+    let info = auth.check_action_code(&oob.oob_code).await.expect("check_action_code");
+    assert_eq!(info.operation, firebase_rs_sdk::auth::ActionCodeOperation::VerifyEmail);
+    auth.apply_action_code(&oob.oob_code).await.expect("apply_action_code");
+
+    // The cached user is stale until reloaded.
+    assert!(!auth.current_user().unwrap().email_verified());
+    let reloaded = auth.reload().await.expect("reload");
+    assert!(reloaded.email_verified(), "reload must pick up the verified flag");
+    assert_eq!(reloaded.uid(), user.uid());
+    assert!(reloaded.metadata().creation_time.is_some(), "metadata.creation_time");
+    assert!(reloaded.metadata().last_sign_in_time.is_some(), "metadata.last_sign_in_time");
+    let providers: Vec<&str> = reloaded
+        .provider_data()
+        .iter()
+        .map(|p| p.provider_id.as_str())
+        .collect();
+    assert_eq!(providers, vec!["password"]);
+    assert_eq!(reloaded.provider_data()[0].email.as_deref(), Some(email.as_str()));
+    assert!(Arc::ptr_eq(&reloaded, &auth.current_user().unwrap()));
+    // Tokens survive the reload.
+    assert!(auth.get_token(false).await.unwrap().is_some());
+
+    auth.delete_user().await.expect("cleanup");
+    delete_app(&app).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn auth_emulator_email_link_sign_in() {
+    let test = "auth_emulator_email_link_sign_in";
+    let Some((_config, app, _user, auth, admin)) = emulator_auth(test).await else {
+        return;
+    };
+    auth.sign_out();
+    let email = format!("link-{}@example.com", nonce());
+    let settings = firebase_rs_sdk::auth::ActionCodeSettings {
+        url: "http://localhost/finish-sign-in".to_string(),
+        handle_code_in_app: true,
+        ..Default::default()
+    };
+    auth.send_sign_in_link_to_email(&email, &settings)
+        .await
+        .expect("send_sign_in_link_to_email");
+    let oob = admin.latest_oob(&email, "EMAIL_SIGNIN").await;
+    assert!(auth.is_sign_in_with_email_link(&oob.oob_link), "link: {}", oob.oob_link);
+    assert!(!auth.is_sign_in_with_email_link("http://localhost/not-a-link"));
+
+    let credential = auth
+        .sign_in_with_email_link(&email, &oob.oob_link)
+        .await
+        .expect("sign_in_with_email_link");
+    assert_eq!(
+        credential.user.info().email.as_deref().map(str::to_lowercase),
+        Some(email.to_lowercase())
+    );
+    let reloaded = auth.reload().await.unwrap();
+    assert!(reloaded.email_verified(), "email-link users are verified");
+    let methods = auth.fetch_sign_in_methods_for_email(&email).await.unwrap();
+    assert!(methods.contains(&"emailLink".to_string()), "methods: {methods:?}");
+
+    auth.delete_user().await.expect("cleanup");
+    delete_app(&app).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn auth_emulator_custom_token_claims_and_id_token_result() {
+    let test = "auth_emulator_custom_token_claims_and_id_token_result";
+    let Some((_config, app, _user, auth, _admin)) = emulator_auth(test).await else {
+        return;
+    };
+    auth.delete_user().await.expect("drop seed user");
+    let uid = format!("custom-{}", nonce());
+    let token = unsigned_custom_token(&uid, serde_json::json!({ "role": "admin", "level": 7 }));
+    let credential = auth
+        .sign_in_with_custom_token(&token)
+        .await
+        .expect("custom token sign-in");
+    assert_eq!(credential.user.uid(), uid);
+
+    let result = auth.get_id_token_result(false).await.expect("get_id_token_result");
+    assert_eq!(result.claims["role"], "admin");
+    assert_eq!(result.claims["level"], 7);
+    assert_eq!(result.claims["user_id"], uid);
+    assert_eq!(result.sign_in_provider.as_deref(), Some("custom"));
+    assert!(result.expiration_time.is_some() && result.issued_at_time.is_some() && result.auth_time.is_some());
+    assert_eq!(result.token, auth.get_token(false).await.unwrap().unwrap());
+
+    let refreshed = auth.get_id_token_result(true).await.expect("forced refresh");
+    assert_eq!(refreshed.claims["role"], "admin", "custom claims survive a refresh");
+
+    auth.delete_user().await.expect("cleanup");
+    delete_app(&app).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn auth_emulator_profile_updates_reauth_and_token_listeners() {
+    let test = "auth_emulator_profile_updates_reauth_and_token_listeners";
+    let Some((_config, app, user, auth, admin)) = emulator_auth(test).await else {
+        return;
+    };
+    let email = user.info().email.clone().unwrap();
+
+    let state_events = Arc::new(Mutex::new(0usize));
+    let token_events = Arc::new(Mutex::new(0usize));
+    let (s, t) = (Arc::clone(&state_events), Arc::clone(&token_events));
+    let _unsub_state = auth.on_auth_state_changed(move |_: &Option<Arc<User>>| *s.lock().unwrap() += 1);
+    let _unsub_token = auth.on_id_token_changed(move |_: &Option<Arc<User>>| *t.lock().unwrap() += 1);
+    assert_eq!((*state_events.lock().unwrap(), *token_events.lock().unwrap()), (1, 1), "primed");
+
+    // A token refresh fires only the ID-token listener.
+    auth.get_token(true).await.expect("refresh");
+    assert_eq!(*state_events.lock().unwrap(), 1);
+    assert_eq!(*token_events.lock().unwrap(), 2);
+
+    let updated = auth
+        .update_profile(Some("Ada Lovelace"), Some("https://example.com/ada.png"))
+        .await
+        .expect("update_profile");
+    assert_eq!(updated.info().display_name.as_deref(), Some("Ada Lovelace"));
+    let reloaded = auth.reload().await.unwrap();
+    assert_eq!(reloaded.info().display_name.as_deref(), Some("Ada Lovelace"));
+    assert_eq!(reloaded.info().photo_url.as_deref(), Some("https://example.com/ada.png"));
+
+    // Reauthenticate, then change the password and the email.
+    auth.reauthenticate_with_password(&email, "correct-horse-battery")
+        .await
+        .expect("reauthenticate");
+    auth.update_password("even-better-password")
+        .await
+        .expect("update_password");
+    let new_email = format!("renamed-{}@example.com", nonce());
+    auth.update_email(&new_email).await.expect("update_email");
+    auth.sign_out();
+    let back = auth
+        .sign_in_with_email_and_password(&new_email, "even-better-password")
+        .await
+        .expect("sign in with the new email and password");
+    assert_eq!(back.user.uid(), user.uid());
+
+    // verifyBeforeUpdateEmail: the new address only applies after the code is used.
+    let pending_email = format!("pending-{}@example.com", nonce());
+    auth.verify_before_update_email(&pending_email, None)
+        .await
+        .expect("verify_before_update_email");
+    assert_eq!(auth.reload().await.unwrap().info().email.as_deref(), Some(new_email.as_str()));
+    let oob = // The emulator files this code under the account's current address, not the pending one.
+    admin.latest_oob(&new_email, "VERIFY_AND_CHANGE_EMAIL").await;
+    assert!(oob.oob_link.contains("mode=verifyAndChangeEmail"), "link: {}", oob.oob_link);
+    auth.apply_action_code(&oob.oob_code)
+        .await
+        .expect("apply change-email code");
+    let renamed = auth.reload().await.unwrap();
+    assert_eq!(renamed.info().email.as_deref(), Some(pending_email.as_str()));
+    assert!(renamed.email_verified());
+
+    assert!(
+        *token_events.lock().unwrap() > *state_events.lock().unwrap(),
+        "token listener must fire more often than the auth-state listener"
+    );
+
+    auth.delete_user().await.expect("cleanup");
+    delete_app(&app).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn auth_emulator_idp_credential_sign_in_link_and_unlink() {
+    let test = "auth_emulator_idp_credential_sign_in_link_and_unlink";
+    let Some((_config, app, seed, auth, _admin)) = emulator_auth(test).await else {
+        return;
+    };
+    let seed_email = seed.info().email.clone().unwrap();
+    auth.sign_out();
+
+    // Sign in with a (fake) Google credential.
+    let google_email = format!("google-{}@example.com", nonce());
+    let credential = emulator_google_credential(&format!("g-{}", nonce()), &google_email, "Google User");
+    let signed_in = auth
+        .sign_in_with_oauth_credential(credential.clone())
+        .await
+        .expect("sign_in_with_oauth_credential");
+    assert_eq!(signed_in.provider_id.as_deref(), Some("google.com"));
+    assert_eq!(signed_in.user.info().email.as_deref(), Some(google_email.as_str()));
+    let reloaded = auth.reload().await.unwrap();
+    assert_eq!(
+        reloaded
+            .provider_data()
+            .iter()
+            .map(|p| p.provider_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["google.com"]
+    );
+    assert_eq!(
+        auth.fetch_sign_in_methods_for_email(&google_email).await.unwrap(),
+        vec!["google.com"]
+    );
+
+    // Reauthenticate with the same credential, then delete.
+    auth.reauthenticate_with_oauth_credential(credential)
+        .await
+        .expect("reauthenticate");
+    auth.delete_user().await.expect("delete google user");
+
+    // Link Google to the seeded password user, then unlink it again.
+    auth.sign_in_with_email_and_password(&seed_email, "correct-horse-battery")
+        .await
+        .expect("seed sign-in");
+    let link_credential =
+        emulator_google_credential(&format!("g-{}", nonce()), &format!("linked-{}@example.com", nonce()), "Linked");
+    let linked = auth
+        .link_with_oauth_credential(link_credential)
+        .await
+        .expect("link_with_oauth_credential");
+    assert_eq!(linked.user.uid(), seed.uid(), "linking keeps the uid");
+    let mut providers: Vec<String> = auth
+        .reload()
+        .await
+        .unwrap()
+        .provider_data()
+        .iter()
+        .map(|p| p.provider_id.clone())
+        .collect();
+    providers.sort();
+    assert_eq!(providers, vec!["google.com", "password"]);
+
+    let unlinked = auth.unlink_providers(&["google.com"]).await.expect("unlink");
+    assert_eq!(unlinked.uid(), seed.uid());
+    let providers: Vec<String> = auth
+        .reload()
+        .await
+        .unwrap()
+        .provider_data()
+        .iter()
+        .map(|p| p.provider_id.clone())
+        .collect();
+    assert_eq!(providers, vec!["password"]);
+
+    auth.delete_user().await.expect("cleanup");
+    delete_app(&app).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn auth_emulator_anonymous_upgrade_to_email_password() {
+    let test = "auth_emulator_anonymous_upgrade_to_email_password";
+    let Some((_config, app, _seed, auth, _admin)) = emulator_auth(test).await else {
+        return;
+    };
+    auth.delete_user().await.expect("drop seed user");
+
+    let anonymous = auth.sign_in_anonymously().await.expect("anonymous");
+    assert!(anonymous.user.is_anonymous());
+    let uid = anonymous.user.uid().to_string();
+
+    let email = format!("upgraded-{}@example.com", nonce());
+    let upgraded = auth
+        .link_with_email_and_password(&email, "upgrade-password-1")
+        .await
+        .expect("link_with_email_and_password");
+    assert_eq!(upgraded.user.uid(), uid, "upgrade keeps the anonymous uid");
+    assert!(!upgraded.user.is_anonymous());
+    assert_eq!(upgraded.user.info().email.as_deref(), Some(email.as_str()));
+    assert_eq!(upgraded.operation_type.as_deref(), Some("link"));
+
+    auth.sign_out();
+    let back = auth
+        .sign_in_with_email_and_password(&email, "upgrade-password-1")
+        .await
+        .expect("password sign-in after upgrade");
+    assert_eq!(back.user.uid(), uid);
+    assert!(!back.user.is_anonymous());
+    assert_eq!(auth.fetch_sign_in_methods_for_email(&email).await.unwrap(), vec!["password"]);
+
+    auth.delete_user().await.expect("cleanup");
+    delete_app(&app).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn auth_emulator_phone_sign_in_and_link() {
+    let test = "auth_emulator_phone_sign_in_and_link";
+    let Some((_config, app, seed, auth, admin)) = emulator_auth(test).await else {
+        return;
+    };
+    let seed_email = seed.info().email.clone().unwrap();
+    auth.sign_out();
+    let verifier = Arc::new(EmulatorVerifier);
+
+    // Phone sign-in: SMS code comes from the emulator instead of a handset.
+    let phone = format!("+1555555{:04}", nonce().len() * 37 % 10000);
+    let confirmation = auth
+        .sign_in_with_phone_number(&phone, verifier.clone())
+        .await
+        .expect("sign_in_with_phone_number");
+    let code = admin.latest_sms_code(&phone).await;
+    let signed_in = confirmation.confirm(&code).await.expect("confirm");
+    assert_eq!(signed_in.user.info().phone_number.as_deref(), Some(phone.as_str()));
+    assert_eq!(signed_in.provider_id.as_deref(), Some("phone"));
+    let phone_uid = signed_in.user.uid().to_string();
+    let wrong = auth
+        .sign_in_with_phone_number(&phone, verifier.clone())
+        .await
+        .unwrap()
+        .confirm("000000")
+        .await
+        .expect_err("wrong code");
+    assert_eq!(wrong.code(), Some(&AuthErrorCode::InvalidVerificationCode), "got {wrong}");
+    // Signing in again with the right code returns the same account.
+    let again = auth.sign_in_with_phone_number(&phone, verifier.clone()).await.unwrap();
+    let code = admin.latest_sms_code(&phone).await;
+    assert_eq!(again.confirm(&code).await.unwrap().user.uid(), phone_uid);
+    auth.delete_user().await.expect("delete phone user");
+
+    // Link a phone number to the password user.
+    auth.sign_in_with_email_and_password(&seed_email, "correct-horse-battery")
+        .await
+        .unwrap();
+    let link_phone = format!("+1555555{:04}", (nonce().len() * 53 + 1) % 10000);
+    let confirmation = auth
+        .link_with_phone_number(&link_phone, verifier.clone())
+        .await
+        .expect("link_with_phone_number");
+    let code = admin.latest_sms_code(&link_phone).await;
+    let linked = confirmation.confirm(&code).await.expect("confirm link");
+    assert_eq!(linked.user.uid(), seed.uid());
+    assert_eq!(linked.user.info().phone_number.as_deref(), Some(link_phone.as_str()));
+    let mut providers: Vec<String> = auth
+        .reload()
+        .await
+        .unwrap()
+        .provider_data()
+        .iter()
+        .map(|p| p.provider_id.clone())
+        .collect();
+    providers.sort();
+    assert_eq!(providers, vec!["password", "phone"]);
+
+    auth.delete_user().await.expect("cleanup");
+    delete_app(&app).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn auth_emulator_phone_multi_factor_enrollment_and_challenge() {
+    let test = "auth_emulator_phone_multi_factor_enrollment_and_challenge";
+    let Some((_config, app, seed, auth, admin)) = emulator_auth(test).await else {
+        return;
+    };
+    let email = seed.info().email.clone().unwrap();
+    let verifier = Arc::new(EmulatorVerifier);
+
+    // MFA enrolment requires a verified email.
+    auth.send_email_verification().await.unwrap();
+    let oob = admin.latest_oob(&email, "VERIFY_EMAIL").await;
+    auth.apply_action_code(&oob.oob_code).await.unwrap();
+    auth.reload().await.unwrap();
+
+    let phone = format!("+1555555{:04}", (nonce().len() * 71 + 2) % 10000);
+    let multi_factor = auth.multi_factor();
+    let confirmation = multi_factor
+        .enroll_phone_number(&phone, verifier.clone(), Some("work phone"))
+        .await
+        .expect("enroll_phone_number");
+    let code = admin.latest_sms_code(&phone).await;
+    let enrolled = confirmation.confirm(&code).await.expect("finalize enrolment");
+    assert_eq!(enrolled.user.uid(), seed.uid());
+    let factors = multi_factor.enrolled_factors().await.expect("enrolled_factors");
+    assert_eq!(factors.len(), 1, "factors: {factors:?}");
+    assert_eq!(factors[0].display_name.as_deref(), Some("work phone"));
+    let factor_uid = factors[0].uid.clone();
+
+    // A fresh password sign-in now requires the second factor.
+    auth.sign_out();
+    let err = auth
+        .sign_in_with_email_and_password(&email, "correct-horse-battery")
+        .await
+        .expect_err("MFA must be required");
+    assert!(matches!(err, AuthError::MultiFactorRequired(_)), "got {err}");
+    let resolver = auth.multi_factor_resolver(&err).expect("resolver");
+    assert_eq!(resolver.hints().len(), 1);
+    let hint = resolver.hints()[0].clone();
+    assert_eq!(hint.display_name.as_deref(), Some("work phone"));
+
+    let verification_id = resolver
+        .send_phone_sign_in_code(&hint, verifier.clone())
+        .await
+        .expect("send_phone_sign_in_code");
+    let code = admin.latest_sms_code(&phone).await;
+    let assertion = firebase_rs_sdk::auth::PhoneMultiFactorGenerator::assertion(
+        firebase_rs_sdk::auth::PhoneAuthCredential::new(verification_id, code),
+    );
+    let resolved = resolver.resolve_sign_in(assertion).await.expect("resolve_sign_in");
+    assert_eq!(resolved.user.uid(), seed.uid());
+    assert!(auth.current_user().is_some());
+    let result = auth.get_id_token_result(false).await.unwrap();
+    assert_eq!(
+        result.sign_in_second_factor.as_deref(),
+        Some("phone"),
+        "claims: {}",
+        result.claims
+    );
+
+    // Unenrol and confirm a plain password sign-in works again.
+    auth.multi_factor().unenroll(&factor_uid).await.expect("unenroll");
+    assert!(auth.multi_factor().enrolled_factors().await.unwrap().is_empty());
+    auth.sign_out();
+    auth.sign_in_with_email_and_password(&email, "correct-horse-battery")
+        .await
+        .expect("no second factor after unenrol");
+
+    auth.delete_user().await.expect("cleanup");
+    delete_app(&app).await.ok();
 }

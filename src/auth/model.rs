@@ -1,7 +1,7 @@
 use crate::app::FirebaseApp;
 use crate::auth::error::{AuthError, AuthResult};
 use crate::auth::token_manager::{TokenManager, TokenUpdate};
-use crate::auth::types::MultiFactorInfo;
+use crate::auth::types::{MultiFactorInfo, UserMetadata};
 use crate::auth::Auth;
 use crate::util::PartialObserver;
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,10 @@ pub struct User {
     mfa_factors: Arc<Mutex<Vec<MultiFactorInfo>>>,
     /// Back-reference to the owning `Auth`, used to refresh tokens on demand (JS: `user.auth`).
     auth: Mutex<Weak<Auth>>,
+    /// Creation and last sign-in times (JS: `user.metadata`).
+    metadata: UserMetadata,
+    /// One entry per linked sign-in provider (JS: `user.providerData`).
+    provider_data: Vec<UserInfo>,
 }
 
 impl Clone for User {
@@ -41,6 +45,8 @@ impl Clone for User {
             token_manager: self.token_manager.clone(),
             mfa_factors: Arc::clone(&self.mfa_factors),
             auth: Mutex::new(self.auth.lock().unwrap().clone()),
+            metadata: self.metadata.clone(),
+            provider_data: self.provider_data.clone(),
         }
     }
 }
@@ -56,7 +62,28 @@ impl User {
             token_manager: TokenManager::default(),
             mfa_factors: Arc::new(Mutex::new(Vec::new())),
             auth: Mutex::new(Weak::new()),
+            metadata: UserMetadata::default(),
+            provider_data: Vec::new(),
         }
+    }
+
+    /// Creation and last sign-in times, populated after sign-in or [`Auth::reload`].
+    pub fn metadata(&self) -> &UserMetadata {
+        &self.metadata
+    }
+
+    /// The identity providers linked to this account, populated after sign-in or
+    /// [`Auth::reload`]. Mirrors `user.providerData`.
+    pub fn provider_data(&self) -> &[UserInfo] {
+        &self.provider_data
+    }
+
+    pub(crate) fn set_metadata(&mut self, metadata: UserMetadata) {
+        self.metadata = metadata;
+    }
+
+    pub(crate) fn set_provider_data(&mut self, provider_data: Vec<UserInfo>) {
+        self.provider_data = provider_data;
     }
 
     /// Binds this user to the `Auth` instance that manages it so that token refreshes can be
@@ -306,6 +333,22 @@ impl AuthStateListeners {
         self.len() == 0
     }
 
+    /// Notifies every observer unconditionally (used for `onIdTokenChanged`, which fires on
+    /// token refreshes and profile updates as well as on user changes).
+    pub fn notify_always(&self, user: Option<Arc<User>>) {
+        let observers = {
+            let state = self.inner.lock().unwrap();
+            state
+                .observers
+                .iter()
+                .filter_map(|(_, observer)| observer.next.clone())
+                .collect::<Vec<_>>()
+        };
+        for next in observers {
+            next(&user);
+        }
+    }
+
     /// Notifies observers when the signed-in user changed. Returns `true` if observers were
     /// invoked.
     pub fn notify(&self, user: Option<Arc<User>>) -> bool {
@@ -522,6 +565,15 @@ pub struct MfaEnrollmentInfo {
 pub struct AccountInfoUser {
     #[serde(rename = "localId")]
     pub local_id: Option<String>,
+    /// Account creation time, milliseconds since the Unix epoch as a decimal string.
+    #[serde(rename = "createdAt")]
+    pub created_at: Option<String>,
+    /// Last sign-in time, milliseconds since the Unix epoch as a decimal string.
+    #[serde(rename = "lastLoginAt")]
+    pub last_login_at: Option<String>,
+    /// Custom claims set through the Admin SDK, serialized as a JSON object string.
+    #[serde(rename = "customAttributes")]
+    pub custom_attributes: Option<String>,
     #[serde(rename = "displayName")]
     pub display_name: Option<String>,
     #[serde(rename = "photoUrl")]

@@ -48,7 +48,7 @@ percentages are estimates and deliberately stricter than the ones in each module
 | storage | 75% | real (`firebasestorage.googleapis.com/v0`) | emulator | uploads, downloads, metadata, list, delete, JS error codes and `encodeURIComponent` paths; no resumable pause/resume |
 | app | 70% | n/a | yes | app lifecycle, options, component container, heartbeat header |
 | data_connect | 65% | real (`firebasedataconnect.googleapis.com/v1`) | no | executeQuery / executeMutation, emulator, subscriptions |
-| auth | 65% | real (Identity Toolkit v1 + securetoken) | yes | broad REST coverage, typed `auth/...` error codes, `onAuthStateChanged` semantics; OAuth popup/redirect flows incomplete |
+| auth | 75% | real (Identity Toolkit v1/v2 + securetoken) | emulator + online | email, phone, custom-token, IdP credential and MFA flows verified end to end; typed error codes; listeners; OAuth popup/redirect UI flows still delegated to the host |
 | functions | 50% | real (`cloudfunctions.net` / custom domain) | yes | callable protocol with auth, App Check and FID headers; no streaming |
 | remote_config | 50% | real (`firebaseremoteconfig.googleapis.com/v1`) | yes | fetch, ETag-based activate, defaults with correct value sources, custom signals, typed getters |
 | app_check | 45% | real exchange endpoint, untested | no | custom provider and refresher only on native; reCAPTCHA is wasm-only |
@@ -74,18 +74,20 @@ percentages are estimates and deliberately stricter than the ones in each module
 |---|---|
 | `signInWithEmailAndPassword`, `createUserWithEmailAndPassword`, `signInAnonymously`, `signInWithCustomToken` | implemented |
 | `signInWithEmailLink`, `isSignInWithEmailLink`, `sendSignInLinkToEmail` | implemented |
-| `sendPasswordResetEmail`, `confirmPasswordReset`, `verifyPasswordResetCode`, `applyActionCode`, `checkActionCode`, `sendEmailVerification` | implemented |
+| `sendPasswordResetEmail`, `confirmPasswordReset`, `verifyPasswordResetCode`, `applyActionCode`, `checkActionCode`, `sendEmailVerification` | implemented; round-tripped through the emulator's out-of-band codes |
 | `updateProfile`, `updateEmail`, `updatePassword`, `deleteUser`, `unlink` | implemented |
 | `reauthenticateWithCredential`, `linkWithCredential` (password, OAuth, phone) | implemented |
-| `signInWithPhoneNumber`, `linkWithPhoneNumber`, `reauthenticateWithPhoneNumber` | implemented (needs caller-supplied verifier) |
-| Multi-factor: phone, TOTP, passkey enrol / unenrol / resolver, `getMultiFactorResolver` | implemented |
-| `getIdToken` (`User::get_id_token(force_refresh)` and `Auth::get_token`), token refresh through `securetoken.googleapis.com` | implemented; expired or forced tokens are refreshed from the user object |
+| `signInWithPhoneNumber`, `linkWithPhoneNumber`, `reauthenticateWithPhoneNumber` | implemented (needs caller-supplied verifier); verified against the Auth emulator's SMS codes |
+| Multi-factor: phone, TOTP, passkey enrol / unenrol / resolver, `getMultiFactorResolver` (`Auth::multi_factor_resolver`) | implemented; phone enrolment, challenge and unenrol verified against the emulator (endpoints now correctly target `v2`) |
+| `getIdToken` (`User::get_id_token(force_refresh)` and `Auth::get_token`), `getIdTokenResult` (decoded claims, `sign_in_provider`, `sign_in_second_factor`), token refresh through `securetoken.googleapis.com` | implemented; custom claims verified via unsigned custom tokens on the emulator |
 | `signInWithPopup`, `signInWithRedirect`, `linkWithPopup`, `getRedirectResult` | partial, delegates to a caller-supplied handler; no built-in flow |
 | `onAuthStateChanged` | implemented; emits `Some(user)` / `None`, primes with the current state, fires only when the uid changes, unsubscribe removes the observer |
 | `setPersistence` | partial, constructor-time only |
 | Typed error codes (`auth/wrong-password`, `auth/user-not-found`, `auth/too-many-requests`, ...) | implemented; `AuthError::Server` carries an `AuthErrorCode` mapped with the JS `SERVER_ERROR_MAP`, unmapped codes are normalised like the JS SDK (`auth/configuration-not-found`) |
-| `getIdTokenResult`, `reload`, `updateCurrentUser`, `onIdTokenChanged`, `beforeAuthStateChanged` | missing |
-| `fetchSignInMethodsForEmail`, `verifyBeforeUpdateEmail`, `revokeAccessToken`, `validatePassword`, `updatePhoneNumber` | missing |
+| `reload` (email verification state, `metadata`, `providerData`, second factors), `onIdTokenChanged` | implemented |
+| `updateCurrentUser`, `beforeAuthStateChanged` | missing |
+| `fetchSignInMethodsForEmail`, `verifyBeforeUpdateEmail`, `linkWithCredential` for email/password (anonymous upgrade), `GoogleAuthProvider.credential` / `oauth_credential` | implemented |
+| `revokeAccessToken`, `validatePassword`, `updatePhoneNumber` | missing |
 | `connectAuthEmulator` | implemented (`Auth::connect_emulator` / `connect_auth_emulator`), verified against the Auth emulator |
 | `useDeviceLanguage`, `tenantId`, `RecaptchaVerifier`, `SAMLAuthProvider` | missing |
 

@@ -7,6 +7,7 @@ use std::fmt;
 pub type AuthResult<T> = Result<T, AuthError>;
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AuthError {
     Firebase(FirebaseError),
     App(AppError),

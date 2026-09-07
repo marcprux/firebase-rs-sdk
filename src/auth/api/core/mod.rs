@@ -33,9 +33,10 @@ use crate::auth::persistence::{
 };
 use crate::auth::types::{
     ActionCodeInfo, ActionCodeInfoData, ActionCodeOperation, ActionCodeSettings, ActionCodeUrl, ApplicationVerifier,
-    ConfirmationResult, MultiFactorError, MultiFactorInfo, MultiFactorOperation, MultiFactorSession,
-    MultiFactorSessionType, MultiFactorSignInContext, MultiFactorUser, TotpSecret, WebAuthnAssertionResponse,
-    WebAuthnAttestationResponse, WebAuthnEnrollmentChallenge, WebAuthnSignInChallenge, WEBAUTHN_FACTOR_ID,
+    ConfirmationResult, IdTokenResult, MultiFactorError, MultiFactorInfo, MultiFactorOperation, MultiFactorResolver,
+    MultiFactorSession, MultiFactorSessionType, MultiFactorSignInContext, MultiFactorUser, TotpSecret, UserMetadata,
+    WebAuthnAssertionResponse, WebAuthnAttestationResponse, WebAuthnEnrollmentChallenge, WebAuthnSignInChallenge,
+    WEBAUTHN_FACTOR_ID,
 };
 use crate::auth::{
     InMemoryRedirectPersistence, OAuthCredential, OAuthPopupHandler, OAuthRedirectHandler, PendingRedirectEvent,
@@ -50,9 +51,10 @@ use crate::platform::runtime::{sleep as runtime_sleep, spawn_detached};
 use crate::platform::token::{AsyncTokenProvider, TokenError};
 use crate::util::PartialObserver;
 use account::{
-    apply_action_code, confirm_password_reset, delete_account, get_account_info, reset_password_info,
-    send_email_verification, send_password_reset_email, send_sign_in_link_to_email, update_account, verify_password,
-    UpdateAccountRequest, UpdateAccountResponse, UpdateString,
+    apply_action_code, confirm_password_reset, delete_account, fetch_sign_in_methods_for_email, get_account_info,
+    reset_password_info, send_email_verification, send_password_reset_email, send_sign_in_link_to_email,
+    send_verify_and_change_email, update_account, verify_password, UpdateAccountRequest, UpdateAccountResponse,
+    UpdateString,
 };
 use idp::{sign_in_with_idp, SignInWithIdpRequest, SignInWithIdpResponse};
 use mfa::{
@@ -108,6 +110,7 @@ pub struct Auth {
     config: Mutex<AuthConfig>,
     current_user: Mutex<Option<Arc<User>>>,
     listeners: AuthStateListeners,
+    id_token_listeners: AuthStateListeners,
     rest_client: Client,
     token_refresh_tolerance: Duration,
     persistence: Arc<dyn AuthPersistence + Send + Sync>,
@@ -185,6 +188,7 @@ impl Auth {
             config: Mutex::new(config),
             current_user: Mutex::new(None),
             listeners: AuthStateListeners::default(),
+            id_token_listeners: AuthStateListeners::default(),
             rest_client: Client::new(),
             token_refresh_tolerance: Duration::from_secs(5 * 60),
             persistence,
@@ -225,7 +229,7 @@ impl Auth {
         if let Err(err) = self.set_persisted_state(None) {
             eprintln!("Failed to clear persisted auth state: {err}");
         }
-        self.listeners.notify(None);
+        self.publish_user(None);
     }
 
     /// Returns the email/password auth provider helper.
@@ -363,9 +367,17 @@ impl Auth {
             ));
         }
 
+        // Some backends (the Auth emulator among them) omit `localId` here; the JS SDK falls
+        // back to the `sub` claim of the ID token.
+        let uid_from_token = response
+            .id_token
+            .as_deref()
+            .and_then(|token| parse_id_token_result(token).ok())
+            .and_then(|result| result.claims.get("sub").and_then(|v| v.as_str()).map(str::to_string));
         let local_id = response
             .local_id
             .as_deref()
+            .or(uid_from_token.as_deref())
             .ok_or_else(|| AuthError::InvalidCredential("Missing localId".into()))?;
         let id_token = response
             .id_token
@@ -571,6 +583,180 @@ impl Auth {
             .finalize_phone_credential(credential, PhoneFinalization::Reauth { id_token })
             .await?;
         Ok(result.user)
+    }
+
+    /// Delivers a user (or `None`) to both listener families: auth-state observers fire only
+    /// when the uid changes, ID-token observers fire on every publication.
+    fn publish_user(&self, user: Option<Arc<User>>) {
+        self.listeners.notify(user.clone());
+        self.id_token_listeners.notify_always(user);
+    }
+
+    /// Builds the resolver for a sign-in that failed with [`AuthError::MultiFactorRequired`].
+    /// Mirrors `getMultiFactorResolver(auth, error)` in the JS SDK.
+    pub fn multi_factor_resolver(self: &Arc<Self>, error: &AuthError) -> AuthResult<MultiFactorResolver> {
+        match error {
+            AuthError::MultiFactorRequired(mfa_error) => {
+                Ok(MultiFactorResolver::from_error(self.clone(), mfa_error.clone()))
+            }
+            _ => Err(AuthError::InvalidCredential(
+                "The supplied error does not contain multi-factor context".into(),
+            )),
+        }
+    }
+
+    /// Registers an observer invoked whenever the current user's ID token changes: sign-in,
+    /// sign-out, token refresh and profile updates. Mirrors `onIdTokenChanged` in the JS SDK,
+    /// including the immediate call with the current state.
+    pub fn on_id_token_changed<O>(&self, observer: O) -> impl FnOnce() + Send + 'static
+    where
+        O: Into<PartialObserver<Option<Arc<User>>>>,
+    {
+        let observer = observer.into();
+        if let Some(next) = observer.next.clone() {
+            next(&self.current_user());
+        }
+        let id = self.id_token_listeners.add_observer(observer);
+        let listeners = self.id_token_listeners.clone();
+        move || listeners.remove_observer(id)
+    }
+
+    /// Refreshes the current user's profile from the backend (`accounts:lookup`): email
+    /// verification state, display name, photo, phone number, provider data, metadata and
+    /// enrolled second factors. Mirrors `reload(user)` in the JS SDK.
+    pub async fn reload(&self) -> AuthResult<Arc<User>> {
+        let current = self.require_current_user()?;
+        let response = self.get_account_info().await?;
+        let account = response
+            .users
+            .into_iter()
+            .next()
+            .ok_or_else(|| AuthError::InvalidCredential("accounts:lookup returned no user".into()))?;
+
+        let provider_data: Vec<UserInfo> = account
+            .provider_user_info
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|info| UserInfo {
+                uid: info.raw_id.clone().unwrap_or_default(),
+                display_name: info.display_name.clone(),
+                email: info.email.clone(),
+                phone_number: info.phone_number.clone(),
+                photo_url: info.photo_url.clone(),
+                provider_id: info.provider_id.clone().unwrap_or_default(),
+            })
+            .collect();
+
+        let info = UserInfo {
+            uid: account.local_id.clone().unwrap_or_else(|| current.uid().to_string()),
+            display_name: account.display_name.clone(),
+            email: account.email.clone().or_else(|| current.info().email.clone()),
+            phone_number: account.phone_number.clone(),
+            photo_url: account.photo_url.clone(),
+            provider_id: provider_data
+                .first()
+                .map(|p| p.provider_id.clone())
+                .unwrap_or_else(|| current.info().provider_id.clone()),
+        };
+
+        let mut user = User::new(self.app.clone(), info);
+        user.set_anonymous(current.is_anonymous() && provider_data.is_empty());
+        user.set_email_verified(account.email_verified.unwrap_or(false));
+        user.set_metadata(UserMetadata {
+            creation_time: account.created_at.as_deref().and_then(millis_to_utc_string),
+            last_sign_in_time: account.last_login_at.as_deref().and_then(millis_to_utc_string),
+        });
+        user.set_provider_data(provider_data);
+        if let Some(entries) = account.mfa_info.as_ref() {
+            user.set_mfa_info(Self::convert_mfa_entries(entries));
+        }
+        user.update_tokens(
+            current.cached_id_token(),
+            current.refresh_token(),
+            current
+                .token_manager()
+                .expiration_time()
+                .and_then(|at| at.duration_since(SystemTime::now()).ok()),
+        );
+
+        let user_arc = Arc::new(user);
+        self.adopt_user(&user_arc);
+        *self.current_user.lock().unwrap() = Some(user_arc.clone());
+        self.after_token_update(user_arc.clone())?;
+        self.id_token_listeners.notify_always(Some(user_arc.clone()));
+        Ok(user_arc)
+    }
+
+    /// Returns the current user's ID token together with its decoded claims. Mirrors
+    /// `getIdTokenResult(user, forceRefresh)` in the JS SDK; the token is not signature-checked
+    /// (clients never are), only parsed.
+    pub async fn get_id_token_result(&self, force_refresh: bool) -> AuthResult<IdTokenResult> {
+        let token = self
+            .get_token(force_refresh)
+            .await?
+            .ok_or_else(|| AuthError::InvalidCredential("No user signed in".into()))?;
+        parse_id_token_result(&token)
+    }
+
+    /// Lists the sign-in methods (`password`, `emailLink`, `google.com`, ...) registered for
+    /// `email`; empty when no account exists. Mirrors `fetchSignInMethodsForEmail`.
+    pub async fn fetch_sign_in_methods_for_email(&self, email: &str) -> AuthResult<Vec<String>> {
+        let api_key = self.api_key()?;
+        let endpoint = self.identity_toolkit_endpoint();
+        fetch_sign_in_methods_for_email(&self.rest_client, &endpoint, &api_key, email).await
+    }
+
+    /// Sends a verification email to `new_email`; the address is applied to the account once
+    /// the link is opened (or the code passed to [`apply_action_code`](Self::apply_action_code)).
+    /// Mirrors `verifyBeforeUpdateEmail`.
+    pub async fn verify_before_update_email(
+        &self,
+        new_email: &str,
+        settings: Option<&ActionCodeSettings>,
+    ) -> AuthResult<()> {
+        let user = self.require_current_user()?;
+        let id_token = user.get_id_token(false).await?;
+        let api_key = self.api_key()?;
+        let endpoint = self.identity_toolkit_endpoint();
+        send_verify_and_change_email(&self.rest_client, &endpoint, &api_key, &id_token, new_email, settings).await
+    }
+
+    /// Links an email/password credential to the current user, typically to upgrade an
+    /// anonymous account. Mirrors `linkWithCredential(user, EmailAuthProvider.credential(...))`.
+    pub async fn link_with_email_and_password(&self, email: &str, password: &str) -> AuthResult<UserCredential> {
+        let user = self.require_current_user()?;
+        let id_token = user.get_id_token(false).await?;
+        let api_key = self.api_key()?;
+        let request = SignUpRequest {
+            id_token: Some(id_token),
+            return_secure_token: Some(true),
+            email: Some(email.to_owned()),
+            password: Some(password.to_owned()),
+            tenant_id: None,
+            captcha_response: None,
+            client_type: None,
+            recaptcha_version: None,
+        };
+        let response: SignUpResponse = self.execute_request("accounts:signUp", &api_key, &request).await?;
+        let new_id_token = response
+            .id_token
+            .ok_or_else(|| AuthError::InvalidCredential("accounts:signUp response missing idToken".into()))?;
+        let refresh_token = response
+            .refresh_token
+            .ok_or_else(|| AuthError::InvalidCredential("accounts:signUp response missing refreshToken".into()))?;
+        let payload = SignInResponsePayload {
+            local_id: response.local_id.as_deref().unwrap_or(user.uid()),
+            email: response.email.as_deref().or(Some(email)),
+            phone_number: user.info().phone_number.as_deref(),
+            id_token: &new_id_token,
+            refresh_token: &refresh_token,
+            expires_in: response.expires_in.as_deref(),
+            provider_id: Some(EmailAuthProvider::PROVIDER_ID),
+            operation: "link",
+            anonymous: false,
+        };
+        self.finalize_sign_in(payload)
     }
 
     /// Registers an observer that is invoked whenever the signed-in user changes.
@@ -1218,7 +1404,7 @@ impl Auth {
         self.adopt_user(&user_arc);
         *self.current_user.lock().unwrap() = Some(user_arc.clone());
         self.after_token_update(user_arc.clone())?;
-        self.listeners.notify(Some(user_arc.clone()));
+        self.publish_user(Some(user_arc.clone()));
 
         Ok(UserCredential {
             user: user_arc,
@@ -1303,7 +1489,7 @@ impl Auth {
         self.adopt_user(&new_user);
         *self.current_user.lock().unwrap() = Some(new_user.clone());
         self.after_token_update(new_user.clone())?;
-        self.listeners.notify(Some(new_user.clone()));
+        self.publish_user(Some(new_user.clone()));
         Ok(new_user)
     }
 
@@ -1531,7 +1717,7 @@ impl Auth {
             Some(expires_in),
         );
         self.after_token_update(user.clone())?;
-        self.listeners.notify(Some(user.clone()));
+        self.publish_user(Some(user.clone()));
         Ok(response.id_token)
     }
 
@@ -1971,12 +2157,15 @@ impl Auth {
     pub async fn reauthenticate_with_oauth_credential(&self, credential: AuthCredential) -> AuthResult<Arc<User>> {
         let user = self.require_current_user()?;
         let result = self
-            .exchange_oauth_credential(
-                credential,
-                MultiFactorOperation::Reauthenticate,
-                Some(user.get_id_token(false).await?),
-            )
+            .exchange_oauth_credential(credential, MultiFactorOperation::Reauthenticate, None)
             .await?;
+        if result.user.uid() != user.uid() {
+            return Err(AuthError::Server(crate::auth::AuthServerError::new(
+                "USER_MISMATCH",
+                Some("The supplied credentials do not correspond to the previously signed in user.".into()),
+                None,
+            )));
+        }
         Ok(result.user)
     }
 
@@ -1993,6 +2182,8 @@ impl Auth {
             request_uri: self.oauth_request_uri(),
             return_idp_credential: true,
             return_secure_token: true,
+            // Reauthentication must resolve to an existing account, never create one.
+            auto_create: (operation == MultiFactorOperation::Reauthenticate).then_some(false),
             id_token,
         };
 
@@ -2040,7 +2231,7 @@ impl Auth {
             .or_else(|| Some(oauth_credential.provider_id().to_string()))
             .unwrap_or_else(|| EmailAuthProvider::PROVIDER_ID.to_string());
 
-        self.listeners.notify(Some(user_arc.clone()));
+        self.publish_user(Some(user_arc.clone()));
 
         Ok(UserCredential {
             user: user_arc,
@@ -2062,7 +2253,7 @@ impl Auth {
         let endpoint = self.identity_toolkit_endpoint();
         let response = update_account(&self.rest_client, &endpoint, &api_key, &request).await?;
         let updated_user = self.apply_account_update(&current_user, &response)?;
-        self.listeners.notify(Some(updated_user.clone()));
+        self.publish_user(Some(updated_user.clone()));
         Ok(updated_user)
     }
 
@@ -2235,13 +2426,13 @@ impl Auth {
                 *self.current_user.lock().unwrap() = Some(user_arc.clone());
                 self.schedule_refresh_for_user(user_arc.clone());
                 if notify_listeners {
-                    self.listeners.notify(Some(user_arc));
+                    self.publish_user(Some(user_arc));
                 }
             }
             _ => {
                 self.clear_local_user_state();
                 if notify_listeners {
-                    self.listeners.notify(None);
+                    self.publish_user(None);
                 }
             }
         }
@@ -2355,20 +2546,17 @@ impl Auth {
         current_user: &Arc<User>,
         response: &UpdateAccountResponse,
     ) -> AuthResult<Arc<User>> {
-        let id_token = response
-            .id_token
-            .clone()
-            .ok_or_else(|| AuthError::InvalidCredential("accounts:update response missing idToken".into()))?;
-        let refresh_token = response
-            .refresh_token
-            .clone()
-            .ok_or_else(|| AuthError::InvalidCredential("accounts:update response missing refreshToken".into()))?;
-
-        let expires_in = response
-            .expires_in
-            .as_deref()
-            .map(|value| self.parse_expires_in(value))
-            .transpose()?;
+        // The backend only mints new tokens when the email or password changed; a profile-only
+        // update keeps the current ones (JS: `_updateTokensIfNecessary`).
+        let id_token = response.id_token.clone().or_else(|| current_user.cached_id_token());
+        let refresh_token = response.refresh_token.clone().or_else(|| current_user.refresh_token());
+        let expires_in = match response.expires_in.as_deref() {
+            Some(value) if response.id_token.is_some() => Some(self.parse_expires_in(value)?),
+            _ => current_user
+                .token_manager()
+                .expiration_time()
+                .and_then(|at| at.duration_since(SystemTime::now()).ok()),
+        };
 
         let uid = response
             .local_id
@@ -2411,7 +2599,7 @@ impl Auth {
             let factors = Self::convert_mfa_entries(entries);
             user.set_mfa_info(factors);
         }
-        user.update_tokens(Some(id_token), Some(refresh_token), expires_in);
+        user.update_tokens(id_token, refresh_token, expires_in);
 
         let user_arc = Arc::new(user);
         self.adopt_user(&user_arc);
@@ -2612,6 +2800,52 @@ fn auth_factory(
         reason: err.to_string(),
     })?;
     Ok(auth as DynService)
+}
+
+/// Formats a decimal millisecond timestamp as the UTC string the JS SDK uses for
+/// `UserMetadata` (e.g. `Mon, 07 Sep 2026 14:16:49 GMT`).
+fn millis_to_utc_string(millis: &str) -> Option<String> {
+    let millis: i64 = millis.parse().ok()?;
+    let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)?;
+    Some(datetime.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+}
+
+fn seconds_to_utc_string(seconds: i64) -> Option<String> {
+    let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0)?;
+    Some(datetime.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+}
+
+/// Decodes the payload of a Firebase ID token into an [`IdTokenResult`] without verifying the
+/// signature (mirrors `getIdTokenResult`, which also only parses).
+pub fn parse_id_token_result(token: &str) -> AuthResult<IdTokenResult> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    let mut parts = token.split('.');
+    let (_header, payload) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(h), Some(p), Some(_)) => (h, p),
+        _ => return Err(AuthError::InvalidCredential("ID token is not a JWT".into())),
+    };
+    let bytes = URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .map_err(|err| AuthError::InvalidCredential(format!("ID token payload is not base64url: {err}")))?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|err| AuthError::InvalidCredential(format!("ID token payload is not JSON: {err}")))?;
+    let seconds = |key: &str| claims.get(key).and_then(serde_json::Value::as_i64);
+    Ok(IdTokenResult {
+        token: token.to_string(),
+        auth_time: seconds("auth_time").and_then(seconds_to_utc_string),
+        issued_at_time: seconds("iat").and_then(seconds_to_utc_string),
+        expiration_time: seconds("exp").and_then(seconds_to_utc_string),
+        sign_in_provider: claims
+            .pointer("/firebase/sign_in_provider")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        sign_in_second_factor: claims
+            .pointer("/firebase/sign_in_second_factor")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        claims,
+    })
 }
 
 fn auth_internal_factory(
@@ -3077,7 +3311,7 @@ mod tests {
 
         let start_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaSignIn:start")
+                .path("/v2/accounts/mfaSignIn:start")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "mfaPendingCredential": "PENDING_TOKEN",
@@ -3101,7 +3335,7 @@ mod tests {
 
         let finalize_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaSignIn:finalize")
+                .path("/v2/accounts/mfaSignIn:finalize")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "mfaPendingCredential": "PENDING_TOKEN",
@@ -3181,7 +3415,7 @@ mod tests {
 
         let start_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaSignIn:start")
+                .path("/v2/accounts/mfaSignIn:start")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "mfaPendingCredential": "REAUTH_PENDING",
@@ -3205,7 +3439,7 @@ mod tests {
 
         let finalize_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaSignIn:finalize")
+                .path("/v2/accounts/mfaSignIn:finalize")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "mfaPendingCredential": "REAUTH_PENDING",
@@ -3289,7 +3523,7 @@ mod tests {
 
         let start_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaSignIn:start")
+                .path("/v2/accounts/mfaSignIn:start")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "mfaPendingCredential": "LINK_PENDING",
@@ -3313,7 +3547,7 @@ mod tests {
 
         let finalize_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaSignIn:finalize")
+                .path("/v2/accounts/mfaSignIn:finalize")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "mfaPendingCredential": "LINK_PENDING",
@@ -3395,7 +3629,7 @@ mod tests {
 
         let start_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaSignIn:start")
+                .path("/v2/accounts/mfaSignIn:start")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "mfaPendingCredential": "LINK_PENDING",
@@ -3425,7 +3659,7 @@ mod tests {
 
         let finalize_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaSignIn:finalize")
+                .path("/v2/accounts/mfaSignIn:finalize")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "mfaPendingCredential": "LINK_PENDING",
@@ -3504,7 +3738,7 @@ mod tests {
 
         let start_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaSignIn:start")
+                .path("/v2/accounts/mfaSignIn:start")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "mfaPendingCredential": "PASSKEY_PENDING",
@@ -3535,7 +3769,7 @@ mod tests {
         let verification_info_clone = verification_info.clone();
         let finalize_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaSignIn:finalize")
+                .path("/v2/accounts/mfaSignIn:finalize")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "mfaPendingCredential": "PASSKEY_PENDING",
@@ -3657,7 +3891,7 @@ mod tests {
 
         let start_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaSignIn:start")
+                .path("/v2/accounts/mfaSignIn:start")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "mfaPendingCredential": "PASSKEY_PENDING",
@@ -3701,7 +3935,7 @@ mod tests {
 
         let start_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaEnrollment:start")
+                .path("/v2/accounts/mfaEnrollment:start")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "idToken": TEST_ID_TOKEN,
@@ -3750,7 +3984,7 @@ mod tests {
 
         let finalize_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaEnrollment:finalize")
+                .path("/v2/accounts/mfaEnrollment:finalize")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "idToken": TEST_ID_TOKEN,
@@ -3793,7 +4027,7 @@ mod tests {
 
         let start_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaEnrollment:start")
+                .path("/v2/accounts/mfaEnrollment:start")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "idToken": TEST_ID_TOKEN,
@@ -3817,7 +4051,7 @@ mod tests {
 
         let finalize_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaEnrollment:finalize")
+                .path("/v2/accounts/mfaEnrollment:finalize")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "idToken": TEST_ID_TOKEN,
@@ -3902,7 +4136,7 @@ mod tests {
 
         let start_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaSignIn:start")
+                .path("/v2/accounts/mfaSignIn:start")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "mfaPendingCredential": "PASSKEY_PENDING",
@@ -3925,7 +4159,7 @@ mod tests {
 
         let finalize_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaSignIn:finalize")
+                .path("/v2/accounts/mfaSignIn:finalize")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "mfaPendingCredential": "PASSKEY_PENDING",
@@ -3985,7 +4219,7 @@ mod tests {
 
         let start_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaEnrollment:start")
+                .path("/v2/accounts/mfaEnrollment:start")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "idToken": TEST_ID_TOKEN,
@@ -4034,7 +4268,7 @@ mod tests {
 
         let finalize_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaEnrollment:finalize")
+                .path("/v2/accounts/mfaEnrollment:finalize")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "idToken": TEST_ID_TOKEN,
@@ -4102,7 +4336,7 @@ mod tests {
 
         let finalize_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaSignIn:finalize")
+                .path("/v2/accounts/mfaSignIn:finalize")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "mfaPendingCredential": "PENDING_TOTP",
@@ -4595,7 +4829,7 @@ mod tests {
 
         let enroll_start = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaEnrollment:start")
+                .path("/v2/accounts/mfaEnrollment:start")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "idToken": TEST_ID_TOKEN,
@@ -4612,7 +4846,7 @@ mod tests {
 
         let enroll_finalize = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/mfaEnrollment:finalize")
+                .path("/v2/accounts/mfaEnrollment:finalize")
                 .query_param("key", TEST_API_KEY)
                 .json_body(json!({
                     "idToken": TEST_ID_TOKEN,

@@ -183,6 +183,77 @@ pub async fn send_password_reset_email(client: &Client, endpoint: &str, api_key:
     send_oob_code_async(client.clone(), endpoint.to_owned(), api_key.to_owned(), request).await
 }
 
+/// Sends the VERIFY_AND_CHANGE_EMAIL out-of-band code (`verifyBeforeUpdateEmail` in the JS SDK).
+pub async fn send_verify_and_change_email(
+    client: &Client,
+    endpoint: &str,
+    api_key: &str,
+    id_token: &str,
+    new_email: &str,
+    settings: Option<&ActionCodeSettings>,
+) -> AuthResult<()> {
+    let mut request = SendOobCodeRequest::new(ActionCodeOperation::VerifyAndChangeEmail);
+    request.id_token = Some(id_token.to_owned());
+    request.new_email = Some(new_email.to_owned());
+    if let Some(settings) = settings {
+        request.can_handle_code_in_app = Some(settings.handle_code_in_app);
+        apply_action_code_settings(&mut request, settings)?;
+    }
+    send_oob_code_async(client.clone(), endpoint.to_owned(), api_key.to_owned(), request).await
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CreateAuthUriRequest {
+    identifier: String,
+    #[serde(rename = "continueUri")]
+    continue_uri: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct CreateAuthUriResponse {
+    #[serde(default)]
+    registered: bool,
+    #[serde(rename = "signinMethods", default)]
+    signin_methods: Vec<String>,
+}
+
+/// Returns the sign-in methods registered for `email` (`fetchSignInMethodsForEmail` in the JS
+/// SDK, backed by `accounts:createAuthUri`). An unknown email yields an empty list.
+pub async fn fetch_sign_in_methods_for_email(
+    client: &Client,
+    endpoint: &str,
+    api_key: &str,
+    email: &str,
+) -> AuthResult<Vec<String>> {
+    let url = identity_toolkit_url(endpoint, "accounts:createAuthUri", api_key);
+    let request = CreateAuthUriRequest {
+        identifier: email.to_owned(),
+        // The JS SDK sends the current page URL; the value only has to be a valid URL.
+        continue_uri: "http://localhost".to_owned(),
+    };
+    let response = client
+        .post(url)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|err| AuthError::Network(err.to_string()))?;
+    if response.status().is_success() {
+        let parsed = response
+            .json::<CreateAuthUriResponse>()
+            .await
+            .map_err(|err| AuthError::InvalidCredential(err.to_string()))?;
+        Ok(if parsed.registered {
+            parsed.signin_methods
+        } else {
+            Vec::new()
+        })
+    } else {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_else(|_| String::new());
+        Err(map_error(status, body))
+    }
+}
+
 pub async fn send_email_verification(client: &Client, endpoint: &str, api_key: &str, id_token: &str) -> AuthResult<()> {
     let mut request = SendOobCodeRequest::new(ActionCodeOperation::VerifyEmail);
     request.id_token = Some(id_token.to_owned());

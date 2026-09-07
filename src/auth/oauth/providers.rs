@@ -227,3 +227,43 @@ mod tests {
         assert!(provider.pkce_enabled());
     }
 }
+
+/// Builds an [`AuthCredential`] for `provider_id` from tokens obtained out of band (a native
+/// Google/Apple/Facebook SDK, a custom OAuth flow, or the Auth emulator's fake exchange).
+/// Mirrors `OAuthProvider.credential({ idToken, accessToken })` in the JS SDK.
+pub fn oauth_credential(
+    provider_id: &str,
+    id_token: Option<&str>,
+    access_token: Option<&str>,
+) -> crate::auth::AuthCredential {
+    let mut token_response = serde_json::Map::new();
+    if let Some(id_token) = id_token {
+        token_response.insert("idToken".to_string(), serde_json::Value::String(id_token.to_string()));
+    }
+    if let Some(access_token) = access_token {
+        token_response.insert("accessToken".to_string(), serde_json::Value::String(access_token.to_string()));
+    }
+    crate::auth::AuthCredential {
+        provider_id: provider_id.to_string(),
+        sign_in_method: provider_id.to_string(),
+        token_response: serde_json::Value::Object(token_response),
+    }
+}
+
+impl GoogleAuthProvider {
+    pub const PROVIDER_ID: &'static str = "google.com";
+
+    /// Mirrors `GoogleAuthProvider.credential(idToken, accessToken)`.
+    pub fn credential(id_token: Option<&str>, access_token: Option<&str>) -> crate::auth::AuthCredential {
+        oauth_credential(Self::PROVIDER_ID, id_token, access_token)
+    }
+}
+
+impl FacebookAuthProvider {
+    pub const PROVIDER_ID: &'static str = "facebook.com";
+
+    /// Mirrors `FacebookAuthProvider.credential(accessToken)`.
+    pub fn credential(access_token: &str) -> crate::auth::AuthCredential {
+        oauth_credential(Self::PROVIDER_ID, None, Some(access_token))
+    }
+}

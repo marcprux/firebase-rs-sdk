@@ -4,8 +4,16 @@ use serde_json::Value;
 
 use crate::auth::error::{map_server_error, AuthError, AuthResult};
 
+/// The multi-factor endpoints live under the `v2` API surface; everything else the SDK talks to
+/// is `v1`. Derive the v2 base from the configured Identity Toolkit endpoint so that emulator and
+/// custom endpoints keep working.
 fn endpoint_url(base: &str, path: &str, api_key: &str) -> String {
-    format!("{}/{}?key={}", base.trim_end_matches('/'), path, api_key)
+    let base = base.trim_end_matches('/');
+    let base = match base.strip_suffix("/v1") {
+        Some(root) => format!("{root}/v2"),
+        None => base.to_string(),
+    };
+    format!("{base}/{path}?key={api_key}")
 }
 
 #[derive(Debug, Deserialize)]

@@ -11,6 +11,7 @@ Based on the current codebase, I’d put parity with the Firebase Auth JS SDK at
 
 
 ## What's Implemented
+- Emulator-verified flows (tests/live_endpoints.rs): password reset, email verification + `reload`, email-link sign-in, custom tokens with claims + `get_id_token_result`, profile/password/email updates with reauthentication and `verify_before_update_email`, `on_id_token_changed`, Google credential sign-in/link/unlink/reauth (`GoogleAuthProvider::credential`), `fetch_sign_in_methods_for_email`, anonymous upgrade via `link_with_email_and_password`, phone sign-in/link, phone MFA enrol/challenge/unenrol (`Auth::multi_factor_resolver`). Fixes: MFA endpoints now use `v2`; IdP reauthentication sends `autoCreate:false` without `idToken` and checks the uid; profile updates keep the current tokens when the backend omits new ones; custom-token sign-in falls back to the token `sub` when `localId` is absent; `User` carries `metadata` and `provider_data`.
 
 - **Auth service core** (`api.rs`, `mod.rs`) provides component registration, `Auth::builder`, and integration with the app provider registry so callers can resolve `Auth` instances.
 - **OAuth scaffolding** (`oauth/`) defines `OAuthRequest`, popup/redirect handler traits, provider builders with PKCE support, and redirect persistence hooks alongside native/WASM examples.
