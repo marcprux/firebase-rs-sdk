@@ -1,4 +1,4 @@
-use crate::auth::error::{map_mfa_error_code, AuthError, AuthResult};
+use crate::auth::error::{map_server_error, AuthError, AuthResult};
 use crate::auth::model::{
     GetAccountInfoResponse, MfaEnrollmentInfo, ProviderUserInfo, SignInWithPasswordRequest, SignInWithPasswordResponse,
 };
@@ -571,18 +571,7 @@ async fn get_account_info_async(
 }
 
 fn map_error(status: StatusCode, body: String) -> AuthError {
-    if let Ok(parsed) = serde_json::from_str::<ErrorResponse>(&body) {
-        if let Some(error) = parsed.error {
-            if let Some(message) = error.message {
-                if let Some(mapped) = map_mfa_error_code(&message) {
-                    return mapped;
-                }
-                return AuthError::InvalidCredential(message);
-            }
-        }
-    }
-
-    AuthError::InvalidCredential(format!("Request failed with status {status}: {body}"))
+    map_server_error(Some(status.as_u16()), &body)
 }
 
 #[cfg(test)]

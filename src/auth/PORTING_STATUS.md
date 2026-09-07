@@ -90,3 +90,6 @@ This section tracks the JavaScript test surface in `packages/auth` and maps it t
 - **Browser/Platform surfaces** – After core coverage stabilises, adapt the mock pattern for browser persistence/recaptcha tests (gated behind `wasm-web`) and outline any required feature flags or stubbed APIs.
 
 Keep this roadmap updated as suites are ported: mark completed migrations, link Rust test modules, and note any design deviations from the JavaScript originals.
+
+## Implemented
+- Backend errors are mapped to typed codes: `AuthError::Server(AuthServerError)` exposes an `AuthErrorCode` (`auth/wrong-password`, `auth/user-not-found`, `auth/too-many-requests`, ...) using the JS `SERVER_ERROR_MAP`, plus the raw server code, the ` : ` detail message and the HTTP status. Unmapped codes are normalised the JS way (`CONFIGURATION_NOT_FOUND` becomes `auth/configuration-not-found`). Transport failures stay `AuthError::Network`.

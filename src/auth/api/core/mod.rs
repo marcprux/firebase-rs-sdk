@@ -18,7 +18,7 @@ pub(crate) use token::DEFAULT_SECURE_TOKEN_ENDPOINT;
 pub use token::{refresh_id_token, refresh_id_token_with_endpoint, RefreshTokenResponse};
 
 use crate::app::{register_component, AppError, FirebaseApp, LOGGER as APP_LOGGER};
-use crate::auth::error::{AuthError, AuthResult};
+use crate::auth::error::{map_server_error, AuthError, AuthResult};
 use crate::auth::model::MfaEnrollmentInfo;
 use crate::auth::model::{
     AuthConfig, AuthCredential, AuthStateListeners, EmailAuthProvider, GetAccountInfoResponse,
@@ -602,9 +602,10 @@ impl Auth {
             .await
             .map_err(|err| AuthError::Network(err.to_string()))?;
 
-        if !response.status().is_success() {
-            let message = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(AuthError::Network(message));
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(map_server_error(Some(status.as_u16()), &body));
         }
 
         response.json().await.map_err(|err| AuthError::Network(err.to_string()))
@@ -2564,7 +2565,7 @@ pub fn auth_for_app(app: FirebaseApp) -> AuthResult<Arc<Auth>> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use crate::auth::error::MultiFactorAuthErrorCode;
+    use crate::auth::error::{AuthErrorCode, MultiFactorAuthErrorCode};
     use crate::auth::types::{ActionCodeSettings, AndroidSettings, ApplicationVerifier, IosSettings};
     use crate::auth::{
         get_multi_factor_resolver, FirebaseAuth, PhoneAuthProvider, PhoneMultiFactorGenerator,
@@ -2672,6 +2673,108 @@ mod tests {
         assert_eq!(credential.user.uid(), "uid-123");
         assert_eq!(credential.user.token_manager().access_token(), Some("id-token".to_string()));
         assert_eq!(credential.user.refresh_token(), Some("refresh-token".to_string()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrong_password_maps_to_typed_server_error() {
+        let server = start_mock_server();
+        let auth = build_auth(&server);
+
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/accounts:signInWithPassword");
+            then.status(400).json_body(json!({
+                "error": {
+                    "code": 400,
+                    "message": "INVALID_PASSWORD",
+                    "errors": [{ "message": "INVALID_PASSWORD", "domain": "global", "reason": "invalid" }]
+                }
+            }));
+        });
+
+        let err = auth
+            .sign_in_with_email_and_password("user@example.com", "nope")
+            .await
+            .expect_err("wrong password must fail");
+        mock.assert();
+
+        assert_eq!(err.code(), Some(&AuthErrorCode::WrongPassword));
+        match err {
+            AuthError::Server(server_err) => {
+                assert_eq!(server_err.server_code(), "INVALID_PASSWORD");
+                assert_eq!(server_err.http_status(), Some(400));
+                assert_eq!(server_err.to_string(), "auth/wrong-password (INVALID_PASSWORD)");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        assert!(auth.current_user().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sign_up_with_existing_email_maps_to_email_already_in_use() {
+        let server = start_mock_server();
+        let auth = build_auth(&server);
+
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/accounts:signUp");
+            then.status(400).json_body(json!({
+                "error": { "code": 400, "message": "EMAIL_EXISTS" }
+            }));
+        });
+
+        let err = auth
+            .create_user_with_email_and_password("user@example.com", "secret")
+            .await
+            .expect_err("duplicate email must fail");
+        mock.assert();
+        assert_eq!(err.code(), Some(&AuthErrorCode::EmailAlreadyInUse));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn throttled_sign_in_keeps_server_detail_message() {
+        let server = start_mock_server();
+        let auth = build_auth(&server);
+
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/accounts:signInWithPassword");
+            then.status(400).json_body(json!({
+                "error": {
+                    "code": 400,
+                    "message": "TOO_MANY_ATTEMPTS_TRY_LATER : Access to this account has been temporarily disabled due to many failed login attempts."
+                }
+            }));
+        });
+
+        let err = auth
+            .sign_in_with_email_and_password("user@example.com", "secret")
+            .await
+            .expect_err("throttled sign-in must fail");
+        match err {
+            AuthError::Server(server_err) => {
+                assert_eq!(server_err.code(), &AuthErrorCode::TooManyRequests);
+                assert!(server_err
+                    .server_message()
+                    .unwrap()
+                    .starts_with("Access to this account"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unmapped_server_code_is_normalised_like_js() {
+        let server = start_mock_server();
+        let auth = build_auth(&server);
+
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/accounts:signUp");
+            then.status(400).json_body(json!({
+                "error": { "code": 400, "message": "CONFIGURATION_NOT_FOUND" }
+            }));
+        });
+
+        let err = auth.sign_in_anonymously().await.expect_err("must fail");
+        assert_eq!(err.code(), Some(&AuthErrorCode::Other("configuration-not-found".into())));
+        assert_eq!(err.code().unwrap().full_code(), "auth/configuration-not-found");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3326,8 +3429,9 @@ mod tests {
         start_mock.assert();
 
         match err {
-            AuthError::InvalidCredential(message) => {
-                assert!(message.contains("INVALID_CHALLENGE"));
+            AuthError::Server(err) => {
+                assert_eq!(err.server_code(), "INVALID_CHALLENGE");
+                assert_eq!(err.code(), &AuthErrorCode::Other("invalid-challenge".into()));
             }
             _ => panic!("unexpected error variant: {err:?}"),
         }
@@ -3499,8 +3603,9 @@ mod tests {
         finalize_mock.assert();
 
         match err {
-            AuthError::InvalidCredential(message) => {
-                assert!(message.contains("MISSING_WEBAUTHN_VERIFICATION_INFO"));
+            AuthError::Server(err) => {
+                assert_eq!(err.server_code(), "MISSING_WEBAUTHN_VERIFICATION_INFO");
+                assert_eq!(err.code(), &AuthErrorCode::Other("missing-webauthn-verification-info".into()));
             }
             _ => panic!("unexpected error variant: {err:?}"),
         }
@@ -3859,10 +3964,13 @@ mod tests {
             .await;
 
         mock.assert();
-        assert!(matches!(
-            result,
-            Err(AuthError::Network(message)) if message.contains("INVALID_PASSWORD")
-        ));
+        match result {
+            Err(AuthError::Server(err)) => {
+                assert_eq!(err.code(), &AuthErrorCode::WrongPassword);
+                assert_eq!(err.server_code(), "INVALID_PASSWORD");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4629,10 +4737,13 @@ mod tests {
         let result = auth.unlink_providers(&[GOOGLE_PROVIDER_ID]).await;
 
         mock.assert();
-        assert!(matches!(
-            result,
-            Err(AuthError::InvalidCredential(message)) if message == "INVALID_PROVIDER_ID"
-        ));
+        match result {
+            Err(AuthError::Server(err)) => {
+                assert_eq!(err.server_code(), "INVALID_PROVIDER_ID");
+                assert_eq!(err.code(), &AuthErrorCode::Other("invalid-provider-id".into()));
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4695,9 +4806,12 @@ mod tests {
         let result = auth.get_account_info().await;
 
         mock.assert();
-        assert!(matches!(
-            result,
-            Err(AuthError::InvalidCredential(message)) if message == "INVALID_ID_TOKEN"
-        ));
+        match result {
+            Err(AuthError::Server(err)) => {
+                assert_eq!(err.code(), &AuthErrorCode::InvalidUserToken);
+                assert_eq!(err.server_code(), "INVALID_ID_TOKEN");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 }

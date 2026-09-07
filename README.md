@@ -48,7 +48,7 @@ percentages are estimates and deliberately stricter than the ones in each module
 | storage | 70% | real (`firebasestorage.googleapis.com/v0`) | yes | uploads, downloads, metadata, list, delete; no resumable pause/resume |
 | app | 70% | n/a | yes | app lifecycle, options, component container, heartbeat header |
 | data_connect | 65% | real (`firebasedataconnect.googleapis.com/v1`) | no | executeQuery / executeMutation, emulator, subscriptions |
-| auth | 55% | real (Identity Toolkit v1 + securetoken) | yes | broad REST coverage; error mapping, listeners and OAuth flows incomplete |
+| auth | 60% | real (Identity Toolkit v1 + securetoken) | yes | broad REST coverage with typed `auth/...` error codes; listeners and OAuth flows incomplete |
 | functions | 50% | real (`cloudfunctions.net` / custom domain) | yes | callable protocol with auth, App Check and FID headers; no streaming |
 | remote_config | 50% | real (`firebaseremoteconfig.googleapis.com/v1`) | yes | fetch, ETag-based activate, defaults with correct value sources, custom signals, typed getters |
 | app_check | 45% | real exchange endpoint, untested | no | custom provider and refresher only on native; reCAPTCHA is wasm-only |
@@ -83,7 +83,7 @@ percentages are estimates and deliberately stricter than the ones in each module
 | `signInWithPopup`, `signInWithRedirect`, `linkWithPopup`, `getRedirectResult` | partial, delegates to a caller-supplied handler; no built-in flow |
 | `onAuthStateChanged` | partial, unsubscribe is a no-op and sign-out is not reported |
 | `setPersistence` | partial, constructor-time only |
-| Typed error codes (`auth/wrong-password`, `auth/user-not-found`, ...) | missing, server errors surface as `AuthError::Network` |
+| Typed error codes (`auth/wrong-password`, `auth/user-not-found`, `auth/too-many-requests`, ...) | implemented; `AuthError::Server` carries an `AuthErrorCode` mapped with the JS `SERVER_ERROR_MAP`, unmapped codes are normalised like the JS SDK (`auth/configuration-not-found`) |
 | `getIdTokenResult`, `reload`, `updateCurrentUser`, `onIdTokenChanged`, `beforeAuthStateChanged` | missing |
 | `fetchSignInMethodsForEmail`, `verifyBeforeUpdateEmail`, `revokeAccessToken`, `validatePassword`, `updatePhoneNumber` | missing |
 | `connectAuthEmulator`, `useDeviceLanguage`, `tenantId`, `RecaptchaVerifier`, `SAMLAuthProvider` | missing |

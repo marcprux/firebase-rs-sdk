@@ -58,6 +58,7 @@ fn map_auth_error(error: AuthError) -> FirestoreError {
         AuthError::NotImplemented(feature) => internal_error(format!("{feature} is not implemented")),
         AuthError::MultiFactorRequired(err) => unauthenticated(err.to_string()),
         AuthError::MultiFactor(err) => unauthenticated(err.to_string()),
+        AuthError::Server(err) => unauthenticated(err.to_string()),
     }
 }
 

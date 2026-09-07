@@ -1,7 +1,7 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::error::{AuthError, AuthResult};
+use crate::auth::error::{map_server_error, AuthError, AuthResult};
 use crate::auth::model::MfaEnrollmentInfo;
 
 /// Fields returned by the `signInWithIdp` Firebase Auth REST endpoint.
@@ -72,7 +72,7 @@ async fn sign_in_with_idp_async(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(AuthError::InvalidCredential(format!("signInWithIdp failed ({status}): {body}")));
+        return Err(map_server_error(Some(status.as_u16()), &body));
     }
 
     response

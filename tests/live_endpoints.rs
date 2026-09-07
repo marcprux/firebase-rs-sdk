@@ -45,7 +45,7 @@ use std::sync::Once;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use firebase_rs_sdk::app::{delete_app, initialize_app, FirebaseApp, FirebaseAppSettings, FirebaseOptions};
-use firebase_rs_sdk::auth::{auth_for_app, register_auth_component, AuthError};
+use firebase_rs_sdk::auth::{auth_for_app, register_auth_component, AuthError, AuthErrorCode};
 use firebase_rs_sdk::firestore::{
     get_firestore, FieldPath, FilterOperator, Firestore, FirestoreClient, FirestoreErrorCode, FirestoreValue, ValueKind,
 };
@@ -673,15 +673,17 @@ async fn auth_email_password_create_sign_in_and_delete() {
     match wrong {
         Ok(_) => panic!("sign-in with a wrong password must fail"),
         Err(err) => {
-            let text = err.to_string();
+            // Projects with email enumeration protection answer INVALID_LOGIN_CREDENTIALS
+            // (`auth/invalid-credential`); older projects answer INVALID_PASSWORD
+            // (`auth/wrong-password`). Both must surface as typed server errors.
+            let code = err.code().cloned();
             assert!(
-                text.contains("INVALID_PASSWORD") || text.contains("INVALID_LOGIN_CREDENTIALS"),
-                "expected an Identity Toolkit credential error, got: {text}"
+                matches!(code, Some(AuthErrorCode::WrongPassword | AuthErrorCode::InvalidCredential)),
+                "expected a typed credential error, got {} ({})",
+                auth_error_variant(&err),
+                err
             );
-            // Documented gap: the SDK currently reports Identity Toolkit errors as
-            // AuthError::Network rather than a typed code. Record which variant we got so the
-            // behaviour is visible in the test log when it is fixed.
-            eprintln!("wrong-password error variant: {}", auth_error_variant(&err));
+            eprintln!("wrong-password error: {err}");
         }
     }
 
@@ -692,8 +694,17 @@ async fn auth_email_password_create_sign_in_and_delete() {
     assert_eq!(signed_in.user.uid(), uid, "the same account must be returned");
 
     auth.delete_user().await.expect("delete_user");
-    let after_delete = auth.sign_in_with_email_and_password(&email, &password).await;
-    assert!(after_delete.is_err(), "deleted account must no longer sign in");
+    let after_delete = auth
+        .sign_in_with_email_and_password(&email, &password)
+        .await
+        .expect_err("deleted account must no longer sign in");
+    assert!(
+        matches!(
+            after_delete.code(),
+            Some(AuthErrorCode::UserNotFound | AuthErrorCode::InvalidCredential)
+        ),
+        "expected user-not-found or invalid-credential, got {after_delete}"
+    );
     delete_app(&app).await.expect("delete_app");
 }
 
@@ -706,6 +717,7 @@ fn auth_error_variant(err: &AuthError) -> &'static str {
         AuthError::NotImplemented(_) => "NotImplemented",
         AuthError::MultiFactorRequired(_) => "MultiFactorRequired",
         AuthError::MultiFactor(_) => "MultiFactor",
+        AuthError::Server(_) => "Server",
     }
 }
 

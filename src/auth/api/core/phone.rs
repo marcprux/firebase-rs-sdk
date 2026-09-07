@@ -1,7 +1,7 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::error::{map_mfa_error_code, AuthError, AuthResult};
+use crate::auth::error::{map_server_error, AuthError, AuthResult};
 use crate::auth::model::MfaEnrollmentInfo;
 
 fn endpoint_url(base: &str, path: &str, api_key: &str) -> String {
@@ -62,19 +62,7 @@ pub async fn send_phone_verification_code(
     } else {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        if let Ok(parsed) = serde_json::from_str::<ErrorResponse>(&body) {
-            if let Some(error) = parsed.error {
-                if let Some(message) = error.message {
-                    if let Some(mapped) = map_mfa_error_code(&message) {
-                        return Err(mapped);
-                    }
-                    return Err(AuthError::InvalidCredential(message));
-                }
-            }
-        }
-        Err(AuthError::InvalidCredential(format!(
-            "sendVerificationCode failed ({status}): {body}"
-        )))
+        Err(map_server_error(Some(status.as_u16()), &body))
     }
 }
 
@@ -175,18 +163,6 @@ async fn execute_phone_request(
     } else {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        if let Ok(parsed) = serde_json::from_str::<ErrorResponse>(&body) {
-            if let Some(error) = parsed.error {
-                if let Some(message) = error.message {
-                    if let Some(mapped) = map_mfa_error_code(&message) {
-                        return Err(mapped);
-                    }
-                    return Err(AuthError::InvalidCredential(message));
-                }
-            }
-        }
-        Err(AuthError::InvalidCredential(format!(
-            "signInWithPhoneNumber failed ({status}): {body}"
-        )))
+        Err(map_server_error(Some(status.as_u16()), &body))
     }
 }

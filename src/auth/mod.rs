@@ -21,10 +21,12 @@ pub use api::{
 pub(crate) use api::DEFAULT_SECURE_TOKEN_ENDPOINT;
 
 #[doc(inline)]
-pub use error::{AuthError, AuthResult, MultiFactorAuthError, MultiFactorAuthErrorCode};
+pub use error::{
+    AuthError, AuthErrorCode, AuthResult, AuthServerError, MultiFactorAuthError, MultiFactorAuthErrorCode,
+};
 
 #[allow(unused_imports)]
-pub(crate) use error::map_mfa_error_code;
+pub(crate) use error::{map_mfa_error_code, map_server_error};
 
 #[doc(inline)]
 pub use model::{
