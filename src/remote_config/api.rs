@@ -38,13 +38,22 @@ pub struct RemoteConfig {
     inner: Arc<RemoteConfigInner>,
 }
 
+/// A fetched template together with the metadata needed to decide whether activating it changes
+/// the active configuration.
+#[derive(Clone, Debug)]
+struct FetchedTemplate {
+    config: HashMap<String, String>,
+    etag: Option<String>,
+    template_version: Option<u64>,
+}
+
 struct RemoteConfigInner {
     app: FirebaseApp,
     defaults: Mutex<HashMap<String, String>>,
-    fetched_config: Mutex<HashMap<String, String>>,
-    fetched_etag: Mutex<Option<String>>,
-    fetched_template_version: Mutex<Option<u64>>,
-    activated: Mutex<bool>,
+    /// The most recent successful (HTTP 200) fetch response, waiting to be activated.
+    ///
+    /// Mirrors `lastSuccessfulFetchResponse` in the JS SDK's storage layer.
+    last_successful_fetch: Mutex<Option<FetchedTemplate>>,
     settings: Mutex<RemoteConfigSettings>,
     fetch_client: Mutex<Arc<dyn RemoteConfigFetchClient>>,
     storage_cache: RemoteConfigStorageCache,
@@ -84,10 +93,7 @@ impl RemoteConfig {
             inner: Arc::new(RemoteConfigInner {
                 app,
                 defaults: Mutex::new(HashMap::new()),
-                fetched_config: Mutex::new(HashMap::new()),
-                fetched_etag: Mutex::new(None),
-                fetched_template_version: Mutex::new(None),
-                activated: Mutex::new(false),
+                last_successful_fetch: Mutex::new(None),
                 settings: Mutex::new(RemoteConfigSettings::default()),
                 fetch_client: Mutex::new(fetch_client),
                 storage_cache,
@@ -207,21 +213,11 @@ impl RemoteConfig {
 
         match response.status {
             200 => {
-                let config = response.config.unwrap_or_default();
-                let etag = response.etag;
-                {
-                    let mut fetched = self.inner.fetched_config.lock().unwrap();
-                    *fetched = config;
-                }
-                {
-                    let mut fetched_etag = self.inner.fetched_etag.lock().unwrap();
-                    *fetched_etag = etag;
-                }
-                {
-                    let mut fetched_template_version = self.inner.fetched_template_version.lock().unwrap();
-                    *fetched_template_version = response.template_version;
-                }
-                *self.inner.activated.lock().unwrap() = false;
+                *self.inner.last_successful_fetch.lock().unwrap() = Some(FetchedTemplate {
+                    config: response.config.unwrap_or_default(),
+                    etag: response.etag,
+                    template_version: response.template_version,
+                });
                 self.inner
                     .storage_cache
                     .set_last_fetch_status(FetchStatus::Success)
@@ -253,37 +249,36 @@ impl RemoteConfig {
         }
     }
 
+    /// Makes the most recently fetched template the active configuration.
+    ///
+    /// Returns `true` when the active configuration changed. Mirrors `activate()` in
+    /// `packages/remote-config/src/api.ts`: nothing is activated when no successful fetch has
+    /// completed, when the backend returned no template (no ETag), or when the fetched ETag equals
+    /// the ETag of the configuration that is already active. Default values supplied through
+    /// [`set_defaults`](Self::set_defaults) are never copied into the active configuration; they
+    /// keep reporting [`RemoteConfigValueSource::Default`].
     pub async fn activate(&self) -> RemoteConfigResult<bool> {
         self.inner.ensure_initialized().await?;
-        let mut activated = self.inner.activated.lock().unwrap();
-        let changed = !*activated;
-        if changed {
-            let mut fetched = self.inner.fetched_config.lock().unwrap();
-            let config = if fetched.is_empty() {
-                self.inner.defaults.lock().unwrap().clone()
-            } else {
-                fetched.clone()
-            };
-            fetched.clear();
-            drop(fetched);
 
-            let mut fetched_etag = self.inner.fetched_etag.lock().unwrap();
-            let etag = fetched_etag.take();
-            drop(fetched_etag);
-
-            let mut fetched_template_version = self.inner.fetched_template_version.lock().unwrap();
-            let template_version = fetched_template_version.take();
-            drop(fetched_template_version);
-
-            self.inner.storage_cache.set_active_config(config).await?;
-            self.inner.storage_cache.set_active_config_etag(etag).await?;
-            self.inner
-                .storage_cache
-                .set_active_config_template_version(template_version)
-                .await?;
+        let fetched = self.inner.last_successful_fetch.lock().unwrap().clone();
+        let Some(fetched) = fetched else {
+            return Ok(false);
+        };
+        let Some(etag) = fetched.etag.clone() else {
+            // A response without an ETag carries no template (e.g. `NO_TEMPLATE`).
+            return Ok(false);
+        };
+        if self.inner.storage_cache.active_config_etag().as_deref() == Some(etag.as_str()) {
+            return Ok(false);
         }
-        *activated = true;
-        Ok(changed)
+
+        self.inner.storage_cache.set_active_config(fetched.config).await?;
+        self.inner.storage_cache.set_active_config_etag(Some(etag)).await?;
+        self.inner
+            .storage_cache
+            .set_active_config_template_version(fetched.template_version)
+            .await?;
+        Ok(true)
     }
 
     /// Returns the timestamp (in milliseconds since epoch) of the last successful fetch.
@@ -677,7 +672,10 @@ mod tests {
     }
 
     #[test]
-    fn defaults_activate() {
+    fn activate_without_template_keeps_defaults_and_returns_false() {
+        // The backend answers `NO_TEMPLATE` (HTTP 200, no ETag, no entries) for projects that have
+        // never published a template. The JS SDK activates nothing in that case and defaults keep
+        // their `default` source.
         let options = FirebaseOptions {
             project_id: Some("project".into()),
             ..Default::default()
@@ -686,14 +684,21 @@ mod tests {
         let rc = remote_config(app);
         rc.set_defaults(HashMap::from([(String::from("welcome"), String::from("hello"))]));
         run_fetch(&rc).unwrap();
-        assert!(run_activate(&rc).unwrap());
-        assert_eq!(rc.get_string("welcome"), "hello");
         assert_eq!(rc.last_fetch_status(), FetchStatus::Success);
         assert!(rc.fetch_time_millis() > 0);
+
+        assert!(!run_activate(&rc).unwrap());
+        assert!(!run_activate(&rc).unwrap());
+        assert_eq!(rc.get_string("welcome"), "hello");
+        assert_eq!(rc.get_value("welcome").source(), RemoteConfigValueSource::Default);
+        assert!(rc
+            .get_all()
+            .values()
+            .all(|value| value.source() == RemoteConfigValueSource::Default));
     }
 
     #[test]
-    fn activate_after_defaults_returns_false() {
+    fn activate_without_prior_fetch_returns_false() {
         let options = FirebaseOptions {
             project_id: Some("project".into()),
             ..Default::default()
@@ -701,9 +706,56 @@ mod tests {
         let app = block_on_future(initialize_app(options, Some(unique_settings()))).unwrap();
         let rc = remote_config(app);
         rc.set_defaults(HashMap::from([(String::from("flag"), String::from("off"))]));
-        run_fetch(&rc).unwrap();
-        run_activate(&rc).unwrap();
         assert!(!run_activate(&rc).unwrap());
+        assert_eq!(rc.get_value("flag").source(), RemoteConfigValueSource::Default);
+    }
+
+    #[test]
+    fn activate_is_idempotent_for_the_same_etag() {
+        let options = FirebaseOptions {
+            project_id: Some("project".into()),
+            ..Default::default()
+        };
+        let app = block_on_future(initialize_app(options, Some(unique_settings()))).unwrap();
+        let rc = remote_config(app);
+        rc.set_fetch_client(Arc::new(StubFetchClient::new(FetchResponse {
+            status: 200,
+            etag: Some(String::from("etag-a")),
+            config: Some(HashMap::from([(String::from("flag"), String::from("on"))])),
+            template_version: Some(1),
+        })));
+
+        run_fetch(&rc).unwrap();
+        assert!(run_activate(&rc).unwrap());
+        assert!(!run_activate(&rc).unwrap(), "same template must not report a change");
+        assert_eq!(rc.get_value("flag").source(), RemoteConfigValueSource::Remote);
+
+        // A fetch that yields the same ETag again (e.g. the backend replays the template) is a no-op.
+        rc.set_fetch_client(Arc::new(StubFetchClient::new(FetchResponse {
+            status: 200,
+            etag: Some(String::from("etag-a")),
+            config: Some(HashMap::from([(String::from("flag"), String::from("on"))])),
+            template_version: Some(1),
+        })));
+        rc.set_config_settings(RemoteConfigSettingsUpdate {
+            minimum_fetch_interval_millis: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+        run_fetch(&rc).unwrap();
+        assert!(!run_activate(&rc).unwrap());
+
+        // A new ETag activates and reports the change.
+        rc.set_fetch_client(Arc::new(StubFetchClient::new(FetchResponse {
+            status: 200,
+            etag: Some(String::from("etag-b")),
+            config: Some(HashMap::from([(String::from("flag"), String::from("off"))])),
+            template_version: Some(2),
+        })));
+        run_fetch(&rc).unwrap();
+        assert!(run_activate(&rc).unwrap());
+        assert_eq!(rc.get_string("flag"), "off");
+        assert_eq!(rc.active_template_version(), Some(2));
     }
 
     #[test]
@@ -729,9 +781,15 @@ mod tests {
         };
         let app = block_on_future(initialize_app(options, Some(unique_settings()))).unwrap();
         let rc = remote_config(app);
-        rc.set_defaults(HashMap::from([(String::from("feature"), String::from("true"))]));
+        rc.set_defaults(HashMap::from([(String::from("feature"), String::from("false"))]));
+        rc.set_fetch_client(Arc::new(StubFetchClient::new(FetchResponse {
+            status: 200,
+            etag: Some(String::from("etag-feature")),
+            config: Some(HashMap::from([(String::from("feature"), String::from("true"))])),
+            template_version: Some(3),
+        })));
         run_fetch(&rc).unwrap();
-        run_activate(&rc).unwrap();
+        assert!(run_activate(&rc).unwrap());
 
         let value = rc.get_value("feature");
         assert_eq!(value.source(), RemoteConfigValueSource::Remote);
@@ -760,12 +818,17 @@ mod tests {
         };
         let app = block_on_future(initialize_app(options, Some(unique_settings()))).unwrap();
         let rc = remote_config(app);
-        rc.set_defaults(HashMap::from([
-            (String::from("feature"), String::from("true")),
-            (String::from("secondary"), String::from("value")),
-        ]));
+        rc.set_fetch_client(Arc::new(StubFetchClient::new(FetchResponse {
+            status: 200,
+            etag: Some(String::from("etag-all")),
+            config: Some(HashMap::from([
+                (String::from("feature"), String::from("true")),
+                (String::from("secondary"), String::from("value")),
+            ])),
+            template_version: Some(4),
+        })));
         run_fetch(&rc).unwrap();
-        run_activate(&rc).unwrap();
+        assert!(run_activate(&rc).unwrap());
         rc.set_defaults(HashMap::from([
             (String::from("feature"), String::from("false")),
             (String::from("secondary"), String::from("value")),

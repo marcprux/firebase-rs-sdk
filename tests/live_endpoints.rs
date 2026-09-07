@@ -52,7 +52,7 @@ use firebase_rs_sdk::firestore::{
 use firebase_rs_sdk::functions::error::FunctionsErrorCode;
 use firebase_rs_sdk::functions::{get_functions, register_functions_component};
 use firebase_rs_sdk::installations::{delete_installations, get_installations};
-use firebase_rs_sdk::remote_config::{get_remote_config, FetchStatus};
+use firebase_rs_sdk::remote_config::{get_remote_config, FetchStatus, RemoteConfigValueSource};
 use firebase_rs_sdk::storage::{get_storage_for_app, StorageErrorCode, StringFormat};
 
 // ---------------------------------------------------------------------------------------------
@@ -525,8 +525,9 @@ async fn remote_config_fetches_and_activates_live_template() {
         ("rust_sdk_live_flag".to_string(), "true".to_string()),
     ]));
 
-    // fetch_and_activate returns true when freshly fetched values were activated. With an empty
-    // template the backend answers NO_TEMPLATE, which the SDK treats as an empty successful fetch.
+    // fetch_and_activate returns true only when a template with a new ETag was activated. A project
+    // without a published template answers NO_TEMPLATE (HTTP 200, no ETag), which must activate
+    // nothing and leave the defaults reporting the `default` source, exactly as the JS SDK does.
     let activated = remote_config
         .fetch_and_activate()
         .await
@@ -541,12 +542,42 @@ async fn remote_config_fetches_and_activates_live_template() {
     assert_eq!(remote_config.get_string("rust_sdk_live_default"), "from-defaults");
     assert!(remote_config.get_boolean("rust_sdk_live_flag"));
     assert_eq!(remote_config.get_string("rust_sdk_live_missing_key"), "");
+    assert_eq!(
+        remote_config.get_value("rust_sdk_live_missing_key").source(),
+        RemoteConfigValueSource::Static
+    );
+
+    // Our default keys are not part of any real template, so they must never be reported as remote.
+    for key in ["rust_sdk_live_default", "rust_sdk_live_flag"] {
+        assert_eq!(
+            remote_config.get_value(key).source(),
+            RemoteConfigValueSource::Default,
+            "default-only key {key} must keep the `default` source after activation"
+        );
+    }
 
     let all = remote_config.get_all();
     eprintln!("remote config: {} parameters visible after activation", all.len());
     for (key, value) in &all {
         eprintln!("  {key} = {:?} ({:?})", value.as_string(), value.source());
     }
+    if !activated {
+        assert!(
+            all.values()
+                .all(|value| value.source() == RemoteConfigValueSource::Default),
+            "nothing was activated, so every visible value must come from the defaults"
+        );
+        assert!(remote_config.active_template_version().is_none());
+    } else {
+        assert!(
+            all.values()
+                .any(|value| value.source() == RemoteConfigValueSource::Remote),
+            "activation reported a change but no remote values are visible"
+        );
+    }
+
+    // Activating again without a new fetch must be a no-op.
+    assert!(!remote_config.activate().await.expect("activate"));
 
     delete_app(&app).await.expect("delete_app");
 }

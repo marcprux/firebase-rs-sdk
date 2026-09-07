@@ -12,6 +12,7 @@ I’d put the Remote Config port around 25 % complete. We now mirror the JS SD
 
 
 ## Implemented
+- `activate()` follows the JS ETag rules: no successful fetch, no ETag (`NO_TEMPLATE`), or an unchanged ETag activates nothing and returns `false`; defaults are never copied into the active config and keep the `default` source.
 - Fetch requests target the `firebase` namespace (`/v1/projects/{project}/namespaces/firebase:fetch`) as the JS SDK does; verified against the live backend by `tests/live_endpoints.rs`.
 
 - Component registration for `remote-config`, allowing `get_remote_config` to resolve instances through the shared
