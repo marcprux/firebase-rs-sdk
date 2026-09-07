@@ -1,4 +1,6 @@
-use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::percent_decode_str;
+
+use crate::storage::util::encode_uri_component;
 use url::Url;
 
 use crate::storage::constants::DEFAULT_HOST;
@@ -36,13 +38,13 @@ impl Location {
     pub fn full_server_url(&self) -> String {
         format!(
             "/b/{}/o/{}",
-            utf8_percent_encode(&self.bucket, NON_ALPHANUMERIC),
-            utf8_percent_encode(&self.path, NON_ALPHANUMERIC)
+            encode_uri_component(&self.bucket),
+            encode_uri_component(&self.path)
         )
     }
 
     pub fn bucket_only_server_url(&self) -> String {
-        format!("/b/{}/o", utf8_percent_encode(&self.bucket, NON_ALPHANUMERIC))
+        format!("/b/{}/o", encode_uri_component(&self.bucket))
     }
 
     pub fn from_bucket_spec(bucket_spec: &str, host: &str) -> StorageResult<Self> {

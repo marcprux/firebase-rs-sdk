@@ -5,16 +5,73 @@ use std::time::Duration;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use reqwest::Method;
 use serde_json::{Map, Value};
-use url::form_urlencoded;
 
-use crate::storage::error::internal_error;
+use crate::storage::error::{
+    bucket_not_found, internal_error, object_not_found, quota_exceeded, unauthenticated, unauthorized,
+    unauthorized_app, StorageError,
+};
 use crate::storage::list::{build_list_options, ListOptions};
 use crate::storage::location::Location;
 use crate::storage::metadata::serde::ObjectMetadata;
+use crate::storage::request::info::ErrorHandler;
+use crate::storage::request::transport::ResponsePayload;
 use crate::storage::service::FirebaseStorageImpl;
+use crate::storage::util::encode_uri_component;
 use crate::storage::{SetMetadataRequest, UploadMetadata};
 
 use super::{RequestBody, RequestInfo, ResponseHandler};
+
+/// Maps status codes common to every Storage request onto typed errors, keeping the HTTP status
+/// and raw body on the result. Mirrors `sharedErrorHandler` in
+/// `packages/storage/src/implementation/requests.ts`.
+pub fn shared_error_handler(location: &Location) -> ErrorHandler {
+    let bucket = location.bucket().to_string();
+    let path = location.path().to_string();
+    Arc::new(move |payload: ResponsePayload, base: StorageError| {
+        let status = payload.status.as_u16();
+        let body = String::from_utf8_lossy(&payload.body).to_string();
+        let mapped = match status {
+            // This exact message string is the only consistent part of the server's error
+            // response that identifies it as an App Check error.
+            401 if body.contains("Firebase App Check token is invalid") => unauthorized_app(),
+            401 => unauthenticated(),
+            402 => quota_exceeded(&bucket),
+            403 => unauthorized(&path),
+            _ => return base,
+        };
+        mapped.with_status(status).with_server_response(body)
+    })
+}
+
+/// Like [`shared_error_handler`], additionally mapping 404 to `object-not-found`. Mirrors
+/// `objectErrorHandler` in the JS SDK.
+pub fn object_error_handler(location: &Location) -> ErrorHandler {
+    let shared = shared_error_handler(location);
+    let path = location.path().to_string();
+    Arc::new(move |payload: ResponsePayload, base: StorageError| {
+        if payload.status.as_u16() == 404 {
+            return object_not_found(&path)
+                .with_status(404)
+                .with_server_response(String::from_utf8_lossy(&payload.body).to_string());
+        }
+        shared(payload, base)
+    })
+}
+
+/// Like [`shared_error_handler`], additionally mapping 404 to `bucket-not-found`, which is what
+/// a listing of a missing (or unprovisioned) bucket returns.
+pub fn bucket_error_handler(location: &Location) -> ErrorHandler {
+    let shared = shared_error_handler(location);
+    let bucket = location.bucket().to_string();
+    Arc::new(move |payload: ResponsePayload, base: StorageError| {
+        if payload.status.as_u16() == 404 {
+            return bucket_not_found(&bucket)
+                .with_status(404)
+                .with_server_response(String::from_utf8_lossy(&payload.body).to_string());
+        }
+        shared(payload, base)
+    })
+}
 
 pub fn get_metadata_request(storage: &FirebaseStorageImpl, location: &Location) -> RequestInfo<Value> {
     let base_url = format!("{}/v0{}", storage.host(), location.full_server_url());
@@ -27,6 +84,7 @@ pub fn get_metadata_request(storage: &FirebaseStorageImpl, location: &Location) 
     RequestInfo::new(base_url, Method::GET, timeout, handler)
         .with_query_param("alt", "json")
         .with_headers(default_json_headers())
+        .with_error_handler(object_error_handler(location))
 }
 
 pub fn update_metadata_request(
@@ -47,6 +105,7 @@ pub fn update_metadata_request(
         .with_body(RequestBody::Text(
             serde_json::to_string(&metadata).expect("metadata serialization should never fail"),
         ))
+        .with_error_handler(object_error_handler(location))
 }
 
 pub fn list_request(storage: &FirebaseStorageImpl, location: &Location, options: &ListOptions) -> RequestInfo<Value> {
@@ -59,7 +118,8 @@ pub fn list_request(storage: &FirebaseStorageImpl, location: &Location, options:
 
     let mut request = RequestInfo::new(base_url, Method::GET, timeout, handler)
         .with_query_param("alt", "json")
-        .with_headers(default_json_headers());
+        .with_headers(default_json_headers())
+        .with_error_handler(bucket_error_handler(location));
 
     for (key, value) in build_list_options(location, options) {
         request = request.with_query_param(key, value);
@@ -78,7 +138,8 @@ pub fn download_bytes_request(
 
     let handler: ResponseHandler<Vec<u8>> = Arc::new(|payload| Ok(payload.body));
 
-    let mut request = RequestInfo::new(base_url, Method::GET, timeout, handler);
+    let mut request =
+        RequestInfo::new(base_url, Method::GET, timeout, handler).with_error_handler(object_error_handler(location));
     request.query_params.insert("alt".to_string(), "media".to_string());
 
     if let Some(limit) = max_download_size_bytes {
@@ -106,7 +167,7 @@ pub fn download_url_request(storage: &FirebaseStorageImpl, location: &Location) 
             .filter(|s| !s.is_empty())
         {
             if let Some(token) = tokens.split(',').find(|segment| !segment.is_empty()) {
-                let encoded_token: String = form_urlencoded::byte_serialize(token.as_bytes()).collect();
+                let encoded_token = encode_uri_component(token);
                 return Ok(Some(format!("{download_base}?alt=media&token={encoded_token}")));
             }
         }
@@ -114,7 +175,8 @@ pub fn download_url_request(storage: &FirebaseStorageImpl, location: &Location) 
         Ok(None)
     });
 
-    let mut request = RequestInfo::new(base_url, Method::GET, timeout, handler);
+    let mut request =
+        RequestInfo::new(base_url, Method::GET, timeout, handler).with_error_handler(object_error_handler(location));
     request.headers = default_json_headers();
     request
 }
@@ -125,7 +187,8 @@ pub fn delete_object_request(storage: &FirebaseStorageImpl, location: &Location)
 
     let handler: ResponseHandler<()> = Arc::new(|_| Ok(()));
 
-    let mut request = RequestInfo::new(base_url, Method::DELETE, timeout, handler);
+    let mut request =
+        RequestInfo::new(base_url, Method::DELETE, timeout, handler).with_error_handler(object_error_handler(location));
     request.success_codes = vec![200, 204];
     request
 }
@@ -185,7 +248,8 @@ pub fn multipart_upload_request(
         .with_headers(default_json_headers())
         .with_body(RequestBody::Bytes(body))
         .with_query_param("uploadType", "multipart")
-        .with_query_param("name", location.path());
+        .with_query_param("name", location.path())
+        .with_error_handler(shared_error_handler(location));
 
     request
         .headers
@@ -225,7 +289,8 @@ pub fn create_resumable_upload_request(
         .with_query_param("uploadType", "resumable")
         .with_query_param("name", location.path())
         .with_headers(default_json_headers())
-        .with_body(RequestBody::Text(resource_json));
+        .with_body(RequestBody::Text(resource_json))
+        .with_error_handler(shared_error_handler(location));
 
     request
         .headers
@@ -245,7 +310,7 @@ pub fn create_resumable_upload_request(
 
 pub fn get_resumable_upload_status_request(
     storage: &FirebaseStorageImpl,
-    _location: &Location,
+    location: &Location,
     upload_url: &str,
     total_size: u64,
 ) -> RequestInfo<ResumableUploadStatus> {
@@ -270,7 +335,8 @@ pub fn get_resumable_upload_status_request(
         ))
     });
 
-    let mut request = RequestInfo::new(upload_url, Method::POST, timeout, handler);
+    let mut request =
+        RequestInfo::new(upload_url, Method::POST, timeout, handler).with_error_handler(shared_error_handler(location));
     request
         .headers
         .insert("X-Goog-Upload-Command".to_string(), "query".to_string());
@@ -282,7 +348,7 @@ pub fn get_resumable_upload_status_request(
 
 pub fn continue_resumable_upload_request(
     storage: &FirebaseStorageImpl,
-    _location: &Location,
+    location: &Location,
     upload_url: &str,
     start_offset: u64,
     total_size: u64,
@@ -321,7 +387,9 @@ pub fn continue_resumable_upload_request(
         ))
     });
 
-    let mut request = RequestInfo::new(upload_url, Method::POST, timeout, handler).with_body(RequestBody::Bytes(chunk));
+    let mut request = RequestInfo::new(upload_url, Method::POST, timeout, handler)
+        .with_body(RequestBody::Bytes(chunk))
+        .with_error_handler(shared_error_handler(location));
 
     let mut command = String::from("upload");
     if finalize && empty_chunk {
@@ -438,6 +506,84 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
 }
 
 #[cfg(test)]
+mod error_handler_tests {
+    use super::*;
+    use crate::storage::error::{unknown_error, StorageErrorCode};
+    use reqwest::StatusCode;
+
+    fn payload(status: u16, body: &str) -> ResponsePayload {
+        ResponsePayload {
+            status: StatusCode::from_u16(status).unwrap(),
+            headers: HashMap::new(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn base(status: u16, body: &str) -> StorageError {
+        unknown_error().with_status(status).with_server_response(body)
+    }
+
+    #[test]
+    fn shared_handler_maps_auth_quota_and_permission_statuses() {
+        let location = Location::new("my-bucket", "photos/cat.png");
+        let handler = shared_error_handler(&location);
+
+        let err = handler(payload(401, "{}"), base(401, "{}"));
+        assert_eq!(err.code, StorageErrorCode::Unauthenticated);
+        assert_eq!(err.status, Some(401));
+
+        let err = handler(
+            payload(401, r#"{"error":{"message":"Firebase App Check token is invalid."}}"#),
+            base(401, ""),
+        );
+        assert_eq!(err.code, StorageErrorCode::UnauthorizedApp);
+
+        let err = handler(payload(402, ""), base(402, ""));
+        assert_eq!(err.code, StorageErrorCode::QuotaExceeded);
+        assert!(err.to_string().contains("my-bucket"));
+
+        let err = handler(
+            payload(403, r#"{"error":{"code":403,"message":"Permission denied."}}"#),
+            base(403, ""),
+        );
+        assert_eq!(err.code, StorageErrorCode::Unauthorized);
+        assert!(err.to_string().contains("photos/cat.png"));
+        assert_eq!(
+            err.server_response.as_deref(),
+            Some(r#"{"error":{"code":403,"message":"Permission denied."}}"#)
+        );
+
+        // Anything else keeps the transport's base error (status + body preserved).
+        let err = handler(payload(500, "boom"), base(500, "boom"));
+        assert_eq!(err.code, StorageErrorCode::Unknown);
+        assert_eq!(err.status, Some(500));
+        assert_eq!(err.server_response.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn object_handler_maps_404_to_object_not_found() {
+        let location = Location::new("my-bucket", "photos/cat.png");
+        let handler = object_error_handler(&location);
+        let err = handler(payload(404, "Not Found"), base(404, "Not Found"));
+        assert_eq!(err.code, StorageErrorCode::ObjectNotFound);
+        assert_eq!(err.status, Some(404));
+        assert_eq!(err.code_str(), "storage/object-not-found");
+        assert!(err.to_string().contains("photos/cat.png"));
+        // Shared mappings still apply.
+        assert_eq!(handler(payload(403, ""), base(403, "")).code, StorageErrorCode::Unauthorized);
+    }
+
+    #[test]
+    fn bucket_handler_maps_404_to_bucket_not_found() {
+        let location = Location::new("missing-bucket", "");
+        let handler = bucket_error_handler(&location);
+        let err = handler(payload(404, ""), base(404, ""));
+        assert_eq!(err.code, StorageErrorCode::BucketNotFound);
+        assert!(err.to_string().contains("missing-bucket"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::initialize_app;
@@ -468,14 +614,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_request_carries_an_error_handler() {
+        let storage = build_storage().await;
+        let location = Location::new("my-bucket", "photos/cat.png");
+        assert!(get_metadata_request(&storage, &location).error_handler.is_some());
+        assert!(download_bytes_request(&storage, &location, None)
+            .error_handler
+            .is_some());
+        assert!(download_url_request(&storage, &location).error_handler.is_some());
+        assert!(delete_object_request(&storage, &location).error_handler.is_some());
+        assert!(list_request(&storage, &location, &ListOptions::default())
+            .error_handler
+            .is_some());
+        assert!(multipart_upload_request(&storage, &location, vec![1], None)
+            .error_handler
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn builds_get_metadata_request() {
         let storage = build_storage().await;
         let location = Location::new("my-bucket", "photos/cat.png");
         let request = get_metadata_request(&storage, &location);
-        assert_eq!(
-            request.url,
-            "firebasestorage.googleapis.com/v0/b/my%2Dbucket/o/photos%2Fcat%2Epng"
-        );
+        assert_eq!(request.url, "firebasestorage.googleapis.com/v0/b/my-bucket/o/photos%2Fcat.png");
         assert_eq!(request.method, Method::GET);
         assert_eq!(request.query_params.get("alt"), Some(&"json".to_string()));
     }
@@ -488,10 +649,7 @@ mod tests {
         metadata.content_type = Some("text/plain".into());
         let request = update_metadata_request(&storage, &location, metadata);
         assert_eq!(request.method, Method::PATCH);
-        assert_eq!(
-            request.url,
-            "firebasestorage.googleapis.com/v0/b/my%2Dbucket/o/docs%2Ffile%2Etxt"
-        );
+        assert_eq!(request.url, "firebasestorage.googleapis.com/v0/b/my-bucket/o/docs%2Ffile.txt");
         assert_eq!(request.query_params.get("alt"), Some(&"json".to_string()));
         match &request.body {
             RequestBody::Text(body) => {
@@ -546,7 +704,7 @@ mod tests {
         let url = handler(payload).unwrap().unwrap();
         assert!(url.contains("token=token123"));
         assert!(url.starts_with("https://"));
-        assert!(url.contains("/v0/b/my%2Dbucket"));
+        assert!(url.contains("/v0/b/my-bucket"));
     }
 
     #[tokio::test]

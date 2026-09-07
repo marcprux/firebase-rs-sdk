@@ -45,7 +45,7 @@ percentages are estimates and deliberately stricter than the ones in each module
 | Module | Coverage | Backend | Verified live | Notes |
 |---|---:|---|:---:|---|
 | installations | 85% | real (Installations REST v1) | yes | FID generation, registration, token refresh, delete, id-change listeners |
-| storage | 70% | real (`firebasestorage.googleapis.com/v0`) | yes | uploads, downloads, metadata, list, delete; no resumable pause/resume |
+| storage | 75% | real (`firebasestorage.googleapis.com/v0`) | emulator | uploads, downloads, metadata, list, delete, JS error codes and `encodeURIComponent` paths; no resumable pause/resume |
 | app | 70% | n/a | yes | app lifecycle, options, component container, heartbeat header |
 | data_connect | 65% | real (`firebasedataconnect.googleapis.com/v1`) | no | executeQuery / executeMutation, emulator, subscriptions |
 | auth | 65% | real (Identity Toolkit v1 + securetoken) | yes | broad REST coverage, typed `auth/...` error codes, `onAuthStateChanged` semantics; OAuth popup/redirect flows incomplete |
@@ -134,7 +134,7 @@ percentages are estimates and deliberately stricter than the ones in each module
 | `getDownloadURL`, `getBytes`, `getStream` (native), `getBlob` (wasm) | implemented |
 | `getMetadata`, `updateMetadata`, `list`, `listAll`, `deleteObject` | implemented |
 | `uploadBytesResumable` | partial, no pause / resume / cancel / progress events |
-| Error codes (`object-not-found`, `unauthorized`, `quota-exceeded`, ...) | partial, every non-2xx maps to `internal-error` |
+| Error codes (`object-not-found`, `bucket-not-found`, `unauthenticated`, `unauthorized`, `unauthorized-app`, `quota-exceeded`, `retry-limit-exceeded`, `unknown` with status and body) | implemented per the JS `sharedErrorHandler` / `objectErrorHandler`; verified against the Storage emulator |
 
 ### functions
 

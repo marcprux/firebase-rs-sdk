@@ -1469,6 +1469,66 @@ async fn cleanup_auth(auth: &std::sync::Arc<firebase_rs_sdk::auth::Auth>) {
 
 #[tokio::test]
 #[ignore = "requires live Firebase credentials"]
+async fn storage_error_codes_match_the_js_sdk() {
+    let test = "storage_error_codes_match_the_js_sdk";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    if config.emulators.storage.is_none() {
+        skip(
+            test,
+            "needs the Storage emulator (scripts/emulator_test.sh); online buckets are not provisioned",
+            "n/a",
+        );
+        return;
+    }
+    let app = live_app(&config, "storage-errors").await;
+    let auth = auth_for(&config, &app);
+    auth.sign_in_anonymously().await.expect("anonymous sign-in");
+    let storage = storage_for(&config, &app).await;
+    let root = storage.root_reference().expect("root reference");
+
+    // 404 on an object the rules allow us to read -> object-not-found.
+    let missing = root.child(&format!("rust_sdk_live_tests/missing-{}.txt", nonce()));
+    let err = missing.get_metadata().await.expect_err("missing object");
+    assert_eq!(err.code, StorageErrorCode::ObjectNotFound, "got {err}");
+    assert_eq!(err.status, Some(404));
+    let err = missing.get_bytes(None).await.expect_err("missing object bytes");
+    assert_eq!(err.code, StorageErrorCode::ObjectNotFound, "got {err}");
+    let err = missing.get_download_url().await.expect_err("missing object url");
+    assert_eq!(err.code, StorageErrorCode::ObjectNotFound, "got {err}");
+    let err = missing.delete_object().await.expect_err("missing object delete");
+    assert_eq!(err.code, StorageErrorCode::ObjectNotFound, "got {err}");
+
+    // Rules deny writes outside `rust_sdk_live_tests/` -> unauthorized (403), with the raw body.
+    let forbidden = root.child(&format!("forbidden/{}.txt", nonce()));
+    let err = forbidden
+        .upload_string("nope", StringFormat::Raw, None)
+        .await
+        .expect_err("rules must deny");
+    assert_eq!(err.code, StorageErrorCode::Unauthorized, "got {err}");
+    assert_eq!(err.status, Some(403));
+    assert!(err.server_response.is_some(), "server body must be preserved");
+    assert!(err.to_string().contains("forbidden/"), "message names the path: {err}");
+
+    // No user at all: the emulator answers 403 as well (rules see request.auth == null).
+    cleanup_auth(&auth).await;
+    auth.sign_out();
+    let anonymous_read = root.child(&format!("rust_sdk_live_tests/whatever-{}.txt", nonce()));
+    let err = anonymous_read
+        .get_metadata()
+        .await
+        .expect_err("signed-out read must fail");
+    assert!(
+        matches!(err.code, StorageErrorCode::Unauthorized | StorageErrorCode::Unauthenticated),
+        "got {err}"
+    );
+
+    delete_app(&app).await.expect("delete_app");
+}
+
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
 async fn storage_upload_download_and_delete() {
     let test = "storage_upload_download_and_delete";
     let Some(config) = require_config(test) else {
@@ -1500,7 +1560,14 @@ async fn storage_upload_download_and_delete() {
             // Against the emulator nothing can be unprovisioned: any failure is a real failure.
             let not_provisioned = config.emulators.storage.is_none()
                 && (provisioning_skip_reason(&text).is_some()
-                    || (err.code == StorageErrorCode::InternalError
+                    || matches!(
+                        err.code,
+                        StorageErrorCode::Unauthenticated
+                            | StorageErrorCode::Unauthorized
+                            | StorageErrorCode::ObjectNotFound
+                            | StorageErrorCode::BucketNotFound
+                    )
+                    || (err.code == StorageErrorCode::Unknown
                         && matches!(err.status, Some(401) | Some(403) | Some(404))));
             if not_provisioned {
                 skip(
@@ -1537,8 +1604,20 @@ async fn storage_upload_download_and_delete() {
     );
 
     reference.delete_object().await.expect("delete_object");
-    let after_delete = reference.get_metadata().await;
-    assert!(after_delete.is_err(), "object must be gone after delete");
+    let after_delete = reference
+        .get_metadata()
+        .await
+        .expect_err("object must be gone after delete");
+    assert_eq!(after_delete.code, StorageErrorCode::ObjectNotFound, "got {after_delete}");
+    assert_eq!(after_delete.status, Some(404));
+    assert_eq!(after_delete.code_str(), "storage/object-not-found");
+
+    // The download URL must use `encodeURIComponent` semantics: `-`, `.` and `_` stay literal.
+    assert!(
+        !url.contains("%2D") && !url.contains("%2E") && !url.contains("%5F"),
+        "over-encoded URL: {url}"
+    );
+
     cleanup_auth(&auth).await;
     delete_app(&app).await.expect("delete_app");
 }

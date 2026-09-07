@@ -29,8 +29,10 @@ pub use constants::{
 
 #[doc(inline)]
 pub use error::{
-    app_deleted, internal_error, invalid_argument, invalid_default_bucket, invalid_root_operation, invalid_url,
-    no_default_bucket, no_download_url, unknown_error, unsupported_environment, StorageError, StorageErrorCode,
+    app_deleted, bucket_not_found, canceled, internal_error, invalid_argument, invalid_checksum,
+    invalid_default_bucket, invalid_format, invalid_root_operation, invalid_url, no_default_bucket, no_download_url,
+    object_not_found, project_not_found, quota_exceeded, retry_limit_exceeded, server_file_wrong_size, unauthenticated,
+    unauthorized, unauthorized_app, unknown_error, unsupported_environment, StorageError, StorageErrorCode,
     StorageResult,
 };
 

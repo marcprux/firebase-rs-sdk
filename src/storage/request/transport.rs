@@ -1,5 +1,5 @@
 use crate::platform::runtime::{self, TimeoutError};
-use crate::storage::error::{internal_error, StorageError, StorageResult};
+use crate::storage::error::{internal_error, retry_limit_exceeded, unknown_error, StorageError, StorageResult};
 use crate::storage::util::is_url;
 #[cfg(not(target_arch = "wasm32"))]
 use bytes::Bytes;
@@ -87,7 +87,7 @@ impl HttpClient {
 
         loop {
             if !backoff.has_time_remaining() {
-                return Err(internal_error("storage request timed out"));
+                return Err(retry_limit_exceeded());
             }
 
             let delay = backoff.next_delay();
@@ -111,13 +111,15 @@ impl HttpClient {
                 }
                 Err(RequestError::Fatal(err)) => return Err(err),
                 Err(RequestError::Timeout) => {
-                    return Err(internal_error("storage request timed out"));
+                    return Err(retry_limit_exceeded());
                 }
                 Err(RequestError::Network(reason)) => {
                     if backoff.can_retry() {
                         continue;
                     }
-                    return Err(internal_error(format!("network failure after retries: {reason}")));
+                    return Err(
+                        retry_limit_exceeded().with_server_response(format!("network failure after retries: {reason}"))
+                    );
                 }
             }
         }
@@ -167,7 +169,7 @@ impl HttpClient {
 
         loop {
             if !backoff.has_time_remaining() {
-                return Err(internal_error("storage request timed out"));
+                return Err(retry_limit_exceeded());
             }
 
             let delay = backoff.next_delay();
@@ -179,13 +181,15 @@ impl HttpClient {
                 Ok(response) => return Ok(response),
                 Err(RequestError::Fatal(err)) => return Err(err),
                 Err(RequestError::Timeout) => {
-                    return Err(internal_error("storage request timed out"));
+                    return Err(retry_limit_exceeded());
                 }
                 Err(RequestError::Network(reason)) => {
                     if backoff.can_retry() {
                         continue;
                     }
-                    return Err(internal_error(format!("network failure after retries: {reason}")));
+                    return Err(
+                        retry_limit_exceeded().with_server_response(format!("network failure after retries: {reason}"))
+                    );
                 }
             }
         }
@@ -288,7 +292,9 @@ fn should_retry<O>(status: StatusCode, info: &RequestInfo<O>) -> bool {
 }
 
 fn map_failure<O>(payload: ResponsePayload, info: &RequestInfo<O>) -> StorageError {
-    let base_error = internal_error(format!("storage request failed with status {}", payload.status))
+    // Same default as the JS SDK: an unexpected status is `storage/unknown`, with the HTTP
+    // status and raw body attached; request-specific handlers refine it below.
+    let base_error = unknown_error()
         .with_status(payload.status.as_u16())
         .with_server_response(String::from_utf8_lossy(&payload.body).to_string());
 

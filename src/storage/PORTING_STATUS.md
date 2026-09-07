@@ -45,6 +45,7 @@ out the remaining error/streaming parity gaps.
 DISCLAIMER: This is not an official Firebase product, nor it is guaranteed that it has no bugs or that it will work as intended.
 
 ## Implemented
+- Error mapping ported from `implementation/requests.ts`: `shared_error_handler` (401 -> `unauthenticated` / `unauthorized-app`, 402 -> `quota-exceeded`, 403 -> `unauthorized`) and `object_error_handler` (404 -> `object-not-found`) are attached to every request; listings map 404 to `bucket-not-found`; unexpected statuses are `unknown` with `status` and `server_response`; exhausted retries/timeouts are `retry-limit-exceeded`. Bucket names, object paths and download tokens are encoded like `encodeURIComponent` (previously `-`, `.` and `_` were percent-encoded). Verified against the Storage emulator by `tests/live_endpoints.rs`.
 
 - Registered a `storage` component so apps can lazily request Storage instances, optionally keyed by bucket URL.
 - Ported the location/URL parsing helpers (`Location`, path utilities, and URL detection) with unit tests that mirror the
