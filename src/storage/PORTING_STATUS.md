@@ -1,6 +1,6 @@
 ## Porting status
 
-- storage 60% `[######    ]`
+- storage 85% `[########+ ]`
 
 ==As of October 21th, 2025== 
 
@@ -21,12 +21,12 @@ Key Gaps
 
   - JS exposes direct `ReadableStream`/service-worker piping (packages/storage/src/reference.ts:201), whereas the Rust
   port still requires callers to adapt browser streams into `AsyncRead` sources before invoking the resumable helpers.
-  - The modular upload task with observers, pause/resume/cancel, and snapshot events (packages/storage/src/task.ts:62,
-  packages/storage/src/public-types.ts:214) is only partially implemented: the async `UploadTask` covers resumable flows
-  but still lacks observer hooks and state transitions (src/storage/upload.rs:40).
-  - Error coverage is narrower: the Rust enum covers a handful of codes (src/storage/error.rs:1), whereas the JS SDK
-  handles the full suite including auth/quota/retry cases (packages/storage/src/implementation/error.ts:88), and there’s
-  no token-refresh logic on 401/403 responses.
+  - (Closed on 2026-09-07.) The modular upload task with observers, pause/resume/cancel, and snapshot events
+  (packages/storage/src/task.ts:62, packages/storage/src/public-types.ts:214) is now implemented in
+  `src/storage/upload.rs`; what remains is the promise-like `UploadTask` (`then`/`catch`), the `StorageObserver` object
+  form, and resuming a session after a process restart.
+  - (Closed on 2026-09-07 for the error codes.) The Rust enum now covers the JS suite (src/storage/error.rs:1); there is
+  still no token-refresh logic on 401/403 responses.
   - Estimated completion: roughly 60 % of the Firebase Storage web SDK surface has been ported to Rust—core CRUD and
   upload flows are in place, but advanced task management, streaming/string conveniences, and full error parity remain
   outstanding.
@@ -45,6 +45,17 @@ out the remaining error/streaming parity gaps.
 DISCLAIMER: This is not an official Firebase product, nor it is guaranteed that it has no bugs or that it will work as intended.
 
 ## Implemented
+- Resumable upload control surface ported from `packages/storage/src/task.ts` (2026-09-07): `UploadTask` exposes
+  `handle()` -> `UploadTaskHandle` (cloneable, `Send + Sync`) with `pause`, `resume`, `cancel`, `state`, `snapshot` and
+  `on_state_changed`, plus `UploadTaskSnapshot` (`bytes_transferred`, `total_bytes`, `state`, `metadata`, `reference`)
+  and the Web SDK `TaskState` strings (`running`, `paused`, `success`, `canceled`, `error`). Cancelling sends the
+  `X-Goog-Upload-Command: cancel` command so the session is discarded server-side and no object is created, and the
+  driving call fails with `storage/canceled`; a `cancelled` session status on any resumable response maps to the same
+  error. `UploadTask::refresh_status` queries the session offset (`X-Goog-Upload-Size-Received`) and resyncs the task.
+  Observers are notified per chunk and on every state change, never while a lock is held, so a callback may itself
+  pause or cancel. `list` validates `max_results` (1..=1000) like the JS SDK. Verified against the Storage emulator by
+  `storage_resumable_upload_progress_pause_and_cancel` and `storage_list_pagination_and_metadata_updates` in
+  `tests/live_endpoints.rs`.
 - Error mapping ported from `implementation/requests.ts`: `shared_error_handler` (401 -> `unauthenticated` / `unauthorized-app`, 402 -> `quota-exceeded`, 403 -> `unauthorized`) and `object_error_handler` (404 -> `object-not-found`) are attached to every request; listings map 404 to `bucket-not-found`; unexpected statuses are `unknown` with `status` and `server_response`; exhausted retries/timeouts are `retry-limit-exceeded`. Bucket names, object paths and download tokens are encoded like `encodeURIComponent` (previously `-`, `.` and `_` were percent-encoded). Verified against the Storage emulator by `tests/live_endpoints.rs`.
 
 - Registered a `storage` component so apps can lazily request Storage instances, optionally keyed by bucket URL.
@@ -85,10 +96,11 @@ DISCLAIMER: This is not an official Firebase product, nor it is guaranteed that 
    forcing token refreshes on 401/403 responses and mapping them to dedicated `StorageErrorCode`s.
 2. **Streaming downloads** – Provide chunked/streamed download APIs (e.g. `get_stream`) so large responses don’t require
   buffering in memory when mirroring the JS SDK.
-3. **Task observers & snapshots** – Model `UploadTaskSnapshot`, observer callbacks, and state transitions so clients can
-   subscribe to upload progress events the same way the Web SDK exposes `state_changed` streams.
-4. **Error parity** – Flesh out the error module with the full suite of error codes, HTTP status mapping, and helper
-   constructors to match the TS SDK.
+3. ~~**Task observers & snapshots**~~ – Done on 2026-09-07: `UploadTaskSnapshot`, `UploadTaskHandle::on_state_changed`
+   and the full state machine (`pause`/`resume`/`cancel`) mirror the Web SDK's `state_changed` stream. Still missing: the
+   promise-like `UploadTask` and recovering a session across process restarts.
+4. ~~**Error parity**~~ – Done on 2026-09-07: the error module carries the full JS code suite with HTTP status mapping
+   and helper constructors.
 5. **Testing** – Broaden coverage with request-layer mocks, emulator integration smoke tests, and regression suites for
    the new operations.
 
@@ -101,8 +113,10 @@ DISCLAIMER: This is not an official Firebase product, nor it is guaranteed that 
    - When server-app support lands, read `FirebaseServerAppSettings` overrides to honour pre-provisioned tokens.
 2. **Upload ergonomics**
    - Layer high-level helpers for string and stream sources on top of the new upload primitives.
-   - Extend `UploadTask` with pause/resume/cancel semantics and persisted session recovery to match the JS SDK.
+   - ~~Extend `UploadTask` with pause/resume/cancel semantics~~ (done 2026-09-07); persisted session recovery (rebuilding
+     a task from a stored `upload_session_url`) is still open.
 3. **Observer & snapshot surface**
-   - Introduce `UploadTaskSnapshot` plus `StorageObserver` types that mirror the Web SDK, including typed progress
-     metrics and error propagation.
-   - Add unit coverage for observer registration and state transitions once snapshot modelling is in place.
+   - ~~Introduce `UploadTaskSnapshot` plus observer callbacks that mirror the Web SDK~~ (done 2026-09-07). The
+     `StorageObserver` object form (next/error/complete) is still closure-only.
+   - ~~Add unit coverage for observer registration and state transitions~~ (done 2026-09-07, `src/storage/upload.rs`
+     tests plus two emulator tests).

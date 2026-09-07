@@ -10,7 +10,7 @@ pub struct ListOptions {
     pub page_token: Option<String>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ListResult {
     pub prefixes: Vec<StorageReference>,
     pub items: Vec<StorageReference>,

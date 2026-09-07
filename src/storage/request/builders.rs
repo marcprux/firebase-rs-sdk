@@ -7,8 +7,8 @@ use reqwest::Method;
 use serde_json::{Map, Value};
 
 use crate::storage::error::{
-    bucket_not_found, internal_error, object_not_found, quota_exceeded, unauthenticated, unauthorized,
-    unauthorized_app, StorageError,
+    bucket_not_found, canceled, internal_error, object_not_found, quota_exceeded, unauthenticated, unauthorized,
+    unauthorized_app, StorageError, StorageResult,
 };
 use crate::storage::list::{build_list_options, ListOptions};
 use crate::storage::location::Location;
@@ -261,6 +261,23 @@ pub fn multipart_upload_request(
     request
 }
 
+/// Reads and validates the `X-Goog-Upload-Status` header shared by every resumable response.
+///
+/// The Web SDK only accepts `active` and `final`; a session that was cancelled (either by this
+/// client or because the server dropped it) is reported as `storage/canceled` so callers can tell
+/// the two apart.
+fn resumable_upload_status(payload: &ResponsePayload) -> StorageResult<String> {
+    let status = header_value(&payload.headers, "X-Goog-Upload-Status")
+        .ok_or_else(|| internal_error("missing resumable upload status header"))?;
+    if status.eq_ignore_ascii_case("cancelled") || status.eq_ignore_ascii_case("canceled") {
+        return Err(canceled());
+    }
+    if !matches!(status.to_ascii_lowercase().as_str(), "active" | "final") {
+        return Err(internal_error(format!("unexpected resumable upload status: {status}")));
+    }
+    Ok(status.to_string())
+}
+
 pub fn create_resumable_upload_request(
     storage: &FirebaseStorageImpl,
     location: &Location,
@@ -274,11 +291,7 @@ pub fn create_resumable_upload_request(
     let resource_json = serde_json::to_string(&resource).expect("upload metadata serialization should never fail");
 
     let handler: ResponseHandler<String> = Arc::new(|payload| {
-        let status = header_value(&payload.headers, "X-Goog-Upload-Status")
-            .ok_or_else(|| internal_error("missing resumable upload status header"))?;
-        if !matches!(status.to_ascii_lowercase().as_str(), "active" | "final") {
-            return Err(internal_error(format!("unexpected resumable upload status: {status}")));
-        }
+        resumable_upload_status(&payload)?;
 
         let upload_url = header_value(&payload.headers, "X-Goog-Upload-URL")
             .ok_or_else(|| internal_error("missing resumable upload url"))?;
@@ -316,11 +329,7 @@ pub fn get_resumable_upload_status_request(
 ) -> RequestInfo<ResumableUploadStatus> {
     let timeout = Duration::from_millis(storage.max_upload_retry_time());
     let handler: ResponseHandler<ResumableUploadStatus> = Arc::new(move |payload| {
-        let status = header_value(&payload.headers, "X-Goog-Upload-Status")
-            .ok_or_else(|| internal_error("missing resumable upload status header"))?;
-        if !matches!(status.to_ascii_lowercase().as_str(), "active" | "final") {
-            return Err(internal_error(format!("unexpected resumable upload status: {status}")));
-        }
+        let status = resumable_upload_status(&payload)?;
         let received = header_value(&payload.headers, "X-Goog-Upload-Size-Received")
             .ok_or_else(|| internal_error("missing upload size header"))?;
         let current = received
@@ -360,11 +369,7 @@ pub fn continue_resumable_upload_request(
     let empty_chunk = chunk.is_empty();
 
     let handler: ResponseHandler<ResumableUploadStatus> = Arc::new(move |payload| {
-        let status = header_value(&payload.headers, "X-Goog-Upload-Status")
-            .ok_or_else(|| internal_error("missing resumable upload status header"))?;
-        if !matches!(status.to_ascii_lowercase().as_str(), "active" | "final") {
-            return Err(internal_error(format!("unexpected resumable upload status: {status}")));
-        }
+        let status = resumable_upload_status(&payload)?;
 
         let new_current = (start_offset + bytes_to_upload).min(total_size);
 
@@ -414,6 +419,31 @@ pub fn continue_resumable_upload_request(
         .additional_retry_codes
         .extend_from_slice(&[308_u16, 500, 502, 503, 504]);
 
+    request
+}
+
+/// Cancels a resumable upload session so the server discards the partially uploaded object.
+///
+/// The Web SDK simply aborts the in-flight `XMLHttpRequest`; on native targets there is no request
+/// to abort between chunks, so the session is cancelled explicitly with the `cancel` upload
+/// command. The call is best effort: a session that already finalised answers 400 and a session the
+/// server has forgotten answers 404.
+pub fn cancel_resumable_upload_request(
+    storage: &FirebaseStorageImpl,
+    location: &Location,
+    upload_url: &str,
+) -> RequestInfo<()> {
+    let timeout = Duration::from_millis(storage.max_upload_retry_time());
+    let handler: ResponseHandler<()> = Arc::new(|_payload| Ok(()));
+
+    let mut request =
+        RequestInfo::new(upload_url, Method::POST, timeout, handler).with_error_handler(shared_error_handler(location));
+    request
+        .headers
+        .insert("X-Goog-Upload-Command".to_string(), "cancel".to_string());
+    request
+        .headers
+        .insert("X-Goog-Upload-Protocol".to_string(), "resumable".to_string());
     request
 }
 
@@ -629,6 +659,76 @@ mod tests {
         assert!(multipart_upload_request(&storage, &location, vec![1], None)
             .error_handler
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn builds_a_resumable_cancel_request() {
+        let storage = build_storage().await;
+        let location = Location::new("my-bucket", "photos/cat.png");
+        let request = cancel_resumable_upload_request(&storage, &location, "https://upload.example/session/1");
+        assert_eq!(request.url, "https://upload.example/session/1");
+        assert_eq!(request.method, Method::POST);
+        assert_eq!(request.headers.get("X-Goog-Upload-Command").map(String::as_str), Some("cancel"));
+        assert_eq!(
+            request.headers.get("X-Goog-Upload-Protocol").map(String::as_str),
+            Some("resumable")
+        );
+        assert!(request.error_handler.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_resumable_session_reports_storage_canceled() {
+        let storage = build_storage().await;
+        let location = Location::new("my-bucket", "photos/cat.png");
+        let request = get_resumable_upload_status_request(&storage, &location, "https://upload.example/session/1", 10);
+
+        let mut headers = HashMap::new();
+        headers.insert("x-goog-upload-status".to_string(), "cancelled".to_string());
+        let payload = ResponsePayload {
+            status: StatusCode::OK,
+            headers,
+            body: Vec::new(),
+        };
+        let err = (request.response_handler)(payload).expect_err("a cancelled session must not parse");
+        assert_eq!(err.code_str(), "storage/canceled");
+    }
+
+    #[tokio::test]
+    async fn resumable_status_requires_a_known_status_header() {
+        let storage = build_storage().await;
+        let location = Location::new("my-bucket", "photos/cat.png");
+        let request = get_resumable_upload_status_request(&storage, &location, "https://upload.example/session/1", 10);
+
+        let mut headers = HashMap::new();
+        headers.insert("x-goog-upload-status".to_string(), "active".to_string());
+        headers.insert("x-goog-upload-size-received".to_string(), "4".to_string());
+        let payload = ResponsePayload {
+            status: StatusCode::OK,
+            headers,
+            body: Vec::new(),
+        };
+        let status = (request.response_handler)(payload).expect("active session");
+        assert_eq!(status.current, 4);
+        assert_eq!(status.total, 10);
+        assert!(!status.finalized);
+    }
+
+    #[tokio::test]
+    async fn list_requests_carry_pagination_parameters() {
+        let storage = build_storage().await;
+        let location = Location::new("my-bucket", "photos");
+        let options = ListOptions {
+            max_results: Some(2),
+            page_token: Some("photos/cat.png".into()),
+        };
+        let request = list_request(&storage, &location, &options);
+        assert_eq!(request.query_params.get("prefix").map(String::as_str), Some("photos/"));
+        assert_eq!(request.query_params.get("delimiter").map(String::as_str), Some("/"));
+        assert_eq!(request.query_params.get("maxResults").map(String::as_str), Some("2"));
+        assert_eq!(
+            request.query_params.get("pageToken").map(String::as_str),
+            Some("photos/cat.png")
+        );
     }
 
     #[tokio::test]

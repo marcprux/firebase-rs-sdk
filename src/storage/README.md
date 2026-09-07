@@ -9,7 +9,7 @@ uploading and downloading files, managing metadata, and handling storage referen
 
 It includes error handling, configuration options, and integration with Firebase apps.
 
-Porting status: 60% `[######    ]` ([details](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/storage/PORTING_STATUS.md))
+Porting status: 85% `[########+ ]` ([details](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/storage/PORTING_STATUS.md))
 
 ## Features:
 
@@ -17,11 +17,11 @@ Porting status: 60% `[######    ]` ([details](https://github.com/dgasparri/fireb
 - Get storage instance for a Firebase app
 - Register storage component
 - Manage storage references
-- Handle file uploads with progress tracking
+- Handle file uploads with progress tracking, pause, resume and cancel
 - Upload strings and browser blobs with shared helpers
 - Stream large uploads directly from async readers
 - Stream downloads as native async readers (non-WASM)
-- List files and directories in storage
+- List files and directories in storage, one page at a time or all at once
 - Manage object metadata
 - Comprehensive error handling
 
@@ -72,6 +72,40 @@ async fn main() -> StorageResult<()> {
     Ok(())
 }
 ```
+
+## Resumable Uploads
+
+Payloads larger than 256 KiB are uploaded chunk by chunk through the resumable protocol.
+`upload_bytes_resumable` hands back a task that can be observed and controlled while it runs:
+cancelling discards the session server-side, so no half-written object is left behind.
+
+```rust,ignore
+use firebase_rs_sdk::storage::{StorageReference, UploadTaskState};
+
+async fn upload(reference: StorageReference, bytes: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+    let task = reference.upload_bytes_resumable(bytes, None)?;
+    let handle = task.handle();
+
+    let unsubscribe = handle.on_state_changed(|snapshot| {
+        println!(
+            "{}: {} of {} bytes",
+            snapshot.state, snapshot.bytes_transferred, snapshot.total_bytes
+        );
+    });
+
+    // `handle` is `Send + Sync + Clone`, so it can pause(), resume() or cancel() the upload from
+    // another task, from a UI callback, or from inside the observer above.
+    let metadata = task.run_to_completion().await?;
+    unsubscribe();
+
+    assert_eq!(handle.state(), UploadTaskState::Completed);
+    println!("uploaded {:?}", metadata.name);
+    Ok(())
+}
+```
+
+A cancelled upload fails with `storage/canceled`. Pausing stops the task at the next chunk
+boundary; `UploadTask::refresh_status` asks the server how many bytes it stored before resuming.
 
 ## References to the Firebase JS SDK
 

@@ -28,6 +28,15 @@ pub struct StorageReference {
 #[cfg(not(target_arch = "wasm32"))]
 pub type StreamingDownload = StreamingResponse;
 
+impl std::fmt::Debug for StorageReference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageReference")
+            .field("bucket", &self.location.bucket())
+            .field("path", &self.location.path())
+            .finish()
+    }
+}
+
 impl StorageReference {
     pub(crate) fn new(storage: FirebaseStorageImpl, location: Location) -> Self {
         Self { storage, location }
@@ -100,8 +109,19 @@ impl StorageReference {
     }
 
     /// Lists objects and prefixes immediately under this reference.
+    ///
+    /// A page holds at most `max_results` items (1..=1000, defaulting to the backend's 1000). When
+    /// the listing is truncated the result carries a `next_page_token` to pass back in the next
+    /// call, matching the Web SDK's `list()`.
     pub async fn list(&self, options: Option<ListOptions>) -> StorageResult<ListResult> {
         let opts = options.unwrap_or_default();
+        if let Some(max_results) = opts.max_results {
+            if !(1..=1000).contains(&max_results) {
+                return Err(invalid_argument(format!(
+                    "list: max_results must be between 1 and 1000 inclusive, got {max_results}"
+                )));
+            }
+        }
         let request = list_request(&self.storage, &self.location, &opts);
         let json = self.storage.run_request(request).await?;
         parse_list_result(&self.storage, self.location.bucket(), json)
@@ -507,5 +527,23 @@ mod tests {
     fn merge_metadata_uses_inferred_when_absent() {
         let merged = merge_metadata(None, Some("text/plain".to_string())).unwrap();
         assert_eq!(merged.content_type.as_deref(), Some("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn list_rejects_out_of_range_page_sizes() {
+        let storage = build_storage().await;
+        let reference = storage.root_reference().unwrap().child("photos");
+
+        for max_results in [0_u32, 1001] {
+            let options = ListOptions {
+                max_results: Some(max_results),
+                page_token: None,
+            };
+            let err = reference
+                .list(Some(options))
+                .await
+                .expect_err("max_results outside 1..=1000 must be rejected");
+            assert_eq!(err.code_str(), "storage/invalid-argument", "got {err}");
+        }
     }
 }

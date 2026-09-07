@@ -69,7 +69,9 @@ use firebase_rs_sdk::functions::error::FunctionsErrorCode;
 use firebase_rs_sdk::functions::{get_functions, register_functions_component};
 use firebase_rs_sdk::installations::{delete_installations, get_installations};
 use firebase_rs_sdk::remote_config::{get_remote_config, FetchStatus, RemoteConfigValueSource};
-use firebase_rs_sdk::storage::{get_storage_for_app, StorageErrorCode, StringFormat};
+use firebase_rs_sdk::storage::{
+    get_storage_for_app, ListOptions, SettableMetadata, StorageErrorCode, StringFormat, UploadTaskState,
+};
 
 // ---------------------------------------------------------------------------------------------
 // Configuration
@@ -1972,6 +1974,302 @@ async fn storage_upload_download_and_delete() {
         !url.contains("%2D") && !url.contains("%2E") && !url.contains("%5F"),
         "over-encoded URL: {url}"
     );
+
+    cleanup_auth(&auth).await;
+    delete_app(&app).await.expect("delete_app");
+}
+
+/// Drives the resumable upload protocol end to end: chunked progress notifications, pausing and
+/// resuming a half-finished upload, and cancelling one so no object is ever created.
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn storage_resumable_upload_progress_pause_and_cancel() {
+    let test = "storage_resumable_upload_progress_pause_and_cancel";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    if config.emulators.storage.is_none() {
+        skip(
+            test,
+            "needs the Storage emulator (scripts/emulator_test.sh); online buckets are not provisioned",
+            "n/a",
+        );
+        return;
+    }
+    let app = live_app(&config, "storage-resumable").await;
+    let auth = auth_for(&config, &app);
+    auth.sign_in_anonymously().await.expect("anonymous sign-in");
+    let storage = storage_for(&config, &app).await;
+    let root = storage.root_reference().expect("root reference");
+
+    let prefix = format!("rust_sdk_live_tests/resumable-{}", nonce());
+    // 1 MiB is comfortably above the 256 KiB threshold that switches to the resumable protocol,
+    // so the upload spans several chunks and progress is observable.
+    let payload: Vec<u8> = (0..1024 * 1024).map(|index| (index % 251) as u8).collect();
+    let total = payload.len() as u64;
+
+    // --- progress notifications ------------------------------------------------------------
+    let progress_path = format!("{prefix}/progress.bin");
+    let progress_ref = root.child(&progress_path);
+    let task = progress_ref
+        .upload_bytes_resumable(payload.clone(), None)
+        .expect("resumable task");
+    assert!(task.is_resumable(), "1 MiB must use the resumable protocol");
+    assert_eq!(task.state(), UploadTaskState::Pending);
+
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&observed);
+    let unsubscribe = task.on_state_changed(move |snapshot| {
+        recorder
+            .lock()
+            .expect("observer lock")
+            .push((snapshot.state, snapshot.bytes_transferred));
+    });
+    let handle = task.handle();
+    let metadata = task.run_to_completion().await.expect("resumable upload");
+    unsubscribe();
+
+    assert_eq!(metadata.size, Some(total));
+    assert_eq!(metadata.name.as_deref(), Some(progress_path.as_str()));
+    assert_eq!(handle.state(), UploadTaskState::Completed);
+    assert_eq!(handle.bytes_transferred(), total);
+
+    let events = observed.lock().expect("observer lock").clone();
+    assert!(events.len() >= 2, "expected several chunks, saw {events:?}");
+    let mut previous = 0;
+    for (_, bytes) in &events {
+        assert!(*bytes >= previous, "progress went backwards: {events:?}");
+        previous = *bytes;
+    }
+    assert!(
+        events.iter().any(|(_, bytes)| *bytes > 0 && *bytes < total),
+        "expected a partial chunk event, saw {events:?}"
+    );
+    assert_eq!(
+        events.last().map(|(state, bytes)| (*state, *bytes)),
+        Some((UploadTaskState::Completed, total)),
+        "the final event must report success"
+    );
+
+    let downloaded = progress_ref.get_bytes(None).await.expect("get_bytes");
+    assert_eq!(downloaded, payload, "uploaded bytes must round-trip");
+
+    // --- pause, ask the server where it got to, resume -------------------------------------
+    let paused_path = format!("{prefix}/paused.bin");
+    let paused_ref = root.child(&paused_path);
+    let mut task = paused_ref
+        .upload_bytes_resumable(payload.clone(), None)
+        .expect("resumable task");
+    let handle = task.handle();
+
+    assert!(
+        task.upload_next().await.expect("first chunk").is_none(),
+        "1 MiB cannot finish in a single chunk"
+    );
+    let after_first_chunk = handle.bytes_transferred();
+    assert!(
+        after_first_chunk > 0 && after_first_chunk < total,
+        "unexpected offset after the first chunk: {after_first_chunk}"
+    );
+
+    assert!(handle.pause(), "a running task can be paused");
+    assert_eq!(handle.state(), UploadTaskState::Paused);
+    assert!(task.upload_next().await.expect("paused task").is_none());
+    assert_eq!(handle.bytes_transferred(), after_first_chunk, "a paused task must not upload");
+
+    let server_offset = task.refresh_status().await.expect("resumable session status");
+    assert_eq!(server_offset, after_first_chunk, "the server must agree with the local offset");
+
+    assert!(handle.resume(), "a paused task can be resumed");
+    let metadata = task.run_to_completion().await.expect("resumed upload");
+    assert_eq!(metadata.size, Some(total));
+    assert_eq!(handle.state(), UploadTaskState::Completed);
+    let downloaded = paused_ref.get_bytes(None).await.expect("get_bytes");
+    assert_eq!(downloaded.len(), payload.len());
+
+    // --- cancel mid-flight ------------------------------------------------------------------
+    let canceled_path = format!("{prefix}/canceled.bin");
+    let canceled_ref = root.child(&canceled_path);
+    let task = canceled_ref
+        .upload_bytes_resumable(payload.clone(), None)
+        .expect("resumable task");
+    let handle = task.handle();
+    let canceller = handle.clone();
+    let unsubscribe = task.on_state_changed(move |snapshot| {
+        if snapshot.bytes_transferred > 0 && !snapshot.state.is_terminal() {
+            canceller.cancel();
+        }
+    });
+    let err = task.run_to_completion().await.expect_err("a canceled upload must fail");
+    unsubscribe();
+
+    assert_eq!(err.code, StorageErrorCode::Canceled, "got {err}");
+    assert_eq!(err.code_str(), "storage/canceled");
+    assert_eq!(handle.state(), UploadTaskState::Canceled);
+    assert!(handle.bytes_transferred() < total, "the upload must stop before the last chunk");
+    let err = canceled_ref
+        .get_metadata()
+        .await
+        .expect_err("a canceled session must not produce an object");
+    assert_eq!(err.code, StorageErrorCode::ObjectNotFound, "got {err}");
+
+    // Cancelling also tears down the session server-side: querying it afterwards reports
+    // `storage/canceled` instead of a byte offset.
+    let discarded_path = format!("{prefix}/discarded.bin");
+    let discarded_ref = root.child(&discarded_path);
+    let mut task = discarded_ref
+        .upload_bytes_resumable(payload.clone(), None)
+        .expect("resumable task");
+    let handle = task.handle();
+    assert!(task.upload_next().await.expect("first chunk").is_none());
+    assert!(handle.upload_session_url().is_some(), "a session must be open");
+    assert!(handle.cancel());
+    let err = task.upload_next().await.expect_err("a canceled task must fail");
+    assert_eq!(err.code, StorageErrorCode::Canceled, "got {err}");
+    let err = task
+        .refresh_status()
+        .await
+        .expect_err("the canceled session must be gone");
+    assert_eq!(err.code, StorageErrorCode::Canceled, "got {err}");
+    let err = discarded_ref
+        .get_metadata()
+        .await
+        .expect_err("a canceled session must not produce an object");
+    assert_eq!(err.code, StorageErrorCode::ObjectNotFound, "got {err}");
+
+    progress_ref.delete_object().await.expect("delete progress.bin");
+    paused_ref.delete_object().await.expect("delete paused.bin");
+    cleanup_auth(&auth).await;
+    delete_app(&app).await.expect("delete_app");
+}
+
+/// Covers `list` pagination (page sizes, page tokens, prefixes vs items) and metadata updates.
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn storage_list_pagination_and_metadata_updates() {
+    let test = "storage_list_pagination_and_metadata_updates";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    if config.emulators.storage.is_none() {
+        skip(
+            test,
+            "needs the Storage emulator (scripts/emulator_test.sh); online buckets are not provisioned",
+            "n/a",
+        );
+        return;
+    }
+    let app = live_app(&config, "storage-list").await;
+    let auth = auth_for(&config, &app);
+    auth.sign_in_anonymously().await.expect("anonymous sign-in");
+    let storage = storage_for(&config, &app).await;
+    let root = storage.root_reference().expect("root reference");
+
+    let prefix = format!("rust_sdk_live_tests/list-{}", nonce());
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        root.child(&format!("{prefix}/{name}"))
+            .upload_string(name, StringFormat::Raw, None)
+            .await
+            .expect("upload");
+    }
+    let nested = root.child(&format!("{prefix}/sub/d.txt"));
+    nested
+        .upload_string("d", StringFormat::Raw, None)
+        .await
+        .expect("upload");
+
+    let folder = root.child(&prefix);
+
+    // Page sizes are validated client-side, exactly like the Web SDK.
+    let err = folder
+        .list(Some(ListOptions {
+            max_results: Some(0),
+            page_token: None,
+        }))
+        .await
+        .expect_err("0 is not a valid page size");
+    assert_eq!(err.code_str(), "storage/invalid-argument", "got {err}");
+
+    let first = folder
+        .list(Some(ListOptions {
+            max_results: Some(2),
+            page_token: None,
+        }))
+        .await
+        .expect("first page");
+    assert_eq!(
+        first.items.iter().map(|item| item.name()).collect::<Vec<_>>(),
+        vec!["a.txt".to_string(), "b.txt".to_string()],
+        "a page holds at most max_results items"
+    );
+    assert!(
+        first.prefixes.iter().any(|p| p.full_path() == format!("{prefix}/sub")),
+        "nested objects surface as prefixes, got {:?}",
+        first.prefixes
+    );
+    let token = first
+        .next_page_token
+        .clone()
+        .expect("a truncated listing carries a page token");
+
+    let second = folder
+        .list(Some(ListOptions {
+            max_results: Some(2),
+            page_token: Some(token),
+        }))
+        .await
+        .expect("second page");
+    assert_eq!(
+        second.items.iter().map(|item| item.name()).collect::<Vec<_>>(),
+        vec!["c.txt".to_string()],
+        "the page token must resume where the first page stopped"
+    );
+    assert!(second.next_page_token.is_none(), "the last page must not carry a token");
+
+    let all = folder.list_all().await.expect("list_all");
+    assert_eq!(
+        all.items.iter().map(|item| item.name()).collect::<Vec<_>>(),
+        vec!["a.txt".to_string(), "b.txt".to_string(), "c.txt".to_string()],
+        "list_all walks every page"
+    );
+    assert!(all.prefixes.iter().any(|p| p.full_path() == format!("{prefix}/sub")));
+
+    // --- metadata updates -------------------------------------------------------------------
+    let target = root.child(&format!("{prefix}/a.txt"));
+    let mut update = SettableMetadata::new()
+        .with_content_type("text/markdown")
+        .with_cache_control("max-age=42");
+    update.insert_custom_metadata("purpose", "live-test");
+    let updated = target.update_metadata(update).await.expect("update_metadata");
+    assert_eq!(updated.content_type.as_deref(), Some("text/markdown"));
+    assert_eq!(updated.cache_control.as_deref(), Some("max-age=42"));
+    assert_eq!(
+        updated
+            .custom_metadata
+            .as_ref()
+            .and_then(|custom| custom.get("purpose"))
+            .map(String::as_str),
+        Some("live-test")
+    );
+
+    let fetched = target.get_metadata().await.expect("get_metadata");
+    assert_eq!(fetched.content_type.as_deref(), Some("text/markdown"));
+    assert_eq!(fetched.cache_control.as_deref(), Some("max-age=42"));
+    assert_eq!(
+        fetched
+            .custom_metadata
+            .as_ref()
+            .and_then(|custom| custom.get("purpose"))
+            .map(String::as_str),
+        Some("live-test"),
+        "custom metadata must survive a round-trip"
+    );
+
+    for reference in all.items.iter().chain(std::iter::once(&nested)) {
+        reference.delete_object().await.expect("delete_object");
+    }
+    let empty = folder.list_all().await.expect("list_all after cleanup");
+    assert!(empty.items.is_empty(), "cleanup must remove every object");
 
     cleanup_auth(&auth).await;
     delete_app(&app).await.expect("delete_app");

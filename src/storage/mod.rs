@@ -56,11 +56,11 @@ pub use reference::StreamingDownload;
 
 #[doc(inline)]
 pub use request::{
-    continue_resumable_upload_request, create_resumable_upload_request, delete_object_request, download_bytes_request,
-    download_url_request, get_metadata_request, get_resumable_upload_status_request, list_request,
-    multipart_upload_request, update_metadata_request, BackoffConfig, BackoffState, ErrorHandler, HttpClient,
-    RequestBody, RequestError, RequestInfo, ResponseHandler, ResponsePayload, ResumableUploadStatus,
-    RESUMABLE_UPLOAD_CHUNK_SIZE,
+    cancel_resumable_upload_request, continue_resumable_upload_request, create_resumable_upload_request,
+    delete_object_request, download_bytes_request, download_url_request, get_metadata_request,
+    get_resumable_upload_status_request, list_request, multipart_upload_request, update_metadata_request,
+    BackoffConfig, BackoffState, ErrorHandler, HttpClient, RequestBody, RequestError, RequestInfo, ResponseHandler,
+    ResponsePayload, ResumableUploadStatus, RESUMABLE_UPLOAD_CHUNK_SIZE,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -77,7 +77,7 @@ pub use stream::UploadAsyncRead;
 pub use string::{prepare_string_upload, PreparedString, StringFormat};
 
 #[doc(inline)]
-pub use upload::{UploadProgress, UploadTask, UploadTaskState};
+pub use upload::{UploadProgress, UploadTask, UploadTaskHandle, UploadTaskSnapshot, UploadTaskState};
 
 #[doc(inline)]
 pub use util::{is_retry_status_code, is_url};

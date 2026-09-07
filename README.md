@@ -45,7 +45,7 @@ percentages are estimates and deliberately stricter than the ones in each module
 | Module | Coverage | Backend | Verified live | Notes |
 |---|---:|---|:---:|---|
 | installations | 85% | real (Installations REST v1) | yes | FID generation, registration, token refresh, delete, id-change listeners |
-| storage | 75% | real (`firebasestorage.googleapis.com/v0`) | emulator | uploads, downloads, metadata, list, delete, JS error codes and `encodeURIComponent` paths; no resumable pause/resume |
+| storage | 85% | real (`firebasestorage.googleapis.com/v0`) | emulator | uploads, downloads, metadata, paginated list, delete, resumable uploads with progress/pause/resume/cancel, JS error codes and `encodeURIComponent` paths |
 | app | 70% | n/a | yes | app lifecycle, options, component container, heartbeat header |
 | data_connect | 65% | real (`firebasedataconnect.googleapis.com/v1`) | no | executeQuery / executeMutation, emulator, subscriptions |
 | auth | 75% | real (Identity Toolkit v1/v2 + securetoken) | emulator + online | email, phone, custom-token, IdP credential and MFA flows verified end to end; typed error codes; listeners; OAuth popup/redirect UI flows still delegated to the host |
@@ -136,8 +136,9 @@ percentages are estimates and deliberately stricter than the ones in each module
 | `getStorage`, `ref` (path, `gs://`, `https://`), `connectStorageEmulator` | implemented |
 | `uploadBytes`, `uploadString` | implemented |
 | `getDownloadURL`, `getBytes`, `getStream` (native), `getBlob` (wasm) | implemented |
-| `getMetadata`, `updateMetadata`, `list`, `listAll`, `deleteObject` | implemented |
-| `uploadBytesResumable` | partial, no pause / resume / cancel / progress events |
+| `getMetadata`, `updateMetadata`, `list`, `listAll`, `deleteObject` | implemented; `list` paginates with `max_results` (1..=1000) and page tokens, verified against the Storage emulator |
+| `uploadBytesResumable`, `UploadTask.pause/resume/cancel`, `UploadTaskSnapshot`, `on('state_changed')` | implemented; chunked progress via `UploadTaskHandle::on_state_changed`, cancellation discards the resumable session server-side and reports `storage/canceled` |
+| `UploadTask` as a promise (`then`/`catch`), `TaskEvent`/`StorageObserver` object form, resuming a session after a process restart | missing; drive the task with `run_to_completion` and closures instead |
 | Error codes (`object-not-found`, `bucket-not-found`, `unauthenticated`, `unauthorized`, `unauthorized-app`, `quota-exceeded`, `retry-limit-exceeded`, `unknown` with status and body) | implemented per the JS `sharedErrorHandler` / `objectErrorHandler`; verified against the Storage emulator |
 
 ### functions
