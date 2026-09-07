@@ -17,6 +17,11 @@ impl MapValue {
         &self.fields
     }
 
+    /// Consumes the map and returns its fields.
+    pub fn into_fields(self) -> BTreeMap<String, FirestoreValue> {
+        self.fields
+    }
+
     /// Retrieves a value referenced by the provided field path if it exists.
     ///
     /// This powers higher-level helpers such as

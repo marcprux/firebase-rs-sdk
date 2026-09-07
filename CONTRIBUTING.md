@@ -127,15 +127,37 @@ In the analytics module a unit test that exercises the dispatcher is skipped by 
 
 ## Live endpoint tests
 
-`tests/live_endpoints.rs` exercises the real Firebase backends (Installations, Remote Config,
-Authentication, Firestore, Cloud Storage and callable Functions) through the public API. The tests
-are `#[ignore]`d so `cargo test` stays offline; run them with:
+`tests/live_endpoints.rs` exercises real Firebase backends through the public API. The tests are
+`#[ignore]`d so `cargo test` stays offline.
+
+### Against the Local Emulator Suite (default, no credentials)
+
+Auth, Firestore, Storage and callable Functions run against the Firebase emulators. One-time setup:
 
 ```bash
-cargo test --test live_endpoints -- --ignored --nocapture
+npm install -g firebase-tools     # needs Node 20+ and Java 11+
+npm ci --prefix firebase-emulator/functions   # callable fixtures served by the Functions emulator
 ```
 
-Credentials are never committed. Provide one of:
+Then:
+
+```bash
+scripts/emulator_test.sh                        # everything
+scripts/emulator_test.sh firestore_transaction  # only matching tests
+```
+
+The script wraps `firebase emulators:exec` with a `demo-*` project id, so the CLI never contacts
+Google and needs no login. The emulated project is defined entirely under `firebase-emulator/`
+(`firebase.json`, `firestore.rules`, `storage.rules`, `functions/index.js`); the rules mirror what
+the online project uses.
+The harness reads the standard `FIREBASE_AUTH_EMULATOR_HOST`, `FIRESTORE_EMULATOR_HOST`,
+`FIREBASE_STORAGE_EMULATOR_HOST` and `FIREBASE_FUNCTIONS_EMULATOR_HOST` variables, so any other
+way of starting the emulators works too.
+
+### Against the online project (Installations, Remote Config)
+
+Installations and Remote Config have no emulator. They run only when credentials for a real
+project are provided, and are skipped otherwise. Credentials are never committed. Provide one of:
 
 - `google-services.json` at the crate root (or `FIREBASE_GOOGLE_SERVICES_FILE=/path`, or the raw
   JSON in `FIREBASE_GOOGLE_SERVICES_JSON`, which is how CI injects the secret);
@@ -144,9 +166,16 @@ Credentials are never committed. Provide one of:
   `FIREBASE_TEST_CALLABLE`);
 - the same variables in the environment.
 
-Both files are gitignored. Products that are not enabled on the project (for example Firebase Auth
-not initialised or the Firestore API disabled) make the affected test print a `SKIP:` line with the
-console action needed and pass; the `live_project_probe` test prints a one-screen summary of what
-the credentials can reach. `.github/workflows/live-tests.yml` runs the suite on pushes to `main`,
-same-repository pull requests, a weekly schedule and manual dispatch using the
-`FIREBASE_GOOGLE_SERVICES_JSON` repository secret.
+```bash
+cargo test --test live_endpoints -- --ignored --nocapture
+```
+
+Without emulator variables, the migrated tests also run against the online project; products that
+are not enabled there make the affected test print a `SKIP:` line with the console action needed
+and pass. `live_project_probe` prints a one-screen summary of what the credentials can reach.
+
+### CI
+
+`.github/workflows/live-tests.yml` has two jobs: `emulator` (no secrets, runs for every push and
+pull request) and `live` (uses the `FIREBASE_GOOGLE_SERVICES_JSON` secret to run the online-only
+tests on pushes to `main`, same-repository pull requests, a weekly schedule and manual dispatch).

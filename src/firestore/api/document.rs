@@ -218,6 +218,62 @@ impl FirestoreClient {
     }
 
     /// Reads a document using the converter attached to a typed reference.
+    /// Writes a serde-serializable value as the document at `path`.
+    ///
+    /// ```no_run
+    /// # use firebase_rs_sdk::firestore::*;
+    /// # #[derive(serde::Serialize, serde::Deserialize)] struct City { name: String, population: i64 }
+    /// # async fn demo(client: FirestoreClient) -> FirestoreResult<()> {
+    /// client.set_doc_as("cities/lima", &City { name: "Lima".into(), population: 10_000_000 }, None).await?;
+    /// let city: Option<City> = client.get_doc_as("cities/lima").await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn set_doc_as<T: serde::Serialize + ?Sized>(
+        &self,
+        path: &str,
+        value: &T,
+        options: Option<SetOptions>,
+    ) -> FirestoreResult<()> {
+        let data = crate::firestore::value::to_document(value)?;
+        self.set_doc(path, data, options).await
+    }
+
+    /// Applies the fields of a serde-serializable value as an update to the document at `path`.
+    pub async fn update_doc_as<T: serde::Serialize + ?Sized>(&self, path: &str, value: &T) -> FirestoreResult<()> {
+        let data = crate::firestore::value::to_document(value)?;
+        self.update_doc(path, data).await
+    }
+
+    /// Adds a serde-serializable value as a new document with an auto-generated id and returns
+    /// the created snapshot.
+    pub async fn add_doc_as<T: serde::Serialize + ?Sized>(
+        &self,
+        collection_path: &str,
+        value: &T,
+    ) -> FirestoreResult<DocumentSnapshot> {
+        let data = crate::firestore::value::to_document(value)?;
+        self.add_doc(collection_path, data).await
+    }
+
+    /// Reads the document at `path` and deserializes it into `T`; `Ok(None)` when it does not
+    /// exist.
+    pub async fn get_doc_as<T: serde::de::DeserializeOwned>(&self, path: &str) -> FirestoreResult<Option<T>> {
+        self.get_doc(path).await?.data_as()
+    }
+
+    /// Runs `query` and deserializes every document into `T`.
+    pub async fn get_docs_as<T: serde::de::DeserializeOwned>(&self, query: &Query) -> FirestoreResult<Vec<T>> {
+        let snapshot = self.get_docs(query).await?;
+        snapshot
+            .documents()
+            .iter()
+            .map(|doc| {
+                doc.data_as::<T>()?
+                    .ok_or_else(|| internal_error("query results always contain existing documents"))
+            })
+            .collect()
+    }
+
     pub async fn get_doc_with_converter<C>(
         &self,
         reference: &ConvertedDocumentReference<C>,

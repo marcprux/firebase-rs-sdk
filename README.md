@@ -52,7 +52,7 @@ percentages are estimates and deliberately stricter than the ones in each module
 | functions | 50% | real (`cloudfunctions.net` / custom domain) | yes | callable protocol with auth, App Check and FID headers; no streaming |
 | remote_config | 50% | real (`firebaseremoteconfig.googleapis.com/v1`) | yes | fetch, ETag-based activate, defaults with correct value sources, custom signals, typed getters |
 | app_check | 45% | real exchange endpoint, untested | no | custom provider and refresher only on native; reCAPTCHA is wasm-only |
-| firestore | 40% | real REST for one-shot ops; realtime is simulated | yes | CRUD, queries, batches, aggregates, optimistic transactions with retry, write results; no `onSnapshot` or offline |
+| firestore | 45% | real REST for one-shot ops; realtime is simulated | yes | CRUD, queries, batches, aggregates, optimistic transactions with retry, write results, serde structs; no `onSnapshot` or offline |
 | database | 30% | real REST; WebSocket partial | no | reads/writes/queries over REST; realtime listeners and transactions incomplete |
 | messaging | 0% native / 40% wasm | real on wasm only | no | native path returns placeholder tokens; no message delivery anywhere |
 | performance | 15% | trace API local; upload body not accepted by backend | no | traces and metrics are recorded but never ingested |
@@ -86,7 +86,8 @@ percentages are estimates and deliberately stricter than the ones in each module
 | Typed error codes (`auth/wrong-password`, `auth/user-not-found`, `auth/too-many-requests`, ...) | implemented; `AuthError::Server` carries an `AuthErrorCode` mapped with the JS `SERVER_ERROR_MAP`, unmapped codes are normalised like the JS SDK (`auth/configuration-not-found`) |
 | `getIdTokenResult`, `reload`, `updateCurrentUser`, `onIdTokenChanged`, `beforeAuthStateChanged` | missing |
 | `fetchSignInMethodsForEmail`, `verifyBeforeUpdateEmail`, `revokeAccessToken`, `validatePassword`, `updatePhoneNumber` | missing |
-| `connectAuthEmulator`, `useDeviceLanguage`, `tenantId`, `RecaptchaVerifier`, `SAMLAuthProvider` | missing |
+| `connectAuthEmulator` | implemented (`Auth::connect_emulator` / `connect_auth_emulator`), verified against the Auth emulator |
+| `useDeviceLanguage`, `tenantId`, `RecaptchaVerifier`, `SAMLAuthProvider` | missing |
 
 ### firestore
 
@@ -106,7 +107,7 @@ percentages are estimates and deliberately stricter than the ones in each module
 | `and`, `or` composite filters, `deleteField`, `vector` / `VectorValue` | missing |
 | `getDocFromCache`, `getDocFromServer`, `enableNetwork`, `disableNetwork`, `waitForPendingWrites`, `terminate` | missing |
 | Offline persistence (`persistentLocalCache`, `enableIndexedDbPersistence`), bundles, named queries, index configuration | missing |
-| Serde integration for plain structs | missing, documents are `BTreeMap<String, FirestoreValue>` |
+| Serde integration (`set_doc_as`, `get_doc_as`, `get_docs_as`, `SerdeConverter`, `Transaction::get_as/set_as`, `WriteBatch::set_as/update_as`) | implemented; `Timestamp`, `GeoPoint`, `BytesValue` and `FirestoreValue` sentinels map to native Firestore types |
 
 ### database (Realtime Database)
 
@@ -143,7 +144,8 @@ percentages are estimates and deliberately stricter than the ones in each module
 | Callable protocol: `data` / `result` envelope, gRPC status error mapping | implemented |
 | `Authorization`, `Firebase-Instance-ID-Token`, `X-Firebase-AppCheck`, `X-Firebase-Client` headers | implemented |
 | `httpsCallable(...).stream()` (server-sent events) | missing |
-| `httpsCallableFromURL`, `connectFunctionsEmulator`, `HttpsCallableOptions` (timeout, limited-use App Check) | missing |
+| `connectFunctionsEmulator` | implemented, verified against the Functions emulator |
+| `httpsCallableFromURL`, `HttpsCallableOptions` (timeout, limited-use App Check) | missing |
 | `@type` `Int64Value` / `UInt64Value` decoding | missing |
 
 ### remote_config
@@ -340,12 +342,14 @@ For further details, refer to the example [`./examples/firestore_select_document
 
 ## Live endpoint tests
 
-Besides the offline unit tests, `tests/live_endpoints.rs` talks to the real Firebase services using
-credentials from a gitignored `google-services.json` or `.env.firebase` (see
-[`CONTRIBUTING.md`](https://github.com/dgasparri/firebase-rs-sdk/blob/main/CONTRIBUTING.md#live-endpoint-tests)):
+Besides the offline unit tests, `tests/live_endpoints.rs` exercises real backends: Auth, Firestore,
+Storage and Functions against the Firebase Local Emulator Suite (no credentials needed), and
+Installations and Remote Config against a real project when credentials are configured. See
+[`CONTRIBUTING.md`](https://github.com/dgasparri/firebase-rs-sdk/blob/main/CONTRIBUTING.md#live-endpoint-tests).
 
 ```bash
-cargo test --test live_endpoints -- --ignored --nocapture
+npm install -g firebase-tools && npm ci --prefix firebase-emulator/functions   # once
+scripts/emulator_test.sh
 ```
 
 ## Copyright

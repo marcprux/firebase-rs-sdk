@@ -13,6 +13,11 @@ impl ArrayValue {
     pub fn values(&self) -> &[FirestoreValue] {
         &self.values
     }
+
+    /// Consumes the array and returns its elements.
+    pub fn into_values(self) -> Vec<FirestoreValue> {
+        self.values
+    }
 }
 
 #[cfg(test)]

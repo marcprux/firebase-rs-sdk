@@ -1,6 +1,8 @@
 name: live-tests
 
-# Exercises the real Firebase backends with the credentials stored in repository secrets.
+# Exercises the Firebase backends: the Local Emulator Suite for everything that has an emulator
+# (no secrets needed) and the real project, with the credentials stored in repository secrets, for
+# the services that don't (Installations, Remote Config).
 #
 # Required secret:
 #   FIREBASE_GOOGLE_SERVICES_JSON  - the full contents of the app's google-services.json
@@ -48,8 +50,54 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Run live endpoint tests
+      # Only the services without an emulator run against the online project; everything else
+      # runs in the `emulator` job below.
+      - name: Run online-only endpoint tests (Installations, Remote Config, probe)
         env:
           # Keep the installations cache out of the checkout (runner context is step-scoped).
           FIREBASE_INSTALLATIONS_CACHE_DIR: ${{ runner.temp }}/firebase-installations
-        run: cargo test --test live_endpoints -- --ignored --nocapture --test-threads=2
+        run: >-
+          cargo test --test live_endpoints -- --ignored --nocapture --test-threads=2
+          installations remote_config live_project_probe
+
+  # Runs Auth, Firestore, Storage and Functions tests against the Firebase Local Emulator Suite.
+  # Needs no secrets, so it also runs for pull requests from forks.
+  emulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: firebase-emulator/functions/package-lock.json
+
+      - name: Set up Java (required by the Firestore and Storage emulators)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Cache emulator binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/firebase/emulators
+          key: firebase-emulators-${{ runner.os }}-${{ hashFiles('firebase-emulator/firebase.json') }}
+
+      - name: Install Firebase CLI and the callable fixtures
+        run: |
+          npm install -g firebase-tools
+          npm ci --prefix firebase-emulator/functions
+
+      - name: Run endpoint tests against the emulators
+        run: scripts/emulator_test.sh

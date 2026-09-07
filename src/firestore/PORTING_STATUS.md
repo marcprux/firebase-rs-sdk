@@ -27,6 +27,7 @@ DISCLAIMER: This is not an official Firebase product, nor it is guaranteed that 
 
 
 ## Implemented
+- Serde support: `to_document` / `from_document` / `to_firestore_value` / `from_firestore_value`, `SerdeConverter<T>` for `with_converter`, and typed helpers (`FirestoreClient::{set,update,add,get}_doc_as`, `get_docs_as`, `DocumentSnapshot::data_as`, `Transaction::{get,set,update}_as`, `WriteBatch::{set,update}_as`). `Timestamp`, `GeoPoint` and `BytesValue` implement `Serialize`/`Deserialize`; `FirestoreValue` fields (including sentinels) pass through unchanged. Verified live.
 - `runTransaction` (`FirestoreClient::run_transaction`) ported from `lite-api/transaction.ts` + `core/transaction.ts` + `core/transaction_runner.ts`: optimistic transactions over `documents:batchGet` and `documents:commit` with `currentDocument` preconditions and `verify` writes, retried on `failed-precondition` / `aborted` / non-permanent errors (5 attempts, exponential backoff). Error codes `aborted`, `failed-precondition`, `already-exists` are mapped from the canonical status in error payloads. `DocumentSnapshot` exposes `create_time` / `update_time`; commits return `CommitResult` (`WriteBatch::commit_with_results`). Commits are no longer replayed on transport failures. Verified live by `tests/live_endpoints.rs`.
 
 - **Component wiring** – `firestore::api::register_firestore_component` hooks Firestore into the global component

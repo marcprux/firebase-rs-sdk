@@ -32,3 +32,8 @@ GoogleService-Info.plist
 .env
 .env.*
 .firebase/
+
+# Firebase Local Emulator Suite
+firebase-emulator/functions/node_modules/
+*-debug.log
+.firebase/

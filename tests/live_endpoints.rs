@@ -29,6 +29,21 @@
 //! `FIREBASE_LIVE_TESTS_REQUIRED=1` is set (CI does this on the main branch) in which case they
 //! fail loudly.
 //!
+//! # Emulators
+//!
+//! When the standard emulator variables are set (`firebase emulators:exec` exports the first
+//! three; `scripts/emulator_test.sh` exports the last one), the matching service is routed to
+//! the Firebase Local Emulator Suite instead of the online project, and no credentials are
+//! needed at all: a `demo-*` project id and a fake API key are synthesized.
+//!
+//! - `FIREBASE_AUTH_EMULATOR_HOST`
+//! - `FIRESTORE_EMULATOR_HOST` (read by the crate itself)
+//! - `FIREBASE_STORAGE_EMULATOR_HOST`
+//! - `FIREBASE_FUNCTIONS_EMULATOR_HOST`
+//!
+//! Installations and Remote Config have no emulator; their tests need online credentials and
+//! skip otherwise. Run everything with `scripts/emulator_test.sh`.
+//!
 //! # Project provisioning
 //!
 //! Firebase projects don't have every product enabled. When a backend reports that a product is
@@ -69,6 +84,45 @@ struct LiveConfig {
     storage_bucket: Option<String>,
     database_url: Option<String>,
     test_callable: Option<String>,
+    /// True when real project credentials were found (as opposed to a synthesized emulator
+    /// configuration).
+    online: bool,
+    emulators: EmulatorHosts,
+}
+
+/// `host:port` of each running emulator, taken from the standard environment variables.
+#[derive(Clone, Debug, Default)]
+struct EmulatorHosts {
+    auth: Option<String>,
+    firestore: Option<String>,
+    storage: Option<String>,
+    functions: Option<String>,
+}
+
+impl EmulatorHosts {
+    fn from_env() -> Self {
+        Self {
+            auth: read_env("FIREBASE_AUTH_EMULATOR_HOST"),
+            firestore: read_env("FIRESTORE_EMULATOR_HOST"),
+            storage: read_env("FIREBASE_STORAGE_EMULATOR_HOST"),
+            functions: read_env("FIREBASE_FUNCTIONS_EMULATOR_HOST"),
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.auth.is_some() || self.firestore.is_some() || self.storage.is_some() || self.functions.is_some()
+    }
+}
+
+/// Splits `host:port` into its parts, defaulting the port when absent.
+fn split_host_port(value: &str, default_port: u16) -> (String, u16) {
+    match value.rsplit_once(':') {
+        Some((host, port)) => (
+            host.trim_matches(|c| c == '[' || c == ']').to_string(),
+            port.parse().unwrap_or(default_port),
+        ),
+        None => (value.to_string(), default_port),
+    }
 }
 
 impl LiveConfig {
@@ -189,29 +243,81 @@ fn live_config() -> Option<LiveConfig> {
         }
     }
 
-    let required = |key: &str| values.get(key).cloned();
-    let config = LiveConfig {
-        api_key: required("FIREBASE_API_KEY")?,
-        project_id: required("FIREBASE_PROJECT_ID")?,
-        app_id: required("FIREBASE_APP_ID")?,
+    let online = ["FIREBASE_API_KEY", "FIREBASE_PROJECT_ID", "FIREBASE_APP_ID"]
+        .iter()
+        .all(|key| values.contains_key(*key));
+    if !online {
+        return None;
+    }
+    Some(LiveConfig {
+        api_key: values["FIREBASE_API_KEY"].clone(),
+        project_id: values["FIREBASE_PROJECT_ID"].clone(),
+        app_id: values["FIREBASE_APP_ID"].clone(),
         project_number: values.get("FIREBASE_PROJECT_NUMBER").cloned(),
         storage_bucket: values.get("FIREBASE_STORAGE_BUCKET").cloned(),
         database_url: values.get("FIREBASE_DATABASE_URL").cloned(),
         test_callable: values.get("FIREBASE_TEST_CALLABLE").cloned(),
-    };
-    Some(config)
+        online: true,
+        emulators: EmulatorHosts::default(),
+    })
+}
+
+/// Configuration for the Local Emulator Suite, when any emulator host variable is set.
+/// Emulators accept any API key and any `demo-*` project id without credentials, and the
+/// project id must match the one the emulators were started with.
+fn emulator_config() -> Option<LiveConfig> {
+    let emulators = EmulatorHosts::from_env();
+    if !emulators.any() {
+        return None;
+    }
+    let project_id = read_env("FIREBASE_EMULATOR_PROJECT_ID")
+        .or_else(|| read_env("GCLOUD_PROJECT"))
+        .unwrap_or_else(|| "demo-firebase-rs-sdk".to_string());
+    Some(LiveConfig {
+        api_key: "demo-api-key".to_string(),
+        app_id: "1:000000000000:web:demo".to_string(),
+        project_number: Some("000000000000".to_string()),
+        storage_bucket: Some(format!("{project_id}.appspot.com")),
+        database_url: None,
+        test_callable: None,
+        project_id,
+        online: false,
+        emulators,
+    })
+}
+
+/// Like [`require_config`] but for services without an emulator: skips unless real
+/// credentials are configured.
+fn require_online_config(test: &str) -> Option<LiveConfig> {
+    init_process();
+    match live_config() {
+        Some(config) => Some(config),
+        None => {
+            let required = read_env("FIREBASE_LIVE_TESTS_REQUIRED").is_some_and(|v| v == "1" || v == "true");
+            let message = format!(
+                "SKIP: {test}: this service has no emulator; provide online credentials (see CONTRIBUTING.md) to run it."
+            );
+            if required {
+                panic!("{message}");
+            }
+            eprintln!("{message}");
+            None
+        }
+    }
 }
 
 /// Returns the configuration, or `None` after printing why the test is being skipped.
 /// Panics instead when `FIREBASE_LIVE_TESTS_REQUIRED=1`.
 fn require_config(test: &str) -> Option<LiveConfig> {
     init_process();
-    match live_config() {
+    // Emulators take precedence: the migrated tests run offline whenever the suite is up.
+    match emulator_config().or_else(live_config) {
         Some(config) => Some(config),
         None => {
             let message = format!(
-                "SKIP: {test}: no Firebase credentials found. Provide google-services.json, .env.firebase, or \
-                 FIREBASE_API_KEY/FIREBASE_PROJECT_ID/FIREBASE_APP_ID (see tests/live_endpoints.rs)."
+                "SKIP: {test}: no Firebase credentials or emulators found. Run scripts/emulator_test.sh, or \
+                 provide google-services.json, .env.firebase, or FIREBASE_API_KEY/FIREBASE_PROJECT_ID/\
+                 FIREBASE_APP_ID (see tests/live_endpoints.rs)."
             );
             if read_env("FIREBASE_LIVE_TESTS_REQUIRED").is_some_and(|v| v == "1" || v == "true") {
                 panic!("{message}");
@@ -254,6 +360,39 @@ async fn live_app(config: &LiveConfig, label: &str) -> FirebaseApp {
     initialize_app(config.firebase_options(), Some(settings))
         .await
         .expect("initialize_app should succeed with valid options")
+}
+
+/// Resolves the Auth service for `app`, routed to the Auth emulator when one is configured.
+fn auth_for(config: &LiveConfig, app: &FirebaseApp) -> Arc<firebase_rs_sdk::auth::Auth> {
+    register_auth_component();
+    let auth = auth_for_app(app.clone()).expect("auth service");
+    if let Some(host) = &config.emulators.auth {
+        auth.connect_emulator(&format!("http://{host}"));
+    }
+    auth
+}
+
+/// Resolves the Storage service for `app`, routed to the Storage emulator when configured.
+async fn storage_for(config: &LiveConfig, app: &FirebaseApp) -> Arc<firebase_rs_sdk::storage::FirebaseStorageImpl> {
+    let storage = get_storage_for_app(Some(app.clone()), None)
+        .await
+        .expect("storage service");
+    if let Some(host) = &config.emulators.storage {
+        let (host, port) = split_host_port(host, 9199);
+        firebase_rs_sdk::storage::connect_storage_emulator(&storage, &host, port, None).expect("connect emulator");
+    }
+    storage
+}
+
+/// Resolves the Functions service for `app`, routed to the Functions emulator when configured.
+async fn functions_for(config: &LiveConfig, app: &FirebaseApp) -> Arc<firebase_rs_sdk::functions::Functions> {
+    register_functions_component();
+    let functions = get_functions(Some(app.clone()), None).await.expect("functions service");
+    if let Some(host) = &config.emulators.functions {
+        let (host, port) = split_host_port(host, 5001);
+        functions.connect_emulator(&host, port);
+    }
+    functions
 }
 
 /// Classifies backend errors that mean "this product isn't provisioned on the project" rather
@@ -319,7 +458,7 @@ fn field_integer(data: &BTreeMap<String, FirestoreValue>, key: &str) -> Option<i
 #[tokio::test]
 #[ignore = "requires live Firebase credentials"]
 async fn live_project_probe() {
-    let Some(config) = require_config("live_project_probe") else {
+    let Some(config) = require_online_config("live_project_probe") else {
         return;
     };
     let client = reqwest::Client::builder()
@@ -356,20 +495,19 @@ async fn live_project_probe() {
         .json(&serde_json::json!({"returnSecureToken": true}))
         .send()
         .await;
-    let summary = summarize(response).await;
-    if summary.starts_with("200") {
-        // Best effort clean-up of the anonymous account we just created.
-        if let Some(token) = summary.split("idToken=").nth(1).and_then(|s| s.split(' ').next()) {
-            let url = format!(
-                "https://identitytoolkit.googleapis.com/v1/accounts:delete?key={}",
-                config.api_key
-            );
-            let _ = client
-                .post(&url)
-                .json(&serde_json::json!({"idToken": token}))
-                .send()
-                .await;
-        }
+    let (summary, id_token) = summarize_with_token(response).await;
+    if let Some(token) = id_token {
+        // Best effort clean-up of the anonymous account we just created. The token itself is
+        // never printed: CI logs are no place for credentials, however short-lived.
+        let url = format!(
+            "https://identitytoolkit.googleapis.com/v1/accounts:delete?key={}",
+            config.api_key
+        );
+        let _ = client
+            .post(&url)
+            .json(&serde_json::json!({"idToken": token}))
+            .send()
+            .await;
     }
     rows.push(("auth (signUp)", summary));
 
@@ -418,6 +556,10 @@ async fn live_project_probe() {
         "\nLive endpoint probe for project '{}' (app {}):",
         config.project_id, config.app_id
     );
+    eprintln!("  mode: {}", if config.online { "online project" } else { "emulators" });
+    if config.emulators.any() {
+        eprintln!("  emulators: {:?}", config.emulators);
+    }
     for (service, result) in &rows {
         eprintln!("  {service:<16} {result}");
     }
@@ -432,12 +574,19 @@ async fn live_project_probe() {
 
 /// Renders an HTTP outcome as `STATUS short-message` for the probe table, never leaking secrets.
 async fn summarize(response: Result<reqwest::Response, reqwest::Error>) -> String {
+    summarize_with_token(response).await.0
+}
+
+/// Like [`summarize`], additionally returning an `idToken` from the body (for clean-up) instead
+/// of rendering it.
+async fn summarize_with_token(response: Result<reqwest::Response, reqwest::Error>) -> (String, Option<String>) {
     match response {
-        Err(err) => format!("transport error: {err}"),
+        Err(err) => (format!("transport error: {err}"), None),
         Ok(resp) => {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
             let json: Option<serde_json::Value> = serde_json::from_str(&text).ok();
+            let id_token = json.as_ref().and_then(|j| j["idToken"].as_str()).map(str::to_string);
             let detail = json
                 .as_ref()
                 .and_then(|j| {
@@ -447,14 +596,14 @@ async fn summarize(response: Result<reqwest::Response, reqwest::Error>) -> Strin
                         .or_else(|| j["error"]["status"].as_str().map(str::to_string))
                         .or_else(|| j["state"].as_str().map(|s| format!("state={s}")))
                         .or_else(|| j["fid"].as_str().map(|_| "registered".to_string()))
-                        .or_else(|| j["idToken"].as_str().map(|t| format!("idToken={t} ")))
+                        .or_else(|| j["idToken"].as_str().map(|_| "signed in (token redacted)".to_string()))
                 })
                 .unwrap_or_else(|| {
                     let head: String = text.chars().take(60).collect();
                     head.replace('\n', " ")
                 });
             let detail: String = detail.chars().take(160).collect();
-            format!("{status} {detail}")
+            (format!("{status} {detail}"), id_token)
         }
     }
 }
@@ -466,7 +615,7 @@ async fn summarize(response: Result<reqwest::Response, reqwest::Error>) -> Strin
 #[tokio::test]
 #[ignore = "requires live Firebase credentials"]
 async fn installations_registers_fid_and_issues_token() {
-    let Some(config) = require_config("installations_registers_fid_and_issues_token") else {
+    let Some(config) = require_online_config("installations_registers_fid_and_issues_token") else {
         return;
     };
     let app = live_app(&config, "fis").await;
@@ -517,7 +666,7 @@ async fn installations_registers_fid_and_issues_token() {
 #[tokio::test]
 #[ignore = "requires live Firebase credentials"]
 async fn remote_config_fetches_and_activates_live_template() {
-    let Some(config) = require_config("remote_config_fetches_and_activates_live_template") else {
+    let Some(config) = require_online_config("remote_config_fetches_and_activates_live_template") else {
         return;
     };
     let app = live_app(&config, "rc").await;
@@ -599,8 +748,7 @@ async fn auth_anonymous_sign_in_round_trip() {
         return;
     };
     let app = live_app(&config, "auth-anon").await;
-    register_auth_component();
-    let auth = auth_for_app(app.clone()).expect("auth service");
+    let auth = auth_for(&config, &app);
 
     // Record every auth-state notification as Some(uid) / None.
     let events: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -694,8 +842,7 @@ async fn auth_email_password_create_sign_in_and_delete() {
         return;
     };
     let app = live_app(&config, "auth-email").await;
-    register_auth_component();
-    let auth = auth_for_app(app.clone()).expect("auth service");
+    let auth = auth_for(&config, &app);
 
     let email = format!("rust-sdk-live-{}@example.com", nonce());
     let password = format!("Pw-{}-{}", nonce(), "correct-horse");
@@ -788,8 +935,7 @@ impl LiveFirestore {
     async fn connect(config: &LiveConfig, label: &str) -> Self {
         let app = live_app(config, label).await;
         let firestore = Firestore::from_arc(get_firestore(Some(app.clone())).await.expect("firestore service"));
-        register_auth_component();
-        let auth = auth_for_app(app.clone()).expect("auth service");
+        let auth = auth_for(config, &app);
         let client = if auth.sign_in_anonymously().await.is_ok() {
             FirestoreClient::with_http_datastore_authenticated(firestore.clone(), auth.token_provider(), None)
         } else {
@@ -1176,6 +1322,139 @@ async fn firestore_transaction_verifies_documents_it_only_read() {
     live.teardown().await;
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+enum Climate {
+    Temperate,
+    Tropical { humidity: u8 },
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+struct CityRecord {
+    marker: String,
+    name: String,
+    population: i64,
+    area_km2: f64,
+    capital: bool,
+    tags: Vec<String>,
+    mayor: Option<String>,
+    founded: firebase_rs_sdk::firestore::Timestamp,
+    location: firebase_rs_sdk::firestore::GeoPoint,
+    flag: firebase_rs_sdk::firestore::BytesValue,
+    climate: Climate,
+    stats: BTreeMap<String, i64>,
+}
+
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn firestore_serde_round_trip_query_and_transaction() {
+    let test = "firestore_serde_round_trip_query_and_transaction";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    let live = LiveFirestore::connect(&config, "fs-serde").await;
+    let client = &live.client;
+    let marker = format!("serde-{}", nonce());
+    let path = format!("{LIVE_COLLECTION}/{marker}");
+
+    let city = CityRecord {
+        marker: marker.clone(),
+        name: "Amsterdam".into(),
+        population: 921_402,
+        area_km2: 219.3,
+        capital: true,
+        tags: vec!["canals".into(), "bikes".into()],
+        mayor: None,
+        founded: firebase_rs_sdk::firestore::Timestamp::new(-21_366_115_200, 500_000),
+        location: firebase_rs_sdk::firestore::GeoPoint::new(52.37, 4.9).expect("geo point"),
+        flag: firebase_rs_sdk::firestore::BytesValue::new(vec![0xde, 0xad, 0xbe, 0xef]),
+        climate: Climate::Tropical { humidity: 87 },
+        stats: BTreeMap::from([("bridges".to_string(), 1281), ("museums".to_string(), 75)]),
+    };
+
+    // Typed set + get: every Firestore-specific type must survive the REST encoding.
+    if let Err(err) = client.set_doc_as(&path, &city, None).await {
+        if live.skip_if_unprovisioned(test, &err) {
+            live.teardown().await;
+            return;
+        }
+        panic!("set_doc_as failed: {err}");
+    }
+    let stored: CityRecord = client
+        .get_doc_as(&path)
+        .await
+        .expect("get_doc_as")
+        .expect("document exists");
+    assert_eq!(stored, city);
+
+    // Typed query results.
+    let query = live
+        .firestore
+        .collection(LIVE_COLLECTION)
+        .expect("collection")
+        .query()
+        .where_field(
+            FieldPath::from_dot_separated("marker").expect("field path"),
+            FilterOperator::Equal,
+            FirestoreValue::from_string(marker.clone()),
+        )
+        .expect("where");
+    let cities: Vec<CityRecord> = client.get_docs_as(&query).await.expect("get_docs_as");
+    assert_eq!(cities, vec![city.clone()]);
+
+    // Typed converter on a reference, the JS `withConverter` path.
+    let converted = live
+        .firestore
+        .doc(&path)
+        .expect("doc")
+        .with_converter(firebase_rs_sdk::firestore::SerdeConverter::<CityRecord>::new());
+    let typed = client.get_doc_with_converter(&converted).await.expect("typed get");
+    assert_eq!(typed.data().expect("decode").as_ref(), Some(&city));
+
+    // Typed transaction: read as a struct, write back a modified struct.
+    let doc_ref = live.firestore.doc(&path).expect("doc");
+    let grown = client
+        .run_transaction(|txn| {
+            let doc_ref = doc_ref.clone();
+            async move {
+                let mut current: CityRecord = txn.get_as(&doc_ref).await?.expect("exists");
+                current.population += 1;
+                current.mayor = Some("Femke".into());
+                txn.set_as(&doc_ref, &current, None)?;
+                Ok(current.population)
+            }
+        })
+        .await
+        .expect("typed transaction");
+    assert_eq!(grown, 921_403);
+    let after: CityRecord = client.get_doc_as(&path).await.unwrap().unwrap();
+    assert_eq!(after.population, 921_403);
+    assert_eq!(after.mayor.as_deref(), Some("Femke"));
+
+    // Serde-encoded sentinel inside a struct update through a batch.
+    #[derive(serde::Serialize)]
+    struct Touch {
+        population: FirestoreValue,
+        tags: FirestoreValue,
+    }
+    let mut batch = client.batch();
+    batch
+        .update_as(
+            &doc_ref,
+            &Touch {
+                population: FirestoreValue::numeric_increment(FirestoreValue::from_integer(7)),
+                tags: FirestoreValue::array_union(vec![FirestoreValue::from_string("tulips")]),
+            },
+        )
+        .expect("batch update_as");
+    batch.commit().await.expect("batch commit");
+    let touched: CityRecord = client.get_doc_as(&path).await.unwrap().unwrap();
+    assert_eq!(touched.population, 921_410);
+    assert_eq!(touched.tags, vec!["canals", "bikes", "tulips"]);
+
+    client.delete_doc(&path).await.expect("cleanup");
+    live.teardown().await;
+}
+
 async fn cleanup_auth(auth: &std::sync::Arc<firebase_rs_sdk::auth::Auth>) {
     if auth.current_user().is_some() {
         if let Err(err) = auth.delete_user().await {
@@ -1200,9 +1479,13 @@ async fn storage_upload_download_and_delete() {
         return;
     }
     let app = live_app(&config, "storage").await;
-    let storage = get_storage_for_app(Some(app.clone()), None)
-        .await
-        .expect("storage service");
+    // Sign in anonymously so rules of the form `request.auth != null` pass; Storage picks the
+    // token up through the app's `auth-internal` component.
+    let auth = auth_for(&config, &app);
+    if let Err(err) = auth.sign_in_anonymously().await {
+        eprintln!("storage: anonymous auth unavailable ({err}), continuing unauthenticated");
+    }
+    let storage = storage_for(&config, &app).await;
 
     let object_name = format!("rust_sdk_live_tests/{}.txt", nonce());
     let reference = storage.root_reference().expect("root reference").child(&object_name);
@@ -1214,9 +1497,11 @@ async fn storage_upload_download_and_delete() {
             let text = err.to_string();
             // The SDK maps every non-2xx to `internal-error`, so the HTTP status is the only
             // reliable signal for "bucket missing / rules deny" (404 / 401 / 403).
-            let not_provisioned = provisioning_skip_reason(&text).is_some()
-                || (err.code == StorageErrorCode::InternalError
-                    && matches!(err.status, Some(401) | Some(403) | Some(404)));
+            // Against the emulator nothing can be unprovisioned: any failure is a real failure.
+            let not_provisioned = config.emulators.storage.is_none()
+                && (provisioning_skip_reason(&text).is_some()
+                    || (err.code == StorageErrorCode::InternalError
+                        && matches!(err.status, Some(401) | Some(403) | Some(404))));
             if not_provisioned {
                 skip(
                     test,
@@ -1224,6 +1509,7 @@ async fn storage_upload_download_and_delete() {
                      Storage > Get started) and allow writes to `rust_sdk_live_tests/` in the rules.",
                     &text,
                 );
+                cleanup_auth(&auth).await;
                 delete_app(&app).await.ok();
                 return;
             }
@@ -1239,11 +1525,21 @@ async fn storage_upload_download_and_delete() {
     assert_eq!(String::from_utf8(bytes).expect("utf-8"), payload);
 
     let url = reference.get_download_url().await.expect("get_download_url");
-    assert!(url.starts_with("https://"), "download URL must be absolute, got {url}");
+    let expected_scheme = if config.emulators.storage.is_some() {
+        "http://"
+    } else {
+        "https://"
+    };
+    assert!(url.starts_with(expected_scheme), "download URL must be absolute, got {url}");
+    assert!(
+        url.contains("alt=media") && url.contains("token="),
+        "download URL must carry a token: {url}"
+    );
 
     reference.delete_object().await.expect("delete_object");
     let after_delete = reference.get_metadata().await;
     assert!(after_delete.is_err(), "object must be gone after delete");
+    cleanup_auth(&auth).await;
     delete_app(&app).await.expect("delete_app");
 }
 
@@ -1254,15 +1550,15 @@ async fn storage_upload_download_and_delete() {
 #[tokio::test]
 #[ignore = "requires live Firebase credentials"]
 async fn functions_callable_protocol_against_live_host() {
-    let Some(config) = require_config("functions_callable_protocol_against_live_host") else {
+    let test = "functions_callable_protocol_against_live_host";
+    let Some(config) = require_config(test) else {
         return;
     };
     let app = live_app(&config, "fn").await;
-    register_functions_component();
-    let functions = get_functions(Some(app.clone()), None).await.expect("functions service");
+    let functions = functions_for(&config, &app).await;
 
     // A function that does not exist must map the host's 404 to `not-found`, which proves the
-    // request reached the regional cloudfunctions.net host and that error decoding works.
+    // request reached the callable host and that error decoding works.
     let missing = functions
         .https_callable::<serde_json::Value, serde_json::Value>("rustSdkLiveTestsDoesNotExist")
         .expect("callable reference");
@@ -1272,8 +1568,47 @@ async fn functions_callable_protocol_against_live_host() {
         .expect_err("calling a missing function must fail");
     assert_eq!(err.code, FunctionsErrorCode::NotFound, "unexpected error: {}", err.message());
 
-    // If the project has a deployed callable configured, exercise the success path too.
-    if let Some(name) = &config.test_callable {
+    if config.emulators.functions.is_some() {
+        // The emulator serves the fixtures in `firebase-emulator/functions/index.js`. Sign in so the callable can
+        // report the caller's uid, proving the ID token travels in the request.
+        let auth = auth_for(&config, &app);
+        let uid = auth
+            .sign_in_anonymously()
+            .await
+            .expect("anonymous sign-in")
+            .user
+            .uid()
+            .to_string();
+
+        let hello = functions
+            .https_callable::<serde_json::Value, serde_json::Value>("helloWorld")
+            .expect("callable reference");
+        let response = hello
+            .call_async(&serde_json::json!({ "message": "firebase-rs-sdk" }))
+            .await
+            .expect("helloWorld");
+        assert_eq!(response["message"], "Hello, firebase-rs-sdk!");
+        assert_eq!(response["uid"], uid, "the callable must see the signed-in user");
+        assert_eq!(response["echo"]["message"], "firebase-rs-sdk");
+
+        let failing = functions
+            .https_callable::<serde_json::Value, serde_json::Value>("alwaysFails")
+            .expect("callable reference");
+        let err = failing
+            .call_async(&serde_json::json!({}))
+            .await
+            .expect_err("alwaysFails must fail");
+        assert_eq!(
+            err.code,
+            FunctionsErrorCode::FailedPrecondition,
+            "unexpected error: {}",
+            err.message()
+        );
+        assert_eq!(err.message(), "This callable always fails");
+        assert_eq!(err.details().and_then(|d| d["reason"].as_str()), Some("test-fixture"));
+
+        cleanup_auth(&auth).await;
+    } else if let Some(name) = &config.test_callable {
         let callable = functions
             .https_callable::<serde_json::Value, serde_json::Value>(name)
             .expect("callable reference");
@@ -1283,7 +1618,7 @@ async fn functions_callable_protocol_against_live_host() {
         {
             Ok(response) => eprintln!("callable {name} responded: {response}"),
             Err(err) if err.code == FunctionsErrorCode::NotFound => skip(
-                "functions_callable_protocol_against_live_host",
+                test,
                 &format!(
                     "FIREBASE_TEST_CALLABLE names `{name}` but no such function is deployed in us-central1. \
                      Deploy it or unset the variable / delete the secret."
@@ -1293,7 +1628,9 @@ async fn functions_callable_protocol_against_live_host() {
             Err(err) => panic!("callable {name} failed: {err}"),
         }
     } else {
-        eprintln!("functions: set FIREBASE_TEST_CALLABLE=<name> to also exercise a deployed callable");
+        eprintln!(
+            "functions: run scripts/emulator_test.sh or set FIREBASE_TEST_CALLABLE=<name> to exercise a callable"
+        );
     }
     delete_app(&app).await.expect("delete_app");
 }

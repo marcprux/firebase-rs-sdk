@@ -49,18 +49,20 @@ pub struct SignInWithIdpRequest {
 /// Signs a user in with an identity provider using the `signInWithIdp` REST endpoint.
 pub async fn sign_in_with_idp(
     client: &Client,
+    endpoint: &str,
     api_key: &str,
     request: &SignInWithIdpRequest,
 ) -> AuthResult<SignInWithIdpResponse> {
-    sign_in_with_idp_async(client.clone(), api_key.to_owned(), request.clone()).await
+    sign_in_with_idp_async(client.clone(), endpoint.to_owned(), api_key.to_owned(), request.clone()).await
 }
 
 async fn sign_in_with_idp_async(
     client: Client,
+    endpoint: String,
     api_key: String,
     request: SignInWithIdpRequest,
 ) -> AuthResult<SignInWithIdpResponse> {
-    let url = format!("https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key={api_key}");
+    let url = format!("{}/accounts:signInWithIdp?key={api_key}", endpoint.trim_end_matches('/'));
 
     let response = client
         .post(&url)

@@ -14,7 +14,12 @@ pub(crate) use api::aggregate::AggregateOperation;
 pub use api::aggregate::{AggregateDefinition, AggregateField, AggregateQuerySnapshot, AggregateSpec};
 
 #[doc(inline)]
-pub use api::converter::{FirestoreDataConverter, PassthroughConverter};
+pub use value::{
+    from_document, from_firestore_value, to_document, to_firestore_value, ValueDeserializer, ValueSerializer,
+};
+
+#[doc(inline)]
+pub use api::converter::{FirestoreDataConverter, PassthroughConverter, SerdeConverter};
 
 #[doc(inline)]
 pub use api::database::{get_firestore, register_firestore_component, Firestore};

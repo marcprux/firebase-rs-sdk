@@ -147,6 +147,36 @@ impl Transaction {
         Ok(snapshot.into_typed(reference.converter()))
     }
 
+    /// Reads a document inside the transaction and deserializes it into `T`; `Ok(None)` when it
+    /// does not exist.
+    pub async fn get_as<T: serde::de::DeserializeOwned>(
+        &self,
+        reference: &DocumentReference,
+    ) -> FirestoreResult<Option<T>> {
+        self.get(reference).await?.data_as()
+    }
+
+    /// Stages a `set` of a serde-serializable value for `reference`.
+    pub fn set_as<T: serde::Serialize + ?Sized>(
+        &self,
+        reference: &DocumentReference,
+        value: &T,
+        options: Option<SetOptions>,
+    ) -> FirestoreResult<&Self> {
+        let data = crate::firestore::value::to_document(value)?;
+        self.set(reference, data, options)
+    }
+
+    /// Stages an `update` with the fields of a serde-serializable value for `reference`.
+    pub fn update_as<T: serde::Serialize + ?Sized>(
+        &self,
+        reference: &DocumentReference,
+        value: &T,
+    ) -> FirestoreResult<&Self> {
+        let data = crate::firestore::value::to_document(value)?;
+        self.update(reference, data)
+    }
+
     /// Stages a `set` (optionally merging) for `reference`.
     pub fn set(
         &self,

@@ -97,6 +97,14 @@ impl Functions {
         })
     }
 
+    /// Routes every callable through the Functions emulator at `host:port`.
+    ///
+    /// Mirrors `connectFunctionsEmulator(functions, host, port)` in the JS SDK: requests go to
+    /// `http://host:port/<project>/<region>/<name>`.
+    pub fn connect_emulator(&self, host: &str, port: u16) {
+        *self.inner.endpoint.emulator_origin.lock().unwrap() = Some(format!("http://{host}:{port}"));
+    }
+
     fn callable_url(&self, name: &str) -> FunctionsResult<String> {
         let sanitized = name.trim_start_matches('/');
         let options = self.inner.app.options();
@@ -435,4 +443,11 @@ mod tests {
         assert_eq!(response, json!({ "ok": true }));
         mock.assert();
     }
+}
+
+/// Routes every callable of `functions` through the emulator at `host:port`.
+///
+/// Mirrors `connectFunctionsEmulator` in the JS SDK.
+pub fn connect_functions_emulator(functions: &Functions, host: &str, port: u16) {
+    functions.connect_emulator(host, port);
 }

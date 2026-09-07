@@ -5,4 +5,4 @@ mod context;
 pub mod error;
 mod transport;
 
-pub use api::{get_functions, register_functions_component, CallableFunction, Functions};
+pub use api::{connect_functions_emulator, get_functions, register_functions_component, CallableFunction, Functions};

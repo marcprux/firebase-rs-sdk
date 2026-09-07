@@ -167,10 +167,11 @@ impl JsonProtoSerializer {
         transforms: &[FieldTransform],
     ) -> JsonValue {
         let mut write = self.build_update_write_map(key, map, transforms);
-        if !field_paths.is_empty() {
-            let mask: Vec<String> = field_paths.iter().map(FieldPath::canonical_string).collect();
-            write.insert("updateMask".to_string(), json!({ "fieldPaths": mask }));
-        }
+        // Always send the mask, even when empty: without it Firestore replaces the whole document,
+        // which would wipe every other field on a transform-only update (increment, arrayUnion).
+        // The JS SDK's PatchMutation behaves the same way.
+        let mask: Vec<String> = field_paths.iter().map(FieldPath::canonical_string).collect();
+        write.insert("updateMask".to_string(), json!({ "fieldPaths": mask }));
         write.insert("currentDocument".to_string(), json!({ "exists": true }));
         JsonValue::Object(write)
     }

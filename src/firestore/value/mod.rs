@@ -1,11 +1,15 @@
 pub mod array_value;
 pub mod bytes_value;
 pub mod map_value;
+pub mod serde_support;
 //pub mod value;
 
 pub use array_value::ArrayValue;
 pub use bytes_value::BytesValue;
 pub use map_value::MapValue;
+pub use serde_support::{
+    from_document, from_firestore_value, to_document, to_firestore_value, ValueDeserializer, ValueSerializer,
+};
 
 use std::collections::BTreeMap;
 
@@ -151,6 +155,11 @@ impl FirestoreValue {
 
     pub fn kind(&self) -> &ValueKind {
         &self.kind
+    }
+
+    /// Consumes the value and returns its kind.
+    pub fn into_kind(self) -> ValueKind {
+        self.kind
     }
 }
 

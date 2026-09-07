@@ -110,6 +110,25 @@ impl DocumentSnapshot {
     }
 
     /// Returns the identifier of the document represented by this snapshot.
+    /// Deserializes the document fields into `T` via serde. Returns `Ok(None)` when the
+    /// document does not exist.
+    ///
+    /// ```no_run
+    /// # use firebase_rs_sdk::firestore::*;
+    /// # #[derive(serde::Deserialize)] struct City { name: String }
+    /// # fn demo(snapshot: DocumentSnapshot) -> FirestoreResult<()> {
+    /// if let Some(city) = snapshot.data_as::<City>()? {
+    ///     println!("{}", city.name);
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub fn data_as<T: serde::de::DeserializeOwned>(&self) -> FirestoreResult<Option<T>> {
+        match &self.data {
+            Some(map) => crate::firestore::value::from_document(map.fields()).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Returns the key (full document path) of this snapshot.
     pub fn key(&self) -> &DocumentKey {
         &self.key

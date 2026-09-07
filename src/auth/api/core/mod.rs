@@ -1572,6 +1572,16 @@ impl Auth {
         self.oauth_request_uri.lock().unwrap().clone()
     }
 
+    /// Routes all Identity Toolkit and Secure Token requests through the Auth emulator.
+    ///
+    /// Mirrors `connectAuthEmulator(auth, "http://127.0.0.1:9099")` in the JS SDK; `url` is the
+    /// emulator origin, with or without a trailing slash.
+    pub fn connect_emulator(&self, url: &str) {
+        let origin = url.trim_end_matches('/');
+        self.set_identity_toolkit_endpoint(format!("{origin}/identitytoolkit.googleapis.com/v1"));
+        self.set_secure_token_endpoint(format!("{origin}/securetoken.googleapis.com/v1/token"));
+    }
+
     /// Updates the Identity Toolkit REST endpoint.
     pub fn set_identity_toolkit_endpoint(&self, endpoint: impl Into<String>) {
         let value = endpoint.into();
@@ -1987,7 +1997,8 @@ impl Auth {
         };
 
         let api_key = self.api_key()?;
-        let response = sign_in_with_idp(&self.rest_client, &api_key, &request).await?;
+        let endpoint = self.identity_toolkit_endpoint();
+        let response = sign_in_with_idp(&self.rest_client, &endpoint, &api_key, &request).await?;
         if let Some(pending) = response.mfa_pending_credential.clone() {
             let mut context = MultiFactorSignInContext::default();
             context.local_id = response.local_id.clone();
@@ -2572,6 +2583,11 @@ pub fn register_auth_component() {
         let component = Component::new("auth", Arc::new(auth_factory), ComponentType::Public)
             .with_instantiation_mode(InstantiationMode::Lazy);
         let _ = register_component(component);
+        // Other services (Storage, Functions, Firestore) resolve the user's token through the
+        // private `auth-internal` component, exactly as in the JS SDK's `registerAuth`.
+        let internal = Component::new("auth-internal", Arc::new(auth_internal_factory), ComponentType::Private)
+            .with_instantiation_mode(InstantiationMode::Lazy);
+        let _ = register_component(internal);
     });
     LazyLock::force(&REGISTERED);
 }
@@ -2596,6 +2612,25 @@ fn auth_factory(
         reason: err.to_string(),
     })?;
     Ok(auth as DynService)
+}
+
+fn auth_internal_factory(
+    container: &ComponentContainer,
+    _options: InstanceFactoryOptions,
+) -> Result<DynService, ComponentError> {
+    // Share the public `auth` instance so both components observe the same signed-in user.
+    let provider = container.get_provider("auth");
+    match provider.get_immediate_with_options::<Auth>(None, false) {
+        Ok(Some(auth)) => Ok(auth as DynService),
+        Ok(None) => Err(ComponentError::InitializationFailed {
+            name: "auth-internal".to_string(),
+            reason: "auth component is not registered".to_string(),
+        }),
+        Err(err) => Err(ComponentError::InitializationFailed {
+            name: "auth-internal".to_string(),
+            reason: err.to_string(),
+        }),
+    }
 }
 
 /// Retrieves the `Auth` service for the provided app, initializing if needed.
@@ -2735,6 +2770,29 @@ mod tests {
             sink.lock().unwrap().push(user.as_ref().map(|u| u.uid().to_string()));
         };
         (events, listener)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auth_internal_component_shares_the_public_auth_instance() {
+        use crate::app::{initialize_app, FirebaseAppSettings, FirebaseOptions};
+        register_auth_component();
+        let options = FirebaseOptions {
+            api_key: Some(TEST_API_KEY.into()),
+            project_id: Some("project".into()),
+            ..Default::default()
+        };
+        let settings = FirebaseAppSettings {
+            name: Some("auth-internal-sharing".into()),
+            ..Default::default()
+        };
+        let app = initialize_app(options, Some(settings)).await.expect("app");
+        let public = auth_for_app(app.clone()).expect("auth");
+        let internal = app
+            .container()
+            .get_provider("auth-internal")
+            .get_immediate::<Auth>()
+            .expect("auth-internal resolves");
+        assert!(Arc::ptr_eq(&public, &internal), "both components must expose one Auth");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5009,4 +5067,11 @@ mod tests {
             other => panic!("unexpected result: {other:?}"),
         }
     }
+}
+
+/// Routes `auth` through the Auth emulator at `url` (e.g. `http://127.0.0.1:9099`).
+///
+/// Mirrors `connectAuthEmulator` in the JS SDK.
+pub fn connect_auth_emulator(auth: &Auth, url: &str) {
+    auth.connect_emulator(url);
 }

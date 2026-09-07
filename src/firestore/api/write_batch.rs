@@ -62,6 +62,27 @@ impl WriteBatch {
     ///
     /// TypeScript reference: `WriteBatch.set` (converter overload) in
     /// `packages/firestore/src/lite-api/write_batch.ts`.
+    /// Stages a `set` of a serde-serializable value.
+    pub fn set_as<T: serde::Serialize + ?Sized>(
+        &mut self,
+        reference: &DocumentReference,
+        value: &T,
+        options: Option<SetOptions>,
+    ) -> FirestoreResult<&mut Self> {
+        let data = crate::firestore::value::to_document(value)?;
+        self.set(reference, data, options)
+    }
+
+    /// Stages an `update` with the fields of a serde-serializable value.
+    pub fn update_as<T: serde::Serialize + ?Sized>(
+        &mut self,
+        reference: &DocumentReference,
+        value: &T,
+    ) -> FirestoreResult<&mut Self> {
+        let data = crate::firestore::value::to_document(value)?;
+        self.update(reference, data)
+    }
+
     pub fn set_with_converter<C>(
         &mut self,
         reference: &ConvertedDocumentReference<C>,
