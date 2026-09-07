@@ -41,11 +41,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use firebase_rs_sdk::app::{delete_app, initialize_app, FirebaseApp, FirebaseAppSettings, FirebaseOptions};
-use firebase_rs_sdk::auth::{auth_for_app, register_auth_component, AuthError, AuthErrorCode};
+use firebase_rs_sdk::auth::{auth_for_app, register_auth_component, AuthError, AuthErrorCode, User};
 use firebase_rs_sdk::firestore::{
     get_firestore, FieldPath, FilterOperator, Firestore, FirestoreClient, FirestoreErrorCode, FirestoreValue, ValueKind,
 };
@@ -278,6 +278,11 @@ fn provisioning_skip_reason(error_text: &str) -> Option<String> {
         (
             "SERVICE_DISABLED",
             "The product's Google API is disabled for this project. Enable it from the console link in the error.",
+        ),
+        (
+            "DOES NOT EXIST FOR PROJECT",
+            "The Firestore API is enabled but no database has been created. In the console open Build > Firestore \
+             Database > Create database (the default database id must be `(default)`).",
         ),
         (
             "HAS NOT BEEN USED IN PROJECT",
@@ -597,6 +602,18 @@ async fn auth_anonymous_sign_in_round_trip() {
     register_auth_component();
     let auth = auth_for_app(app.clone()).expect("auth service");
 
+    // Record every auth-state notification as Some(uid) / None.
+    let events: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    let unsubscribe = auth.on_auth_state_changed(move |user: &Option<Arc<User>>| {
+        sink.lock().unwrap().push(user.as_ref().map(|u| u.uid().to_string()));
+    });
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![None],
+        "listener must be primed with the signed-out state"
+    );
+
     let credential = match auth.sign_in_anonymously().await {
         Ok(credential) => credential,
         Err(err) => {
@@ -629,10 +646,43 @@ async fn auth_anonymous_sign_in_round_trip() {
         .expect("refreshed token");
     assert_eq!(refreshed.split('.').count(), 3);
 
+    // The same refresh must be reachable from the user object, as in the JS SDK. Secure Token
+    // mints byte-identical JWTs within one second (same `iat`), so wait before forcing again.
+    let before = user.cached_id_token().expect("cached token");
+    std::thread::sleep(Duration::from_millis(1100));
+    let via_user = user.get_id_token(true).await.expect("User::get_id_token(true)");
+    assert_eq!(via_user.split('.').count(), 3);
+    assert_ne!(via_user, before, "a forced refresh must mint a new token");
+    assert_eq!(user.cached_id_token().as_deref(), Some(via_user.as_str()));
+    assert_eq!(
+        user.get_id_token(false).await.expect("cached"),
+        via_user,
+        "a valid token is served from the cache"
+    );
+
+    let uid = user.uid().to_string();
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![None, Some(uid.clone())],
+        "token refreshes must not fire auth-state notifications"
+    );
+
     auth.delete_user()
         .await
         .expect("delete_user should remove the anonymous account");
     assert!(auth.current_user().is_none(), "current_user must be cleared after deletion");
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![None, Some(uid.clone()), None],
+        "deletion must report sign-out"
+    );
+
+    unsubscribe();
+    let second = auth.sign_in_anonymously().await.expect("second anonymous sign-in");
+    assert_ne!(second.user.uid(), uid);
+    assert_eq!(events.lock().unwrap().len(), 3, "unsubscribed listener must stay silent");
+    auth.delete_user().await.expect("cleanup second anonymous user");
+
     delete_app(&app).await.expect("delete_app");
 }
 

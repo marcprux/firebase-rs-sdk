@@ -127,7 +127,11 @@ pub struct Auth {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl AsyncTokenProvider for Arc<Auth> {
     async fn get_token(&self, force_refresh: bool) -> Result<Option<String>, TokenError> {
-        self.get_token(force_refresh).await.map_err(TokenError::from_error)
+        // Fully qualified: with the trait in scope, `self.get_token(..)` would resolve to this
+        // very method and recurse until the stack overflows.
+        Auth::get_token(self, force_refresh)
+            .await
+            .map_err(TokenError::from_error)
     }
 }
 
@@ -221,6 +225,7 @@ impl Auth {
         if let Err(err) = self.set_persisted_state(None) {
             eprintln!("Failed to clear persisted auth state: {err}");
         }
+        self.listeners.notify(None);
     }
 
     /// Returns the email/password auth provider helper.
@@ -492,7 +497,7 @@ impl Auth {
         verifier: Arc<dyn ApplicationVerifier>,
     ) -> AuthResult<ConfirmationResult> {
         let user = self.require_current_user()?;
-        let id_token = user.get_id_token(false)?;
+        let id_token = user.get_id_token(false).await?;
         self.start_phone_flow(phone_number, verifier, PhoneFinalization::Link { id_token })
             .await
     }
@@ -504,7 +509,7 @@ impl Auth {
         verifier: Arc<dyn ApplicationVerifier>,
     ) -> AuthResult<ConfirmationResult> {
         let user = self.require_current_user()?;
-        let id_token = user.get_id_token(false)?;
+        let id_token = user.get_id_token(false).await?;
         self.start_phone_flow(phone_number, verifier, PhoneFinalization::Reauth { id_token })
             .await
     }
@@ -537,7 +542,7 @@ impl Auth {
         credential: PhoneAuthCredential,
     ) -> AuthResult<UserCredential> {
         let user = self.require_current_user()?;
-        let id_token = user.get_id_token(false)?;
+        let id_token = user.get_id_token(false).await?;
         self.finalize_phone_credential(credential, PhoneFinalization::Link { id_token })
             .await
     }
@@ -561,23 +566,45 @@ impl Auth {
         credential: PhoneAuthCredential,
     ) -> AuthResult<Arc<User>> {
         let user = self.require_current_user()?;
-        let id_token = user.get_id_token(false)?;
+        let id_token = user.get_id_token(false).await?;
         let result = self
             .finalize_phone_credential(credential, PhoneFinalization::Reauth { id_token })
             .await?;
         Ok(result.user)
     }
 
-    /// Registers an observer that is invoked whenever auth state changes.
-    pub fn on_auth_state_changed(&self, observer: PartialObserver<Arc<User>>) -> impl FnOnce() + Send + 'static {
-        if let Some(user) = self.current_user() {
-            if let Some(next) = observer.next.clone() {
-                next(&user);
-            }
+    /// Registers an observer that is invoked whenever the signed-in user changes.
+    ///
+    /// Mirrors `onAuthStateChanged(auth, nextOrObserver)` in the JS SDK: the observer is
+    /// called immediately with the current state (`Some(user)` or `None`), then again whenever a
+    /// different user signs in or the user signs out. Token refreshes and profile updates for
+    /// the same user do not trigger it. The returned closure removes the observer.
+    ///
+    /// ```no_run
+    /// # use firebase_rs_sdk::auth::Auth;
+    /// # fn demo(auth: &Auth) {
+    /// let unsubscribe = auth.on_auth_state_changed(|user: &Option<std::sync::Arc<firebase_rs_sdk::auth::User>>| {
+    ///     match user {
+    ///         Some(user) => println!("signed in as {}", user.uid()),
+    ///         None => println!("signed out"),
+    ///     }
+    /// });
+    /// // later
+    /// unsubscribe();
+    /// # }
+    /// ```
+    pub fn on_auth_state_changed<O>(&self, observer: O) -> impl FnOnce() + Send + 'static
+    where
+        O: Into<PartialObserver<Option<Arc<User>>>>,
+    {
+        let observer = observer.into();
+        if let Some(next) = observer.next.clone() {
+            next(&self.current_user());
         }
 
-        self.listeners.add_observer(observer);
-        || {}
+        let id = self.listeners.add_observer(observer);
+        let listeners = self.listeners.clone();
+        move || listeners.remove_observer(id)
     }
 
     async fn execute_request<TRequest, TResponse>(
@@ -753,7 +780,7 @@ impl Auth {
         display_name: Option<&str>,
     ) -> AuthResult<ConfirmationResult> {
         let user = self.require_current_user()?;
-        let id_token = user.get_id_token(false)?;
+        let id_token = user.get_id_token(false).await?;
         let api_key = self.api_key()?;
         let endpoint = self.identity_toolkit_endpoint();
         let enrollment_info = self.build_phone_enrollment_info(phone_number, verifier)?;
@@ -1125,7 +1152,7 @@ impl Auth {
 
     pub(crate) async fn withdraw_multi_factor(&self, enrollment_id: &str) -> AuthResult<()> {
         let user = self.require_current_user()?;
-        let id_token = user.get_id_token(false)?;
+        let id_token = user.get_id_token(false).await?;
         let api_key = self.api_key()?;
         let endpoint = self.identity_toolkit_endpoint();
         let request = WithdrawMfaRequest {
@@ -1188,9 +1215,10 @@ impl Auth {
         let expiration = expires_in.map(|value| self.parse_expires_in(value)).transpose()?;
         user.update_tokens(Some(id_token.to_string()), Some(refresh_token.to_string()), expiration);
         let user_arc = Arc::new(user);
+        self.adopt_user(&user_arc);
         *self.current_user.lock().unwrap() = Some(user_arc.clone());
         self.after_token_update(user_arc.clone())?;
-        self.listeners.notify(user_arc.clone());
+        self.listeners.notify(Some(user_arc.clone()));
 
         Ok(UserCredential {
             user: user_arc,
@@ -1206,7 +1234,7 @@ impl Auth {
 
     pub(crate) async fn multi_factor_session(&self) -> AuthResult<MultiFactorSession> {
         let user = self.require_current_user()?;
-        let id_token = user.get_id_token(false)?;
+        let id_token = user.get_id_token(false).await?;
         Ok(MultiFactorSession::enrollment(id_token))
     }
 
@@ -1272,9 +1300,10 @@ impl Auth {
         }
 
         let new_user = Arc::new(new_user);
+        self.adopt_user(&new_user);
         *self.current_user.lock().unwrap() = Some(new_user.clone());
         self.after_token_update(new_user.clone())?;
-        self.listeners.notify(new_user.clone());
+        self.listeners.notify(Some(new_user.clone()));
         Ok(new_user)
     }
 
@@ -1473,6 +1502,19 @@ impl Auth {
         Ok(Duration::from_secs(seconds))
     }
 
+    /// Refreshes the ID token of `user` through the Secure Token API. Used by
+    /// [`User::get_id_token`].
+    pub(crate) async fn refresh_id_token_for_user(&self, user: &Arc<User>) -> AuthResult<String> {
+        self.refresh_user_token(user).await
+    }
+
+    /// Gives `user` a back-reference to this `Auth` so `User::get_id_token` can refresh.
+    fn adopt_user(&self, user: &Arc<User>) {
+        if let Some(auth) = self.self_ref.lock().unwrap().upgrade() {
+            user.attach_auth(&auth);
+        }
+    }
+
     async fn refresh_user_token(&self, user: &Arc<User>) -> AuthResult<String> {
         let refresh_token = user
             .refresh_token()
@@ -1489,7 +1531,7 @@ impl Auth {
             Some(expires_in),
         );
         self.after_token_update(user.clone())?;
-        self.listeners.notify(user.clone());
+        self.listeners.notify(Some(user.clone()));
         Ok(response.id_token)
     }
 
@@ -1637,7 +1679,7 @@ impl Auth {
     /// Sends an email verification message to the currently signed-in user.
     pub async fn send_email_verification(&self) -> AuthResult<()> {
         let user = self.require_current_user()?;
-        let id_token = user.get_id_token(false)?;
+        let id_token = user.get_id_token(false).await?;
         let api_key = self.api_key()?;
         let endpoint = self.identity_toolkit_endpoint();
         send_email_verification(&self.rest_client, &endpoint, &api_key, &id_token).await
@@ -1826,7 +1868,7 @@ impl Auth {
     /// Updates the current user's display name and photo URL.
     pub async fn update_profile(&self, display_name: Option<&str>, photo_url: Option<&str>) -> AuthResult<Arc<User>> {
         let user = self.require_current_user()?;
-        let id_token = user.get_id_token(false)?;
+        let id_token = user.get_id_token(false).await?;
         let mut request = UpdateAccountRequest::new(id_token);
         if let Some(value) = display_name {
             if value.is_empty() {
@@ -1849,7 +1891,7 @@ impl Auth {
     /// Updates the current user's email address.
     pub async fn update_email(&self, email: &str) -> AuthResult<Arc<User>> {
         let user = self.require_current_user()?;
-        let id_token = user.get_id_token(false)?;
+        let id_token = user.get_id_token(false).await?;
         let mut request = UpdateAccountRequest::new(id_token);
         request.email = Some(email.to_string());
         self.perform_account_update(user, request).await
@@ -1858,7 +1900,7 @@ impl Auth {
     /// Updates the current user's password.
     pub async fn update_password(&self, password: &str) -> AuthResult<Arc<User>> {
         let user = self.require_current_user()?;
-        let id_token = user.get_id_token(false)?;
+        let id_token = user.get_id_token(false).await?;
         let mut request = UpdateAccountRequest::new(id_token);
         request.password = Some(password.to_string());
         self.perform_account_update(user, request).await
@@ -1867,7 +1909,7 @@ impl Auth {
     /// Deletes the current user from Firebase Auth.
     pub async fn delete_user(&self) -> AuthResult<()> {
         let user = self.require_current_user()?;
-        let id_token = user.get_id_token(false)?;
+        let id_token = user.get_id_token(false).await?;
         let api_key = self.api_key()?;
         let endpoint = self.identity_toolkit_endpoint();
         delete_account(&self.rest_client, &endpoint, &api_key, &id_token).await?;
@@ -1878,7 +1920,7 @@ impl Auth {
     /// Unlinks the specified providers from the current user.
     pub async fn unlink_providers(&self, provider_ids: &[&str]) -> AuthResult<Arc<User>> {
         let user = self.require_current_user()?;
-        let id_token = user.get_id_token(false)?;
+        let id_token = user.get_id_token(false).await?;
         let mut request = UpdateAccountRequest::new(id_token);
         request.delete_providers = provider_ids.iter().map(|id| id.to_string()).collect();
         self.perform_account_update(user, request).await
@@ -1887,7 +1929,7 @@ impl Auth {
     /// Fetches the latest account info for the current user.
     pub async fn get_account_info(&self) -> AuthResult<GetAccountInfoResponse> {
         let user = self.require_current_user()?;
-        let id_token = user.get_id_token(false)?;
+        let id_token = user.get_id_token(false).await?;
         let api_key = self.api_key()?;
         let endpoint = self.identity_toolkit_endpoint();
         get_account_info(&self.rest_client, &endpoint, &api_key, &id_token).await
@@ -1896,7 +1938,7 @@ impl Auth {
     /// Links an OAuth credential with the currently signed-in user.
     pub async fn link_with_oauth_credential(&self, credential: AuthCredential) -> AuthResult<UserCredential> {
         let user = self.require_current_user()?;
-        let id_token = user.get_id_token(false)?;
+        let id_token = user.get_id_token(false).await?;
         self.exchange_oauth_credential(credential, MultiFactorOperation::Link, Some(id_token))
             .await
     }
@@ -1922,7 +1964,7 @@ impl Auth {
             .exchange_oauth_credential(
                 credential,
                 MultiFactorOperation::Reauthenticate,
-                Some(user.get_id_token(false)?),
+                Some(user.get_id_token(false).await?),
             )
             .await?;
         Ok(result.user)
@@ -1987,7 +2029,7 @@ impl Auth {
             .or_else(|| Some(oauth_credential.provider_id().to_string()))
             .unwrap_or_else(|| EmailAuthProvider::PROVIDER_ID.to_string());
 
-        self.listeners.notify(user_arc.clone());
+        self.listeners.notify(Some(user_arc.clone()));
 
         Ok(UserCredential {
             user: user_arc,
@@ -2009,7 +2051,7 @@ impl Auth {
         let endpoint = self.identity_toolkit_endpoint();
         let response = update_account(&self.rest_client, &endpoint, &api_key, &request).await?;
         let updated_user = self.apply_account_update(&current_user, &response)?;
-        self.listeners.notify(updated_user.clone());
+        self.listeners.notify(Some(updated_user.clone()));
         Ok(updated_user)
     }
 
@@ -2088,6 +2130,7 @@ impl Auth {
         user.update_tokens(Some(id_token), Some(refresh_token), Some(expires_in));
 
         let user_arc = Arc::new(user);
+        self.adopt_user(&user_arc);
         *self.current_user.lock().unwrap() = Some(user_arc.clone());
         self.after_token_update(user_arc.clone())?;
         Ok(user_arc)
@@ -2177,14 +2220,18 @@ impl Auth {
         match state.clone() {
             Some(ref persisted) if Self::has_refresh_token(persisted) => {
                 let user_arc = self.build_user_from_persisted_state(persisted);
+                self.adopt_user(&user_arc);
                 *self.current_user.lock().unwrap() = Some(user_arc.clone());
                 self.schedule_refresh_for_user(user_arc.clone());
                 if notify_listeners {
-                    self.listeners.notify(user_arc);
+                    self.listeners.notify(Some(user_arc));
                 }
             }
             _ => {
                 self.clear_local_user_state();
+                if notify_listeners {
+                    self.listeners.notify(None);
+                }
             }
         }
 
@@ -2286,6 +2333,7 @@ impl Auth {
         user.update_tokens(Some(id_token), Some(refresh_token), expires_in);
 
         let user_arc = Arc::new(user);
+        self.adopt_user(&user_arc);
         *self.current_user.lock().unwrap() = Some(user_arc.clone());
         self.after_token_update(user_arc.clone())?;
         Ok(user_arc)
@@ -2355,6 +2403,7 @@ impl Auth {
         user.update_tokens(Some(id_token), Some(refresh_token), expires_in);
 
         let user_arc = Arc::new(user);
+        self.adopt_user(&user_arc);
         *self.current_user.lock().unwrap() = Some(user_arc.clone());
         self.after_token_update(user_arc.clone())?;
         Ok(user_arc)
@@ -2488,6 +2537,9 @@ impl AuthBuilder {
             .persistence
             .unwrap_or_else(|| Arc::new(InMemoryPersistence::default()));
         let auth = Arc::new(Auth::new_with_persistence(self.app, persistence)?);
+        // Users hand out a weak back-reference for on-demand token refresh; record it even when
+        // initialization is deferred.
+        *auth.self_ref.lock().unwrap() = Arc::downgrade(&auth);
         if let Some(handler) = self.popup_handler {
             auth.set_popup_handler(handler);
         }
@@ -2673,6 +2725,149 @@ mod tests {
         assert_eq!(credential.user.uid(), "uid-123");
         assert_eq!(credential.user.token_manager().access_token(), Some("id-token".to_string()));
         assert_eq!(credential.user.refresh_token(), Some("refresh-token".to_string()));
+    }
+
+    /// Collects the uid (or `None`) of every auth-state notification.
+    fn recording_listener() -> (Arc<Mutex<Vec<Option<String>>>>, impl Fn(&Option<Arc<User>>) + Send + Sync) {
+        let events: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let listener = move |user: &Option<Arc<User>>| {
+            sink.lock().unwrap().push(user.as_ref().map(|u| u.uid().to_string()));
+        };
+        (events, listener)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_token_provider_delegates_to_auth_get_token() {
+        let server = start_mock_server();
+        let auth = build_auth(&server);
+        sign_in_user(&auth, &server).await;
+        let provider: &dyn AsyncTokenProvider = &auth;
+        let token = provider.get_token(false).await.expect("provider token");
+        assert_eq!(token.as_deref(), Some(TEST_ID_TOKEN));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auth_state_listener_observes_sign_in_and_sign_out() {
+        let server = start_mock_server();
+        let auth = build_auth(&server);
+        let (events, listener) = recording_listener();
+        let _unsubscribe = auth.on_auth_state_changed(listener);
+
+        // Initial emission reflects the signed-out state, like the JS SDK.
+        assert_eq!(*events.lock().unwrap(), vec![None]);
+
+        sign_in_user(&auth, &server).await;
+        assert_eq!(*events.lock().unwrap(), vec![None, Some(TEST_UID.to_string())]);
+
+        auth.sign_out();
+        assert_eq!(*events.lock().unwrap(), vec![None, Some(TEST_UID.to_string()), None]);
+
+        // Signing out twice must not fire again.
+        auth.sign_out();
+        assert_eq!(events.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auth_state_listener_ignores_token_refresh_for_same_user() {
+        let server = start_mock_server();
+        let auth = build_auth(&server);
+        sign_in_user(&auth, &server).await;
+
+        let (events, listener) = recording_listener();
+        let _unsubscribe = auth.on_auth_state_changed(listener);
+        assert_eq!(*events.lock().unwrap(), vec![Some(TEST_UID.to_string())]);
+
+        let refresh_mock = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200).json_body(json!({
+                "access_token": "refreshed-token",
+                "refresh_token": "refreshed-refresh",
+                "id_token": "refreshed-token",
+                "expires_in": "3600",
+                "user_id": TEST_UID
+            }));
+        });
+        let token = auth.get_token(true).await.expect("refresh").expect("token");
+        refresh_mock.assert();
+        assert_eq!(token, "refreshed-token");
+
+        // Same uid, so no auth-state notification.
+        assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auth_state_listener_unsubscribe_stops_notifications() {
+        let server = start_mock_server();
+        let auth = build_auth(&server);
+        let (events, listener) = recording_listener();
+        let unsubscribe = auth.on_auth_state_changed(listener);
+        assert!(!auth.listeners.is_empty());
+
+        unsubscribe();
+        assert!(auth.listeners.is_empty());
+
+        sign_in_user(&auth, &server).await;
+        auth.sign_out();
+        assert_eq!(*events.lock().unwrap(), vec![None], "only the initial emission is expected");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auth_state_listener_accepts_partial_observer() {
+        let server = start_mock_server();
+        let auth = build_auth(&server);
+        let (events, listener) = recording_listener();
+        let observer = PartialObserver::new().with_next(listener);
+        let _unsubscribe = auth.on_auth_state_changed(observer);
+        sign_in_user(&auth, &server).await;
+        assert_eq!(*events.lock().unwrap(), vec![None, Some(TEST_UID.to_string())]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_get_id_token_force_refresh_uses_secure_token_api() {
+        let server = start_mock_server();
+        let auth = build_auth(&server);
+        sign_in_user(&auth, &server).await;
+        let user = auth.current_user().expect("signed in");
+
+        // Cached token is returned without a network call when it is still valid.
+        assert_eq!(user.get_id_token(false).await.unwrap(), TEST_ID_TOKEN);
+
+        let refresh_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/token")
+                .body_contains("grant_type=refresh_token");
+            then.status(200).json_body(json!({
+                "access_token": "forced-token",
+                "refresh_token": "forced-refresh",
+                "id_token": "forced-token",
+                "expires_in": "3600",
+                "user_id": TEST_UID
+            }));
+        });
+        let token = user.get_id_token(true).await.expect("forced refresh");
+        refresh_mock.assert();
+        assert_eq!(token, "forced-token");
+        assert_eq!(user.cached_id_token().as_deref(), Some("forced-token"));
+        assert_eq!(user.refresh_token().as_deref(), Some("forced-refresh"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detached_user_cannot_force_refresh() {
+        let user = Arc::new(User::new(
+            test_firebase_app_with_api_key(TEST_API_KEY),
+            UserInfo {
+                uid: "loose".into(),
+                display_name: None,
+                email: None,
+                phone_number: None,
+                photo_url: None,
+                provider_id: "password".into(),
+            },
+        ));
+        user.update_tokens(Some("cached".into()), Some("refresh".into()), Some(Duration::from_secs(3600)));
+        assert_eq!(user.get_id_token(false).await.unwrap(), "cached");
+        assert!(matches!(user.get_id_token(true).await, Err(AuthError::InvalidCredential(_))));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -2,11 +2,12 @@ use crate::app::FirebaseApp;
 use crate::auth::error::{AuthError, AuthResult};
 use crate::auth::token_manager::{TokenManager, TokenUpdate};
 use crate::auth::types::MultiFactorInfo;
+use crate::auth::Auth;
 use crate::util::PartialObserver;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, SystemTime};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserInfo {
@@ -18,7 +19,7 @@ pub struct UserInfo {
     pub provider_id: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct User {
     app: FirebaseApp,
     info: UserInfo,
@@ -26,6 +27,22 @@ pub struct User {
     is_anonymous: bool,
     token_manager: TokenManager,
     mfa_factors: Arc<Mutex<Vec<MultiFactorInfo>>>,
+    /// Back-reference to the owning `Auth`, used to refresh tokens on demand (JS: `user.auth`).
+    auth: Mutex<Weak<Auth>>,
+}
+
+impl Clone for User {
+    fn clone(&self) -> Self {
+        Self {
+            app: self.app.clone(),
+            info: self.info.clone(),
+            email_verified: self.email_verified,
+            is_anonymous: self.is_anonymous,
+            token_manager: self.token_manager.clone(),
+            mfa_factors: Arc::clone(&self.mfa_factors),
+            auth: Mutex::new(self.auth.lock().unwrap().clone()),
+        }
+    }
 }
 
 impl User {
@@ -38,7 +55,14 @@ impl User {
             is_anonymous: false,
             token_manager: TokenManager::default(),
             mfa_factors: Arc::new(Mutex::new(Vec::new())),
+            auth: Mutex::new(Weak::new()),
         }
+    }
+
+    /// Binds this user to the `Auth` instance that manages it so that token refreshes can be
+    /// performed from the user object itself.
+    pub(crate) fn attach_auth(&self, auth: &Arc<Auth>) {
+        *self.auth.lock().unwrap() = Arc::downgrade(auth);
     }
 
     /// Returns the owning `FirebaseApp` for the user.
@@ -71,11 +95,39 @@ impl User {
         self.token_manager.refresh_token()
     }
 
-    /// Returns the cached ID token or an error if none is available.
-    pub fn get_id_token(&self, _force_refresh: bool) -> AuthResult<String> {
-        self.token_manager
-            .access_token()
-            .ok_or_else(|| AuthError::InvalidCredential("Missing ID token".into()))
+    /// Returns the cached ID token without contacting the backend, if one is present.
+    pub fn cached_id_token(&self) -> Option<String> {
+        self.token_manager.access_token()
+    }
+
+    /// Returns a valid ID token for this user, refreshing it through the Secure Token API when
+    /// `force_refresh` is set or the cached token has expired.
+    ///
+    /// Mirrors `user.getIdToken(forceRefresh)` in the JS SDK. The refresh goes through the
+    /// [`Auth`] instance that signed the user in; a user that is not attached to an `Auth`
+    /// (for example one constructed manually) can only return its cached token.
+    pub async fn get_id_token(self: &Arc<Self>, force_refresh: bool) -> AuthResult<String> {
+        let cached = self.token_manager.access_token();
+        let expired = self
+            .token_manager
+            .expiration_time()
+            .map(|expires_at| expires_at <= SystemTime::now())
+            .unwrap_or(false);
+
+        if !force_refresh && !expired {
+            if let Some(token) = cached {
+                return Ok(token);
+            }
+        }
+
+        let auth = self.auth.lock().unwrap().upgrade();
+        match auth {
+            Some(auth) => auth.refresh_id_token_for_user(self).await,
+            None if force_refresh || cached.is_none() => Err(AuthError::InvalidCredential(
+                "Cannot refresh the ID token: the user is not attached to an Auth instance".into(),
+            )),
+            None => Ok(cached.expect("checked above")),
+        }
     }
 
     /// Exposes the underlying token manager.
@@ -200,22 +252,81 @@ impl EmailAuthProvider {
 
 #[derive(Default)]
 pub struct AuthStateListeners {
-    observers: Mutex<Vec<PartialObserver<Arc<User>>>>,
+    inner: Arc<Mutex<AuthStateListenerState>>,
 }
 
+impl Clone for AuthStateListeners {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+#[derive(Default)]
+struct AuthStateListenerState {
+    next_id: u64,
+    observers: Vec<(u64, PartialObserver<Option<Arc<User>>>)>,
+    /// `None` until the first notification; then the uid (or `None` for signed-out) that
+    /// observers last received. Mirrors `lastNotifiedUid` in the JS `AuthImpl`.
+    last_notified_uid: Option<Option<String>>,
+}
+
+/// Registry of `onAuthStateChanged` observers.
+///
+/// Observers receive `Some(user)` on sign-in and `None` on sign-out. Like the JS SDK, a
+/// notification is only delivered when the signed-in user's uid actually changes; token
+/// refreshes and profile updates for the same user do not fire.
 impl AuthStateListeners {
-    /// Registers a new observer to receive auth state changes.
-    pub fn add_observer(&self, observer: PartialObserver<Arc<User>>) {
-        self.observers.lock().unwrap().push(observer);
+    /// Registers a new observer and returns the id needed to remove it again.
+    pub fn add_observer(&self, observer: PartialObserver<Option<Arc<User>>>) -> u64 {
+        let mut state = self.inner.lock().unwrap();
+        let id = state.next_id;
+        state.next_id += 1;
+        state.observers.push((id, observer));
+        id
     }
 
-    /// Notifies all observers with the provided user snapshot.
-    pub fn notify(&self, user: Arc<User>) {
-        for observer in self.observers.lock().unwrap().iter() {
-            if let Some(next) = observer.next.clone() {
-                next(&user);
+    /// Removes a previously registered observer. Unknown ids are ignored.
+    pub fn remove_observer(&self, id: u64) {
+        self.inner
+            .lock()
+            .unwrap()
+            .observers
+            .retain(|(observer_id, _)| *observer_id != id);
+    }
+
+    /// Number of registered observers.
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().observers.len()
+    }
+
+    /// Whether no observers are registered.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Notifies observers when the signed-in user changed. Returns `true` if observers were
+    /// invoked.
+    pub fn notify(&self, user: Option<Arc<User>>) -> bool {
+        let uid = user.as_ref().map(|user| user.uid().to_string());
+        let observers = {
+            let mut state = self.inner.lock().unwrap();
+            if state.last_notified_uid.as_ref() == Some(&uid) {
+                return false;
             }
+            state.last_notified_uid = Some(uid);
+            state
+                .observers
+                .iter()
+                .filter_map(|(_, observer)| observer.next.clone())
+                .collect::<Vec<_>>()
+        };
+        // Callbacks run without the lock held so they may unsubscribe or re-enter `Auth`.
+        for next in observers {
+            next(&user);
         }
+        true
     }
 }
 

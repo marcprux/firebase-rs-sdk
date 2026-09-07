@@ -92,4 +92,5 @@ This section tracks the JavaScript test surface in `packages/auth` and maps it t
 Keep this roadmap updated as suites are ported: mark completed migrations, link Rust test modules, and note any design deviations from the JavaScript originals.
 
 ## Implemented
+- `on_auth_state_changed` follows the JS contract: observers receive `Option<Arc<User>>`, are primed with the current state, fire only when the signed-in uid changes (sign-in, sign-out, delete, persistence sync), and the returned closure really unsubscribes. `User::get_id_token(force_refresh)` refreshes through the owning `Auth` (weak back-reference) when forced or expired; `User::cached_id_token()` exposes the cached value.
 - Backend errors are mapped to typed codes: `AuthError::Server(AuthServerError)` exposes an `AuthErrorCode` (`auth/wrong-password`, `auth/user-not-found`, `auth/too-many-requests`, ...) using the JS `SERVER_ERROR_MAP`, plus the raw server code, the ` : ` detail message and the HTTP status. Unmapped codes are normalised the JS way (`CONFIGURATION_NOT_FOUND` becomes `auth/configuration-not-found`). Transport failures stay `AuthError::Network`.

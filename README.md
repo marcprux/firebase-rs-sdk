@@ -48,7 +48,7 @@ percentages are estimates and deliberately stricter than the ones in each module
 | storage | 70% | real (`firebasestorage.googleapis.com/v0`) | yes | uploads, downloads, metadata, list, delete; no resumable pause/resume |
 | app | 70% | n/a | yes | app lifecycle, options, component container, heartbeat header |
 | data_connect | 65% | real (`firebasedataconnect.googleapis.com/v1`) | no | executeQuery / executeMutation, emulator, subscriptions |
-| auth | 60% | real (Identity Toolkit v1 + securetoken) | yes | broad REST coverage with typed `auth/...` error codes; listeners and OAuth flows incomplete |
+| auth | 65% | real (Identity Toolkit v1 + securetoken) | yes | broad REST coverage, typed `auth/...` error codes, `onAuthStateChanged` semantics; OAuth popup/redirect flows incomplete |
 | functions | 50% | real (`cloudfunctions.net` / custom domain) | yes | callable protocol with auth, App Check and FID headers; no streaming |
 | remote_config | 50% | real (`firebaseremoteconfig.googleapis.com/v1`) | yes | fetch, ETag-based activate, defaults with correct value sources, custom signals, typed getters |
 | app_check | 45% | real exchange endpoint, untested | no | custom provider and refresher only on native; reCAPTCHA is wasm-only |
@@ -79,9 +79,9 @@ percentages are estimates and deliberately stricter than the ones in each module
 | `reauthenticateWithCredential`, `linkWithCredential` (password, OAuth, phone) | implemented |
 | `signInWithPhoneNumber`, `linkWithPhoneNumber`, `reauthenticateWithPhoneNumber` | implemented (needs caller-supplied verifier) |
 | Multi-factor: phone, TOTP, passkey enrol / unenrol / resolver, `getMultiFactorResolver` | implemented |
-| `getIdToken` (via `Auth::get_token`), token refresh through `securetoken.googleapis.com` | implemented |
+| `getIdToken` (`User::get_id_token(force_refresh)` and `Auth::get_token`), token refresh through `securetoken.googleapis.com` | implemented; expired or forced tokens are refreshed from the user object |
 | `signInWithPopup`, `signInWithRedirect`, `linkWithPopup`, `getRedirectResult` | partial, delegates to a caller-supplied handler; no built-in flow |
-| `onAuthStateChanged` | partial, unsubscribe is a no-op and sign-out is not reported |
+| `onAuthStateChanged` | implemented; emits `Some(user)` / `None`, primes with the current state, fires only when the uid changes, unsubscribe removes the observer |
 | `setPersistence` | partial, constructor-time only |
 | Typed error codes (`auth/wrong-password`, `auth/user-not-found`, `auth/too-many-requests`, ...) | implemented; `AuthError::Server` carries an `AuthErrorCode` mapped with the JS `SERVER_ERROR_MAP`, unmapped codes are normalised like the JS SDK (`auth/configuration-not-found`) |
 | `getIdTokenResult`, `reload`, `updateCurrentUser`, `onIdTokenChanged`, `beforeAuthStateChanged` | missing |

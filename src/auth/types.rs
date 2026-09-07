@@ -1468,7 +1468,10 @@ impl FirebaseAuth {
     }
 
     /// Registers an observer that is notified whenever the auth state changes.
-    pub fn on_auth_state_changed(&self, observer: PartialObserver<Arc<User>>) -> impl FnOnce() + Send + 'static {
+    pub fn on_auth_state_changed<O>(&self, observer: O) -> impl FnOnce() + Send + 'static
+    where
+        O: Into<PartialObserver<Option<Arc<User>>>>,
+    {
         self.inner.on_auth_state_changed(observer)
     }
 }

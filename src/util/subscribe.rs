@@ -12,6 +12,17 @@ pub struct PartialObserver<T> {
     pub complete: Option<CompleteFn>,
 }
 
+/// Lets a plain closure be passed wherever an observer is expected, mirroring the JS SDK's
+/// `nextOrObserver` parameters.
+impl<T, F> From<F> for PartialObserver<T>
+where
+    F: Fn(&T) + Send + Sync + 'static,
+{
+    fn from(callback: F) -> Self {
+        PartialObserver::new().with_next(callback)
+    }
+}
+
 impl<T> PartialObserver<T> {
     pub fn new() -> Self {
         Self::default()
