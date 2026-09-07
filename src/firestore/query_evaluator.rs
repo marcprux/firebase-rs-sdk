@@ -3,7 +3,9 @@ use std::cmp::Ordering;
 use crate::firestore::api::snapshot::DocumentSnapshot;
 use crate::firestore::model::FieldPath;
 use crate::firestore::value::{FirestoreValue, MapValue, ValueKind};
-use crate::firestore::{Bound, FieldFilter, FilterOperator, LimitType, OrderBy, OrderDirection, QueryDefinition};
+use crate::firestore::{
+    Bound, CompositeOperator, FieldFilter, Filter, FilterOperator, LimitType, OrderBy, OrderDirection, QueryDefinition,
+};
 
 /// Applies the provided query definition to a set of candidate documents and returns
 /// the filtered, ordered, and bounded result set.
@@ -51,17 +53,28 @@ pub(crate) fn apply_query_to_documents(
     filtered
 }
 
-fn document_satisfies_filters(snapshot: &DocumentSnapshot, filters: &[FieldFilter]) -> bool {
-    filters
-        .iter()
-        .all(|filter| match get_field_value(snapshot, filter.field()) {
+fn document_satisfies_filters(snapshot: &DocumentSnapshot, filters: &[Filter]) -> bool {
+    filters.iter().all(|filter| document_satisfies(snapshot, filter))
+}
+
+fn document_satisfies(snapshot: &DocumentSnapshot, filter: &Filter) -> bool {
+    match filter {
+        Filter::Field(filter) => match get_field_value(snapshot, filter.field()) {
             Some(value) => evaluate_filter(filter, &value),
             None => match filter.operator() {
                 FilterOperator::NotEqual => evaluate_filter(filter, &FirestoreValue::null()),
-                FilterOperator::NotIn => false,
                 _ => false,
             },
-        })
+        },
+        Filter::Composite {
+            operator: CompositeOperator::And,
+            filters,
+        } => filters.iter().all(|f| document_satisfies(snapshot, f)),
+        Filter::Composite {
+            operator: CompositeOperator::Or,
+            filters,
+        } => filters.iter().any(|f| document_satisfies(snapshot, f)),
+    }
 }
 
 fn evaluate_filter(filter: &FieldFilter, value: &FirestoreValue) -> bool {
@@ -135,18 +148,84 @@ fn compare_snapshots(left: &DocumentSnapshot, right: &DocumentSnapshot, order_by
     Ordering::Equal
 }
 
-fn compare_values(left: &FirestoreValue, right: &FirestoreValue) -> Option<Ordering> {
-    match (left.kind(), right.kind()) {
-        (ValueKind::Null, ValueKind::Null) => Some(Ordering::Equal),
-        (ValueKind::Boolean(a), ValueKind::Boolean(b)) => Some(a.cmp(b)),
-        (ValueKind::Integer(a), ValueKind::Integer(b)) => Some(a.cmp(b)),
-        (ValueKind::Double(a), ValueKind::Double(b)) => a.partial_cmp(b),
-        (ValueKind::Integer(a), ValueKind::Double(b)) => (*a as f64).partial_cmp(b),
-        (ValueKind::Double(a), ValueKind::Integer(b)) => a.partial_cmp(&(*b as f64)),
-        (ValueKind::String(a), ValueKind::String(b)) => Some(a.cmp(b)),
-        (ValueKind::Reference(a), ValueKind::Reference(b)) => Some(a.cmp(b)),
-        _ => None,
+/// Position of a value kind in Firestore's cross-type ordering
+/// (null < boolean < number < timestamp < string < bytes < reference < geo point < array < map).
+fn type_order(kind: &ValueKind) -> u8 {
+    match kind {
+        ValueKind::Null => 0,
+        ValueKind::Boolean(_) => 1,
+        ValueKind::Integer(_) | ValueKind::Double(_) => 2,
+        ValueKind::Timestamp(_) => 3,
+        ValueKind::String(_) => 4,
+        ValueKind::Bytes(_) => 5,
+        ValueKind::Reference(_) => 6,
+        ValueKind::GeoPoint(_) => 7,
+        ValueKind::Array(_) => 8,
+        ValueKind::Map(_) => 9,
+        ValueKind::Sentinel(_) => 10,
     }
+}
+
+fn compare_numbers(a: f64, b: f64) -> Ordering {
+    // NaN sorts before every other number, and equal to itself, as on the backend.
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+    }
+}
+
+/// Total ordering over values following the backend's rules, so that local sorting and cursor
+/// evaluation agree with what a query would return.
+fn compare_values(left: &FirestoreValue, right: &FirestoreValue) -> Option<Ordering> {
+    let (l, r) = (left.kind(), right.kind());
+    let by_type = type_order(l).cmp(&type_order(r));
+    if by_type != Ordering::Equal {
+        return Some(by_type);
+    }
+    Some(match (l, r) {
+        (ValueKind::Null, ValueKind::Null) => Ordering::Equal,
+        (ValueKind::Boolean(a), ValueKind::Boolean(b)) => a.cmp(b),
+        (ValueKind::Integer(a), ValueKind::Integer(b)) => a.cmp(b),
+        (ValueKind::Double(a), ValueKind::Double(b)) => compare_numbers(*a, *b),
+        (ValueKind::Integer(a), ValueKind::Double(b)) => compare_numbers(*a as f64, *b),
+        (ValueKind::Double(a), ValueKind::Integer(b)) => compare_numbers(*a, *b as f64),
+        (ValueKind::Timestamp(a), ValueKind::Timestamp(b)) => (a.seconds, a.nanos).cmp(&(b.seconds, b.nanos)),
+        (ValueKind::String(a), ValueKind::String(b)) => a.cmp(b),
+        (ValueKind::Bytes(a), ValueKind::Bytes(b)) => a.as_slice().cmp(b.as_slice()),
+        (ValueKind::Reference(a), ValueKind::Reference(b)) => {
+            // References compare segment by segment, like resource paths.
+            a.split('/').cmp(b.split('/'))
+        }
+        (ValueKind::GeoPoint(a), ValueKind::GeoPoint(b)) => {
+            compare_numbers(a.latitude(), b.latitude()).then_with(|| compare_numbers(a.longitude(), b.longitude()))
+        }
+        (ValueKind::Array(a), ValueKind::Array(b)) => {
+            for (x, y) in a.values().iter().zip(b.values()) {
+                let ordering = compare_values(x, y).unwrap_or(Ordering::Equal);
+                if ordering != Ordering::Equal {
+                    return Some(ordering);
+                }
+            }
+            a.values().len().cmp(&b.values().len())
+        }
+        (ValueKind::Map(a), ValueKind::Map(b)) => {
+            // Maps compare by key, then value, in key order.
+            for ((ka, va), (kb, vb)) in a.fields().iter().zip(b.fields()) {
+                let by_key = ka.cmp(kb);
+                if by_key != Ordering::Equal {
+                    return Some(by_key);
+                }
+                let by_value = compare_values(va, vb).unwrap_or(Ordering::Equal);
+                if by_value != Ordering::Equal {
+                    return Some(by_value);
+                }
+            }
+            a.fields().len().cmp(&b.fields().len())
+        }
+        _ => Ordering::Equal,
+    })
 }
 
 fn array_contains(array: &crate::firestore::value::ArrayValue, needle: &FirestoreValue) -> bool {

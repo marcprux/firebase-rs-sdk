@@ -121,10 +121,16 @@ pub fn encode_set_data(
     data: BTreeMap<String, FirestoreValue>,
     options: &SetOptions,
 ) -> FirestoreResult<EncodedSetData> {
-    let (sanitized, transforms, sentinel_paths) = sanitize_for_write(data)?;
+    let (sanitized, transforms, sentinel_paths, deleted_paths) = sanitize_for_write(data)?;
+    if !deleted_paths.is_empty() && !options.is_merge() {
+        return Err(invalid_argument(
+            "deleteField() can only be used with update() and set() with {merge:true}",
+        ));
+    }
 
     let mut available_paths = collect_update_paths(&sanitized)?;
     available_paths.extend(sentinel_paths.iter().cloned());
+    available_paths.extend(deleted_paths.iter().cloned());
 
     let mut available_set = HashSet::new();
     let mut deduped_paths = Vec::new();
@@ -151,11 +157,14 @@ pub fn encode_set_data(
 }
 
 pub fn encode_update_document_data(data: BTreeMap<String, FirestoreValue>) -> FirestoreResult<EncodedUpdateData> {
-    let (sanitized, transforms, _sentinel_paths) = sanitize_for_write(data)?;
-    if sanitized.is_empty() && transforms.is_empty() {
+    let (sanitized, transforms, _sentinel_paths, deleted_paths) = sanitize_for_write(data)?;
+    if sanitized.is_empty() && transforms.is_empty() && deleted_paths.is_empty() {
         return Err(invalid_argument("update_doc requires at least one field/value pair"));
     }
-    let field_paths = collect_update_paths(&sanitized)?;
+    // Deleted fields appear in the update mask without a value, which is how the backend
+    // removes them.
+    let mut field_paths = collect_update_paths(&sanitized)?;
+    field_paths.extend(deleted_paths);
     let map = MapValue::new(sanitized);
     Ok(EncodedUpdateData {
         map,
@@ -170,13 +179,21 @@ pub fn validate_document_path(path: &str) -> FirestoreResult<DocumentKey> {
     Ok(key)
 }
 
-fn sanitize_for_write(
-    data: BTreeMap<String, FirestoreValue>,
-) -> FirestoreResult<(BTreeMap<String, FirestoreValue>, Vec<FieldTransform>, Vec<FieldPath>)> {
+type SanitizedWrite = (
+    BTreeMap<String, FirestoreValue>,
+    Vec<FieldTransform>,
+    Vec<FieldPath>,
+    Vec<FieldPath>,
+);
+
+/// Splits user data into plain fields, field transforms, the paths of those transforms, and the
+/// paths marked with `delete_field()`.
+fn sanitize_for_write(data: BTreeMap<String, FirestoreValue>) -> FirestoreResult<SanitizedWrite> {
     let mut transforms = Vec::new();
     let mut sentinel_paths = Vec::new();
-    let sanitized = sanitize_map(&data, &[], &mut transforms, &mut sentinel_paths)?;
-    Ok((sanitized, transforms, sentinel_paths))
+    let mut deleted_paths = Vec::new();
+    let sanitized = sanitize_map(&data, &[], &mut transforms, &mut sentinel_paths, &mut deleted_paths)?;
+    Ok((sanitized, transforms, sentinel_paths, deleted_paths))
 }
 
 fn sanitize_map(
@@ -184,6 +201,7 @@ fn sanitize_map(
     parent_segments: &[String],
     transforms: &mut Vec<FieldTransform>,
     sentinel_paths: &mut Vec<FieldPath>,
+    deleted_paths: &mut Vec<FieldPath>,
 ) -> FirestoreResult<BTreeMap<String, FirestoreValue>> {
     let mut cleaned = BTreeMap::new();
     for (key, value) in data {
@@ -191,13 +209,16 @@ fn sanitize_map(
         segments.push(key.clone());
         let field_path = FieldPath::new(segments.clone())?;
         match value.kind().clone() {
+            ValueKind::Sentinel(SentinelValue::DeleteField) => {
+                deleted_paths.push(field_path);
+            }
             ValueKind::Sentinel(sentinel) => {
                 validate_sentinel_usage(&sentinel, &field_path)?;
                 transforms.push(transform_from_sentinel(field_path.clone(), sentinel)?);
                 sentinel_paths.push(field_path);
             }
             ValueKind::Map(map) => {
-                let nested = sanitize_map(map.fields(), &segments, transforms, sentinel_paths)?;
+                let nested = sanitize_map(map.fields(), &segments, transforms, sentinel_paths, deleted_paths)?;
                 if !nested.is_empty() {
                     cleaned.insert(key.clone(), FirestoreValue::from_map(nested));
                 }
@@ -227,6 +248,7 @@ fn validate_sentinel_usage(sentinel: &SentinelValue, field_path: &FieldPath) -> 
             ValueKind::Integer(_) | ValueKind::Double(_) => Ok(()),
             _ => Err(invalid_argument("FieldValue.increment() requires a numeric operand")),
         },
+        SentinelValue::DeleteField => Ok(()),
     }
 }
 
@@ -236,6 +258,12 @@ fn transform_from_sentinel(field_path: FieldPath, sentinel: SentinelValue) -> Fi
         SentinelValue::ArrayUnion(elements) => TransformOperation::ArrayUnion(elements),
         SentinelValue::ArrayRemove(elements) => TransformOperation::ArrayRemove(elements),
         SentinelValue::NumericIncrement(operand) => TransformOperation::NumericIncrement(*operand),
+        SentinelValue::DeleteField => {
+            return Err(invalid_argument(format!(
+                "deleteField() is not a transform (field '{}')",
+                field_path.canonical_string()
+            )))
+        }
     };
     Ok(FieldTransform::new(field_path, operation))
 }
@@ -409,5 +437,88 @@ mod tests {
         );
         let err = encode_update_document_data(data).unwrap_err();
         assert_eq!(err.code_str(), "firestore/invalid-argument");
+    }
+}
+
+/// Removes the value at `path`, if present. Empty parent maps are left in place, matching the
+/// backend, which keeps an empty map after its last key is deleted.
+pub(crate) fn remove_value_at_field_path(fields: &mut BTreeMap<String, FirestoreValue>, path: &FieldPath) {
+    remove_segments(fields, path.segments());
+}
+
+fn remove_segments(fields: &mut BTreeMap<String, FirestoreValue>, segments: &[String]) {
+    match segments {
+        [] => {}
+        [last] => {
+            fields.remove(last);
+        }
+        [head, rest @ ..] => {
+            if let Some(child) = fields.get_mut(head) {
+                if let ValueKind::Map(map) = child.kind() {
+                    let mut nested = map.fields().clone();
+                    remove_segments(&mut nested, rest);
+                    *child = FirestoreValue::from_map(nested);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod delete_field_tests {
+    use super::*;
+
+    fn nested(a_b: FirestoreValue) -> BTreeMap<String, FirestoreValue> {
+        let mut inner = BTreeMap::new();
+        inner.insert("b".to_string(), a_b);
+        let mut data = BTreeMap::new();
+        data.insert("a".to_string(), FirestoreValue::from_map(inner));
+        data.insert("keep".to_string(), FirestoreValue::from_integer(1));
+        data
+    }
+
+    #[test]
+    fn update_puts_deleted_paths_in_the_mask_without_values() {
+        let encoded = encode_update_document_data(nested(FirestoreValue::delete_field())).unwrap();
+        let paths: Vec<String> = encoded.field_paths.iter().map(FieldPath::canonical_string).collect();
+        assert_eq!(paths, vec!["keep", "a.b"]);
+        assert!(
+            !encoded.map.fields().contains_key("a"),
+            "deleted field must not be sent as a value"
+        );
+        assert!(encoded.transforms.is_empty());
+    }
+
+    #[test]
+    fn delete_field_alone_is_a_valid_update() {
+        let mut data = BTreeMap::new();
+        data.insert("gone".to_string(), FirestoreValue::delete_field());
+        let encoded = encode_update_document_data(data).unwrap();
+        assert_eq!(encoded.field_paths.len(), 1);
+        assert!(encoded.map.fields().is_empty());
+    }
+
+    #[test]
+    fn delete_field_requires_merge_for_set() {
+        let mut data = BTreeMap::new();
+        data.insert("gone".to_string(), FirestoreValue::delete_field());
+        let err = encode_set_data(data.clone(), &SetOptions::default()).unwrap_err();
+        assert!(err.to_string().contains("deleteField()"));
+        let merged = encode_set_data(data, &SetOptions::merge_all()).unwrap();
+        let mask: Vec<String> = merged.mask.unwrap().iter().map(FieldPath::canonical_string).collect();
+        assert_eq!(mask, vec!["gone"]);
+    }
+
+    #[test]
+    fn remove_value_at_field_path_handles_nesting() {
+        let mut fields = nested(FirestoreValue::from_integer(7));
+        remove_value_at_field_path(&mut fields, &FieldPath::from_dot_separated("a.b").unwrap());
+        match fields["a"].kind() {
+            ValueKind::Map(map) => assert!(map.fields().is_empty()),
+            other => panic!("unexpected {other:?}"),
+        }
+        remove_value_at_field_path(&mut fields, &FieldPath::from_dot_separated("missing.x").unwrap());
+        remove_value_at_field_path(&mut fields, &FieldPath::from_dot_separated("keep").unwrap());
+        assert!(!fields.contains_key("keep"));
     }
 }

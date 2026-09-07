@@ -93,6 +93,14 @@ fn extract_message(body: &str) -> Option<String> {
 }
 
 fn extract_error_payload(body: &str) -> Option<GoogleError> {
+    // Streaming RPCs (`runQuery`, `batchGet`, `runAggregationQuery`) wrap their error in a
+    // one-element JSON array; unary RPCs return the bare object. Check the shape first: serde
+    // would otherwise happily read a struct out of an array positionally.
+    if body.trim_start().starts_with('[') {
+        return serde_json::from_str::<Vec<GoogleErrorBody>>(body)
+            .ok()
+            .and_then(|entries| entries.into_iter().find_map(|entry| entry.error));
+    }
     serde_json::from_str::<GoogleErrorBody>(body)
         .ok()
         .and_then(|parsed| parsed.error)
@@ -127,6 +135,15 @@ mod tests {
             map_http_error(StatusCode::BAD_REQUEST, body).code,
             FirestoreErrorCode::InvalidArgument
         );
+    }
+
+    #[test]
+    fn streaming_rpc_errors_arrive_wrapped_in_an_array() {
+        let body = r#"[{"error":{"code":400,"message":"The query requires an index. You can create it here: https://console.firebase.google.com/x","status":"FAILED_PRECONDITION"}}]"#;
+        let err = map_http_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(err.code, FirestoreErrorCode::FailedPrecondition);
+        assert!(err.to_string().contains("requires an index"));
+        assert!(err.to_string().contains("console.firebase.google.com"));
     }
 
     #[test]

@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 
-use crate::firestore::error::{
-    already_exists, failed_precondition, internal_error, invalid_argument, not_found, FirestoreResult,
-};
+use crate::firestore::error::{already_exists, failed_precondition, invalid_argument, not_found, FirestoreResult};
 use crate::firestore::model::{DocumentKey, FieldPath, Timestamp};
 use crate::firestore::query_evaluator::apply_query_to_documents;
 use crate::firestore::value::{FirestoreValue, MapValue, ValueKind};
 use crate::firestore::QueryDefinition;
-use crate::firestore::{set_value_at_field_path, value_for_field_path, FieldTransform, TransformOperation};
+use crate::firestore::{
+    remove_value_at_field_path, set_value_at_field_path, value_for_field_path, FieldTransform, TransformOperation,
+};
 use crate::firestore::{AggregateDefinition, AggregateOperation};
 use crate::firestore::{DocumentSnapshot, SnapshotMetadata};
 
@@ -98,8 +98,10 @@ impl InMemoryDatastore {
                     .map(|existing| existing.fields().clone())
                     .unwrap_or_default();
                 for field in mask {
-                    if let Some(value) = value_for_field_path(&data, &field) {
-                        set_value_at_field_path(&mut fields, &field, value);
+                    match value_for_field_path(&data, &field) {
+                        Some(value) => set_value_at_field_path(&mut fields, &field, value),
+                        // A masked path without a value is a `delete_field()`.
+                        None => remove_value_at_field_path(&mut fields, &field),
                     }
                 }
                 fields
@@ -131,10 +133,11 @@ impl InMemoryDatastore {
 
         let mut fields = current.fields().clone();
         for path in &field_paths {
-            let value = value_for_field_path(&data, path).ok_or_else(|| {
-                internal_error(format!("Failed to resolve value for update path {}", path.canonical_string()))
-            })?;
-            set_value_at_field_path(&mut fields, path, value);
+            match value_for_field_path(&data, path) {
+                Some(value) => set_value_at_field_path(&mut fields, path, value),
+                // A masked path without a value is a `delete_field()`.
+                None => remove_value_at_field_path(&mut fields, path),
+            }
         }
 
         apply_field_transforms(&mut fields, &transforms)?;

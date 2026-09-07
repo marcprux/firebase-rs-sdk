@@ -1,7 +1,7 @@
 use serde_json::{json, Value as JsonValue};
 
 use crate::firestore::api::aggregate::{AggregateDefinition, AggregateOperation};
-use crate::firestore::api::query::{Bound, FieldFilter, QueryDefinition};
+use crate::firestore::api::query::{Bound, FieldFilter, Filter, QueryDefinition};
 use crate::firestore::error::FirestoreResult;
 use crate::firestore::remote::serializer::JsonProtoSerializer;
 
@@ -97,15 +97,12 @@ pub(crate) fn encode_aggregation_body(
     }))
 }
 
-fn encode_filters(serializer: &JsonProtoSerializer, filters: &[FieldFilter]) -> JsonValue {
+fn encode_filters(serializer: &JsonProtoSerializer, filters: &[Filter]) -> JsonValue {
     if filters.len() == 1 {
-        return encode_field_filter(serializer, &filters[0]);
+        return encode_filter(serializer, &filters[0]);
     }
 
-    let nested: Vec<_> = filters
-        .iter()
-        .map(|filter| encode_field_filter(serializer, filter))
-        .collect();
+    let nested: Vec<_> = filters.iter().map(|filter| encode_filter(serializer, filter)).collect();
 
     json!({
         "compositeFilter": {
@@ -113,6 +110,23 @@ fn encode_filters(serializer: &JsonProtoSerializer, filters: &[FieldFilter]) -> 
             "filters": nested
         }
     })
+}
+
+fn encode_filter(serializer: &JsonProtoSerializer, filter: &Filter) -> JsonValue {
+    match filter {
+        Filter::Field(field) => encode_field_filter(serializer, field),
+        Filter::Composite { operator, filters } => {
+            if filters.len() == 1 {
+                return encode_filter(serializer, &filters[0]);
+            }
+            json!({
+                "compositeFilter": {
+                    "op": operator.as_str(),
+                    "filters": filters.iter().map(|f| encode_filter(serializer, f)).collect::<Vec<_>>()
+                }
+            })
+        }
+    }
 }
 
 fn encode_field_filter(serializer: &JsonProtoSerializer, filter: &FieldFilter) -> JsonValue {

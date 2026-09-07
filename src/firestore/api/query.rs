@@ -87,8 +87,9 @@ pub enum LimitType {
     Last,
 }
 
+/// A single `field <op> value` condition.
 #[derive(Clone, Debug)]
-pub(crate) struct FieldFilter {
+pub struct FieldFilter {
     field: FieldPath,
     operator: FilterOperator,
     value: FirestoreValue,
@@ -99,16 +100,77 @@ impl FieldFilter {
         Self { field, operator, value }
     }
 
-    pub(crate) fn field(&self) -> &FieldPath {
+    pub fn field(&self) -> &FieldPath {
         &self.field
     }
 
-    pub(crate) fn operator(&self) -> FilterOperator {
+    pub fn operator(&self) -> FilterOperator {
         self.operator
     }
 
-    pub(crate) fn value(&self) -> &FirestoreValue {
+    pub fn value(&self) -> &FirestoreValue {
         &self.value
+    }
+}
+
+/// How the children of a composite filter combine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompositeOperator {
+    And,
+    Or,
+}
+
+impl CompositeOperator {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            CompositeOperator::And => "AND",
+            CompositeOperator::Or => "OR",
+        }
+    }
+}
+
+/// A query filter: either a field condition or an `and` / `or` combination of filters.
+///
+/// Build leaves with [`where_filter`] and combine them with [`and`] / [`or`], mirroring the
+/// `where()`, `and()` and `or()` helpers of the JS SDK; attach the result with
+/// [`Query::where_filter`].
+#[derive(Clone, Debug)]
+pub enum Filter {
+    Field(FieldFilter),
+    Composite {
+        operator: CompositeOperator,
+        filters: Vec<Filter>,
+    },
+}
+
+impl Filter {
+    /// Every field condition in this filter tree, depth first.
+    pub fn leaves(&self) -> Vec<&FieldFilter> {
+        match self {
+            Filter::Field(filter) => vec![filter],
+            Filter::Composite { filters, .. } => filters.iter().flat_map(Filter::leaves).collect(),
+        }
+    }
+}
+
+/// Creates a field condition. Mirrors `where(field, op, value)` in the JS SDK.
+pub fn where_filter(field: impl Into<FieldPath>, operator: FilterOperator, value: FirestoreValue) -> Filter {
+    Filter::Field(FieldFilter::new(field.into(), operator, value))
+}
+
+/// Combines filters so that all of them must match. Mirrors `and(...)` in the JS SDK.
+pub fn and(filters: Vec<Filter>) -> Filter {
+    Filter::Composite {
+        operator: CompositeOperator::And,
+        filters,
+    }
+}
+
+/// Combines filters so that at least one must match. Mirrors `or(...)` in the JS SDK.
+pub fn or(filters: Vec<Filter>) -> Filter {
+    Filter::Composite {
+        operator: CompositeOperator::Or,
+        filters,
     }
 }
 
@@ -168,7 +230,7 @@ pub struct Query {
     firestore: Firestore,
     collection_path: ResourcePath,
     collection_group: Option<String>,
-    filters: Vec<FieldFilter>,
+    filters: Vec<Filter>,
     explicit_order_by: Vec<OrderBy>,
     limit: Option<u32>,
     limit_type: LimitType,
@@ -246,8 +308,99 @@ impl Query {
         let field_path = field.into();
         self.validate_filter(&field_path, operator, &value)?;
         let mut next = self.clone();
-        next.filters.push(FieldFilter::new(field_path, operator, value));
+        next.filters
+            .push(Filter::Field(FieldFilter::new(field_path, operator, value)));
         Ok(next)
+    }
+
+    /// Adds a filter tree built with [`where_filter`], [`and`] and [`or`]. Mirrors
+    /// `query(q, or(where(...), where(...)))` in the JS SDK; every leaf is validated the way a
+    /// plain `where` is, except that the single-inequality-field rule is not applied across
+    /// branches (the backend enforces its own index requirements for those).
+    ///
+    /// ```no_run
+    /// # use firebase_rs_sdk::firestore::*;
+    /// # fn demo(query: Query) -> FirestoreResult<Query> {
+    /// query.where_filter(or(vec![
+    ///     where_filter(FieldPath::from_dot_separated("city")?, FilterOperator::Equal, FirestoreValue::from_string("Lima")),
+    ///     where_filter(FieldPath::from_dot_separated("city")?, FilterOperator::Equal, FirestoreValue::from_string("Quito")),
+    /// ]))
+    /// # }
+    /// ```
+    pub fn where_filter(&self, filter: Filter) -> FirestoreResult<Self> {
+        if let Filter::Composite { filters, .. } = &filter {
+            if filters.is_empty() {
+                return Err(invalid_argument(
+                    "Invalid query. A composite filter must contain at least one filter.",
+                ));
+            }
+        }
+        for leaf in filter.leaves() {
+            self.validate_leaf(leaf.field(), leaf.operator(), leaf.value())?;
+        }
+        let mut next = self.clone();
+        next.filters.push(filter);
+        Ok(next)
+    }
+
+    /// Starts the result set at the document `snapshot` (inclusive), using the query's `order_by`
+    /// fields as the cursor. Mirrors `startAt(snapshot)`.
+    pub fn start_at_snapshot(&self, snapshot: &DocumentSnapshot) -> FirestoreResult<Self> {
+        let values = self.cursor_values_from_snapshot(snapshot)?;
+        self.apply_start_bound(values, true)
+    }
+
+    /// Starts the result set after the document `snapshot`. Mirrors `startAfter(snapshot)`, the
+    /// idiomatic way to fetch the next page.
+    pub fn start_after_snapshot(&self, snapshot: &DocumentSnapshot) -> FirestoreResult<Self> {
+        let values = self.cursor_values_from_snapshot(snapshot)?;
+        self.apply_start_bound(values, false)
+    }
+
+    /// Ends the result set at the document `snapshot` (inclusive). Mirrors `endAt(snapshot)`.
+    pub fn end_at_snapshot(&self, snapshot: &DocumentSnapshot) -> FirestoreResult<Self> {
+        let values = self.cursor_values_from_snapshot(snapshot)?;
+        self.apply_end_bound(values, true)
+    }
+
+    /// Ends the result set before the document `snapshot`. Mirrors `endBefore(snapshot)`.
+    pub fn end_before_snapshot(&self, snapshot: &DocumentSnapshot) -> FirestoreResult<Self> {
+        let values = self.cursor_values_from_snapshot(snapshot)?;
+        self.apply_end_bound(values, false)
+    }
+
+    /// One cursor value per `order_by` field (including the implicit `__name__`), taken from
+    /// `snapshot`. Mirrors `newQueryBoundFromDocument` in the JS SDK.
+    fn cursor_values_from_snapshot(&self, snapshot: &DocumentSnapshot) -> FirestoreResult<Vec<FirestoreValue>> {
+        if !snapshot.exists() {
+            return Err(invalid_argument(
+                "Can't use a DocumentSnapshot that doesn't exist for a query cursor.",
+            ));
+        }
+        let mut values = Vec::new();
+        for order in self.normalized_order_by() {
+            if order.is_document_id() {
+                let database = self.firestore.database_id();
+                values.push(FirestoreValue::from_reference(format!(
+                    "projects/{}/databases/{}/documents/{}",
+                    database.project_id(),
+                    database.database(),
+                    snapshot.key().path().canonical_string()
+                )));
+            } else {
+                match snapshot.get(order.field().clone())? {
+                    Some(value) => values.push(value.clone()),
+                    None => {
+                        return Err(invalid_argument(format!(
+                            "Invalid query. You are trying to start or end a query using a document for which the \
+                             field '{}' (used as the orderBy) does not exist.",
+                            order.field().canonical_string()
+                        )))
+                    }
+                }
+            }
+        }
+        Ok(values)
     }
 
     pub fn order_by(&self, field: impl Into<FieldPath>, direction: OrderDirection) -> FirestoreResult<Self> {
@@ -384,10 +537,34 @@ impl Query {
         Ok(next)
     }
 
+    /// The order the backend actually applies (JS: `queryNormalizedOrderBy`): the explicit
+    /// `order_by` clauses, then every field used in an inequality filter that is not already
+    /// ordered (the backend requires those to precede the key), then `__name__`, all extra
+    /// entries taking the direction of the last explicit clause.
     fn normalized_order_by(&self) -> Vec<OrderBy> {
         let mut order = self.explicit_order_by.clone();
+        let mut present: Vec<String> = order.iter().map(|o| o.field().canonical_string()).collect();
+        let last_direction = order.last().map(|o| o.direction()).unwrap_or(OrderDirection::Ascending);
+
+        let mut inequality_fields: Vec<FieldPath> = self
+            .filters
+            .iter()
+            .flat_map(Filter::leaves)
+            .filter(|leaf| is_inequality(leaf.operator()))
+            .map(|leaf| leaf.field().clone())
+            .collect();
+        inequality_fields.sort_by_key(FieldPath::canonical_string);
+        inequality_fields.dedup();
+        for field in inequality_fields {
+            let canonical = field.canonical_string();
+            if field != FieldPath::document_id() && !present.contains(&canonical) {
+                order.push(OrderBy::new(field, last_direction));
+                present.push(canonical);
+            }
+        }
+
         if !order.iter().any(|existing| existing.is_document_id()) {
-            order.push(OrderBy::new(FieldPath::document_id(), OrderDirection::Ascending));
+            order.push(OrderBy::new(FieldPath::document_id(), last_direction));
         }
         order
     }
@@ -402,6 +579,33 @@ impl Query {
         operator: FilterOperator,
         value: &FirestoreValue,
     ) -> FirestoreResult<()> {
+        self.validate_leaf(field, operator, value)?;
+
+        // Prevent mixing inequality operators on different fields.
+        if is_inequality(operator) {
+            if let Some(existing) = self.inequality_field() {
+                if existing != field.canonical_string() {
+                    return Err(invalid_argument(
+                        "Invalid query. All inequality filters must be on the same field.",
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_leaf(
+        &self,
+        field: &FieldPath,
+        operator: FilterOperator,
+        value: &FirestoreValue,
+    ) -> FirestoreResult<()> {
+        if matches!(value.kind(), ValueKind::Sentinel(_)) {
+            return Err(invalid_argument(
+                "Invalid query. Sentinel values such as serverTimestamp() cannot be used in filters.",
+            ));
+        }
         if field == &FieldPath::document_id() {
             match operator {
                 FilterOperator::ArrayContains | FilterOperator::ArrayContainsAny => {
@@ -428,27 +632,13 @@ impl Query {
             _ => {}
         }
 
-        // Prevent mixing inequality operators on different fields.
-        if is_inequality(operator) {
-            if let Some(existing) = self.inequality_field() {
-                if existing != field.canonical_string() {
-                    return Err(invalid_argument(
-                        "Invalid query. All inequality filters must be on the same field.",
-                    ));
-                }
-            }
-        }
-
         Ok(())
     }
 
     fn inequality_field(&self) -> Option<String> {
-        self.filters.iter().find_map(|filter| {
-            if is_inequality(filter.operator()) {
-                Some(filter.field().canonical_string())
-            } else {
-                None
-            }
+        self.filters.iter().find_map(|filter| match filter {
+            Filter::Field(filter) if is_inequality(filter.operator()) => Some(filter.field().canonical_string()),
+            _ => None,
         })
     }
 }
@@ -745,7 +935,7 @@ pub struct QueryDefinition {
     pub(crate) parent_path: ResourcePath,
     pub(crate) collection_id: String,
     pub(crate) collection_group: Option<String>,
-    pub(crate) filters: Vec<FieldFilter>,
+    pub(crate) filters: Vec<Filter>,
     pub(crate) request_order_by: Vec<OrderBy>,
     pub(crate) result_order_by: Vec<OrderBy>,
     pub(crate) limit: Option<u32>,
@@ -781,7 +971,7 @@ impl QueryDefinition {
         self.collection_group.as_deref()
     }
 
-    pub(crate) fn filters(&self) -> &[FieldFilter] {
+    pub(crate) fn filters(&self) -> &[Filter] {
         &self.filters
     }
 
@@ -856,6 +1046,32 @@ where
     pub fn order_by(&self, field: impl Into<FieldPath>, direction: OrderDirection) -> FirestoreResult<Self> {
         let query = self.inner.order_by(field, direction)?;
         Ok(Self::new(query, Arc::clone(&self.converter)))
+    }
+
+    pub fn where_filter(&self, filter: Filter) -> FirestoreResult<Self> {
+        Ok(Self::new(self.inner.where_filter(filter)?, Arc::clone(&self.converter)))
+    }
+
+    pub fn start_at_snapshot(&self, snapshot: &DocumentSnapshot) -> FirestoreResult<Self> {
+        Ok(Self::new(self.inner.start_at_snapshot(snapshot)?, Arc::clone(&self.converter)))
+    }
+
+    pub fn start_after_snapshot(&self, snapshot: &DocumentSnapshot) -> FirestoreResult<Self> {
+        Ok(Self::new(
+            self.inner.start_after_snapshot(snapshot)?,
+            Arc::clone(&self.converter),
+        ))
+    }
+
+    pub fn end_at_snapshot(&self, snapshot: &DocumentSnapshot) -> FirestoreResult<Self> {
+        Ok(Self::new(self.inner.end_at_snapshot(snapshot)?, Arc::clone(&self.converter)))
+    }
+
+    pub fn end_before_snapshot(&self, snapshot: &DocumentSnapshot) -> FirestoreResult<Self> {
+        Ok(Self::new(
+            self.inner.end_before_snapshot(snapshot)?,
+            Arc::clone(&self.converter),
+        ))
     }
 
     pub fn limit(&self, value: u32) -> FirestoreResult<Self> {
@@ -1246,5 +1462,169 @@ where
 
     pub fn new_index(&self) -> i32 {
         self.new_index
+    }
+}
+
+#[cfg(test)]
+mod filter_and_cursor_tests {
+    use super::*;
+    use crate::app::{FirebaseApp, FirebaseAppConfig, FirebaseOptions};
+    use crate::component::ComponentContainer;
+    use crate::firestore::api::snapshot::SnapshotMetadata;
+    use crate::firestore::model::{DatabaseId, DocumentKey};
+    use crate::firestore::remote::serializer::JsonProtoSerializer;
+    use crate::firestore::remote::structured_query::encode_structured_query;
+    use crate::firestore::value::MapValue;
+    use crate::firestore::FirestoreErrorCode;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn firestore() -> Firestore {
+        let options = FirebaseOptions {
+            project_id: Some("demo".into()),
+            ..Default::default()
+        };
+        let app = FirebaseApp::new(
+            options,
+            FirebaseAppConfig::new("filter-tests", false),
+            ComponentContainer::new("filter-tests"),
+        );
+        Firestore::new(app, DatabaseId::new("demo", "(default)"))
+    }
+
+    fn path(name: &str) -> FieldPath {
+        FieldPath::from_dot_separated(name).unwrap()
+    }
+
+    fn encode(query: &Query) -> serde_json::Value {
+        let serializer = JsonProtoSerializer::new(DatabaseId::new("demo", "(default)"));
+        encode_structured_query(&serializer, &query.definition()).unwrap()
+    }
+
+    #[test]
+    fn or_and_nested_filters_encode_as_composite_filters() {
+        let query = firestore()
+            .collection("cities")
+            .unwrap()
+            .query()
+            .where_filter(and(vec![
+                where_filter(path("country"), FilterOperator::Equal, FirestoreValue::from_string("PE")),
+                or(vec![
+                    where_filter(path("city"), FilterOperator::Equal, FirestoreValue::from_string("Lima")),
+                    where_filter(
+                        path("population"),
+                        FilterOperator::GreaterThan,
+                        FirestoreValue::from_integer(1_000_000),
+                    ),
+                ]),
+            ]))
+            .unwrap();
+        let encoded = encode(&query);
+        let composite = &encoded["where"]["compositeFilter"];
+        assert_eq!(composite["op"], "AND");
+        assert_eq!(composite["filters"][0]["fieldFilter"]["field"]["fieldPath"], "country");
+        let nested = &composite["filters"][1]["compositeFilter"];
+        assert_eq!(nested["op"], "OR");
+        assert_eq!(nested["filters"][1]["fieldFilter"]["op"], "GREATER_THAN");
+    }
+
+    #[test]
+    fn plain_where_and_composite_filters_combine_with_and() {
+        let query = firestore()
+            .collection("cities")
+            .unwrap()
+            .query()
+            .where_field(path("marker"), FilterOperator::Equal, FirestoreValue::from_string("m"))
+            .unwrap()
+            .where_filter(or(vec![
+                where_filter(path("a"), FilterOperator::Equal, FirestoreValue::from_integer(1)),
+                where_filter(path("b"), FilterOperator::Equal, FirestoreValue::from_integer(2)),
+            ]))
+            .unwrap();
+        let encoded = encode(&query);
+        assert_eq!(encoded["where"]["compositeFilter"]["op"], "AND");
+        assert_eq!(encoded["where"]["compositeFilter"]["filters"][1]["compositeFilter"]["op"], "OR");
+    }
+
+    #[test]
+    fn composite_leaves_are_validated_and_empty_composites_rejected() {
+        let query = firestore().collection("cities").unwrap().query();
+        let err = query.where_filter(or(vec![])).unwrap_err();
+        assert!(err.to_string().contains("at least one filter"));
+        let too_many: Vec<FirestoreValue> = (0..11).map(FirestoreValue::from_integer).collect();
+        let err = query
+            .where_filter(or(vec![where_filter(
+                path("x"),
+                FilterOperator::In,
+                FirestoreValue::from_array(too_many),
+            )]))
+            .unwrap_err();
+        assert_eq!(err.code, FirestoreErrorCode::InvalidArgument);
+        let err = query
+            .where_field(path("x"), FilterOperator::Equal, FirestoreValue::server_timestamp())
+            .unwrap_err();
+        assert!(err.to_string().contains("Sentinel"));
+    }
+
+    #[test]
+    fn field_paths_quote_segments_that_are_not_identifiers() {
+        assert_eq!(path("address.city").canonical_string(), "address.city");
+        assert_eq!(FieldPath::new(["a.b"]).unwrap().canonical_string(), "`a.b`");
+        assert_eq!(
+            FieldPath::new(["odd key", "1st"]).unwrap().canonical_string(),
+            "`odd key`.`1st`"
+        );
+        assert_eq!(FieldPath::new(["back`tick"]).unwrap().canonical_string(), "`back\\`tick`");
+        assert_eq!(FieldPath::document_id().canonical_string(), "__name__");
+        assert!(FieldPath::from_dot_separated("a..b").is_err());
+        assert!(FieldPath::from_dot_separated("a/b").is_err());
+        assert!(FieldPath::from_dot_separated(".a").is_err());
+    }
+
+    #[test]
+    fn snapshot_cursors_use_order_by_fields_and_the_document_name() {
+        let firestore = firestore();
+        let query = firestore
+            .collection("cities")
+            .unwrap()
+            .query()
+            .order_by(path("population"), OrderDirection::Descending)
+            .unwrap();
+        let mut fields = BTreeMap::new();
+        fields.insert("population".to_string(), FirestoreValue::from_integer(42));
+        let snapshot = DocumentSnapshot::new(
+            DocumentKey::from_string("cities/lima").unwrap(),
+            Some(MapValue::new(fields)),
+            SnapshotMetadata::new(false, false),
+        );
+
+        let encoded = encode(&query.start_after_snapshot(&snapshot).unwrap());
+        assert_eq!(
+            encoded["startAt"],
+            json!({
+                "values": [
+                    { "integerValue": "42" },
+                    { "referenceValue": "projects/demo/databases/(default)/documents/cities/lima" }
+                ],
+                "before": false
+            })
+        );
+        let encoded = encode(&query.end_at_snapshot(&snapshot).unwrap());
+        assert_eq!(encoded["endAt"]["before"], false);
+        assert_eq!(encoded["endAt"]["values"][0], json!({ "integerValue": "42" }));
+
+        // A document lacking the order-by field cannot be a cursor, nor can a missing document.
+        let bare = DocumentSnapshot::new(
+            DocumentKey::from_string("cities/none").unwrap(),
+            Some(MapValue::new(BTreeMap::new())),
+            SnapshotMetadata::new(false, false),
+        );
+        assert!(query.start_after_snapshot(&bare).is_err());
+        let missing = DocumentSnapshot::new(
+            DocumentKey::from_string("cities/none").unwrap(),
+            None,
+            SnapshotMetadata::new(false, false),
+        );
+        assert!(query.start_after_snapshot(&missing).is_err());
     }
 }

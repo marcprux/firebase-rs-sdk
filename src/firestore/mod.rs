@@ -33,16 +33,17 @@ pub use api::operations::{
     EncodedUpdateData, FieldTransform, SetOptions, TransformOperation,
 };
 
-pub(crate) use api::operations::{set_value_at_field_path, value_for_field_path};
+pub(crate) use api::operations::{remove_value_at_field_path, set_value_at_field_path, value_for_field_path};
 
 #[doc(inline)]
 pub use api::query::{
-    ConvertedQuery, DocumentChangeType, FilterOperator, LimitType, OrderDirection, Query, QueryDocumentChange,
-    QuerySnapshot, QuerySnapshotMetadata, TypedQueryDocumentChange, TypedQuerySnapshot,
+    and, or, where_filter, CompositeOperator, ConvertedQuery, DocumentChangeType, FieldFilter, Filter, FilterOperator,
+    LimitType, OrderDirection, Query, QueryDocumentChange, QuerySnapshot, QuerySnapshotMetadata,
+    TypedQueryDocumentChange, TypedQuerySnapshot,
 };
 
 #[allow(unused_imports)]
-pub(crate) use api::query::{compute_doc_changes, Bound, FieldFilter, OrderBy, QueryDefinition};
+pub(crate) use api::query::{compute_doc_changes, Bound, OrderBy, QueryDefinition};
 
 #[doc(inline)]
 pub use api::reference::{

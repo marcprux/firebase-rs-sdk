@@ -40,6 +40,7 @@ const SERVER_TIMESTAMP_MARKER: &str = "$__firestore_server_timestamp";
 const INCREMENT_MARKER: &str = "$__firestore_increment";
 const ARRAY_UNION_MARKER: &str = "$__firestore_array_union";
 const ARRAY_REMOVE_MARKER: &str = "$__firestore_array_remove";
+const DELETE_FIELD_MARKER: &str = "$__firestore_delete_field";
 const KIND_KEY: &str = "$__firestore_kind";
 
 impl ser::Error for FirestoreError {
@@ -223,6 +224,7 @@ impl Serialize for FirestoreValue {
                 SentinelValue::ArrayRemove(elements) => {
                     serializer.serialize_newtype_struct(ARRAY_REMOVE_MARKER, elements)
                 }
+                SentinelValue::DeleteField => serializer.serialize_unit_struct(DELETE_FIELD_MARKER),
             },
         }
     }
@@ -428,10 +430,10 @@ impl Serializer for ValueSerializer {
         Ok(FirestoreValue::null())
     }
     fn serialize_unit_struct(self, name: &'static str) -> FirestoreResult<FirestoreValue> {
-        if name == SERVER_TIMESTAMP_MARKER {
-            Ok(FirestoreValue::server_timestamp())
-        } else {
-            Ok(FirestoreValue::null())
+        match name {
+            SERVER_TIMESTAMP_MARKER => Ok(FirestoreValue::server_timestamp()),
+            DELETE_FIELD_MARKER => Ok(FirestoreValue::delete_field()),
+            _ => Ok(FirestoreValue::null()),
         }
     }
     fn serialize_unit_variant(

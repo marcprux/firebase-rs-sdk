@@ -62,7 +62,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use firebase_rs_sdk::app::{delete_app, initialize_app, FirebaseApp, FirebaseAppSettings, FirebaseOptions};
 use firebase_rs_sdk::auth::{auth_for_app, register_auth_component, AuthError, AuthErrorCode, User};
 use firebase_rs_sdk::firestore::{
-    get_firestore, FieldPath, FilterOperator, Firestore, FirestoreClient, FirestoreErrorCode, FirestoreValue, ValueKind,
+    get_firestore, FieldPath, FilterOperator, Firestore, FirestoreClient, FirestoreErrorCode, FirestoreValue,
+    OrderDirection, ValueKind,
 };
 use firebase_rs_sdk::functions::error::FunctionsErrorCode;
 use firebase_rs_sdk::functions::{get_functions, register_functions_component};
@@ -417,6 +418,16 @@ fn provisioning_skip_reason(error_text: &str) -> Option<String> {
         (
             "SERVICE_DISABLED",
             "The product's Google API is disabled for this project. Enable it from the console link in the error.",
+        ),
+        (
+            "REQUIRES AN INDEX",
+            "This query needs a composite index on the online project (the emulator does not enforce indexes). \
+             Create it with the console link in the error, then rerun.",
+        ),
+        (
+            "REQUIRES MULTIPLE INDEXES",
+            "This query needs composite indexes on the online project (the emulator does not enforce indexes). \
+             Create them with the console link in the error, then rerun.",
         ),
         (
             "DOES NOT EXIST FOR PROJECT",
@@ -1453,6 +1464,349 @@ async fn firestore_serde_round_trip_query_and_transaction() {
     assert_eq!(touched.tags, vec!["canals", "bikes", "tulips"]);
 
     client.delete_doc(&path).await.expect("cleanup");
+    live.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn firestore_composite_filters_delete_field_and_dotted_names() {
+    let test = "firestore_composite_filters_delete_field_and_dotted_names";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    let live = LiveFirestore::connect(&config, "fs-filters").await;
+    let client = &live.client;
+    let marker = format!("filters-{}", nonce());
+    let field = |name: &str| FieldPath::from_dot_separated(name).expect("field path");
+
+    let cities = [
+        ("Lima", "PE", 10_000_000),
+        ("Cusco", "PE", 430_000),
+        ("Quito", "EC", 2_800_000),
+        ("Loja", "EC", 200_000),
+    ];
+    for (name, country, population) in cities {
+        let mut data = BTreeMap::new();
+        data.insert("marker".to_string(), FirestoreValue::from_string(marker.clone()));
+        data.insert("name".to_string(), FirestoreValue::from_string(name));
+        data.insert("country".to_string(), FirestoreValue::from_string(country));
+        data.insert("population".to_string(), FirestoreValue::from_integer(population));
+        if let Err(err) = client
+            .set_doc(&format!("{LIVE_COLLECTION}/{marker}-{name}"), data, None)
+            .await
+        {
+            if live.skip_if_unprovisioned(test, &err) {
+                live.teardown().await;
+                return;
+            }
+            panic!("seed failed: {err}");
+        }
+    }
+    let base = live.firestore.collection(LIVE_COLLECTION).expect("collection").query();
+    let mine = base
+        .where_field(
+            field("marker"),
+            FilterOperator::Equal,
+            FirestoreValue::from_string(marker.clone()),
+        )
+        .expect("marker filter");
+    let names = |snapshot: &firebase_rs_sdk::firestore::QuerySnapshot| -> Vec<String> {
+        let mut names: Vec<String> = snapshot
+            .documents()
+            .iter()
+            .filter_map(|d| d.data().and_then(|m| field_string(m, "name")))
+            .collect();
+        names.sort();
+        names
+    };
+
+    // OR over one field.
+    let query = mine
+        .where_filter(firebase_rs_sdk::firestore::or(vec![
+            firebase_rs_sdk::firestore::where_filter(
+                field("name"),
+                FilterOperator::Equal,
+                FirestoreValue::from_string("Lima"),
+            ),
+            firebase_rs_sdk::firestore::where_filter(
+                field("name"),
+                FilterOperator::Equal,
+                FirestoreValue::from_string("Quito"),
+            ),
+        ]))
+        .expect("or filter");
+    let or_result = match client.get_docs(&query).await {
+        Ok(snapshot) => snapshot,
+        Err(err) if live.skip_if_unprovisioned(test, &err) => {
+            cleanup_marker(client, &mine).await;
+            live.teardown().await;
+            return;
+        }
+        Err(err) => panic!("or query failed: {err}"),
+    };
+    assert_eq!(names(&or_result), vec!["Lima", "Quito"]);
+
+    // AND of an equality and an OR that mixes fields and operators.
+    let query = mine
+        .where_filter(firebase_rs_sdk::firestore::and(vec![
+            firebase_rs_sdk::firestore::where_filter(
+                field("country"),
+                FilterOperator::Equal,
+                FirestoreValue::from_string("EC"),
+            ),
+            firebase_rs_sdk::firestore::or(vec![
+                firebase_rs_sdk::firestore::where_filter(
+                    field("population"),
+                    FilterOperator::GreaterThan,
+                    FirestoreValue::from_integer(1_000_000),
+                ),
+                firebase_rs_sdk::firestore::where_filter(
+                    field("name"),
+                    FilterOperator::Equal,
+                    FirestoreValue::from_string("Loja"),
+                ),
+            ]),
+        ]))
+        .expect("and/or filter");
+    let and_or_result = match client.get_docs(&query).await {
+        Ok(snapshot) => snapshot,
+        Err(err) if live.skip_if_unprovisioned(test, &err) => {
+            cleanup_marker(client, &mine).await;
+            live.teardown().await;
+            return;
+        }
+        Err(err) => panic!("and/or query failed: {err}"),
+    };
+    assert_eq!(names(&and_or_result), vec!["Loja", "Quito"]);
+
+    // deleteField through update, then through a merge set; plain set must refuse it.
+    let lima = format!("{LIVE_COLLECTION}/{marker}-Lima");
+    let mut patch = BTreeMap::new();
+    patch.insert("population".to_string(), FirestoreValue::delete_field());
+    client.update_doc(&lima, patch).await.expect("update with delete_field");
+    let after = client.get_doc(&lima).await.unwrap();
+    assert!(after.data().unwrap().get("population").is_none(), "population must be deleted");
+    assert_eq!(
+        field_string(after.data().unwrap(), "name").as_deref(),
+        Some("Lima"),
+        "other fields survive"
+    );
+    let mut merge = BTreeMap::new();
+    merge.insert("country".to_string(), FirestoreValue::delete_field());
+    client
+        .set_doc(&lima, merge.clone(), Some(firebase_rs_sdk::firestore::SetOptions::merge_all()))
+        .await
+        .expect("merge set with delete_field");
+    assert!(client
+        .get_doc(&lima)
+        .await
+        .unwrap()
+        .data()
+        .unwrap()
+        .get("country")
+        .is_none());
+    let err = client
+        .set_doc(&lima, merge, None)
+        .await
+        .expect_err("plain set rejects delete_field");
+    assert_eq!(err.code, FirestoreErrorCode::InvalidArgument);
+
+    // A field literally named `a.b` next to a nested `a.b`: string paths address the nested one,
+    // `FieldPath::new` addresses the literal one, and both filter correctly.
+    let dotted = format!("{LIVE_COLLECTION}/{marker}-dotted");
+    let mut data = BTreeMap::new();
+    data.insert("marker".to_string(), FirestoreValue::from_string(marker.clone()));
+    data.insert("a.b".to_string(), FirestoreValue::from_string("literal"));
+    let mut nested = BTreeMap::new();
+    nested.insert("b".to_string(), FirestoreValue::from_string("nested"));
+    data.insert("a".to_string(), FirestoreValue::from_map(nested));
+    client.set_doc(&dotted, data, None).await.expect("dotted seed");
+    let mut patch = BTreeMap::new();
+    patch.insert("a.b".to_string(), FirestoreValue::from_string("literal-updated"));
+    let mut nested = BTreeMap::new();
+    nested.insert("b".to_string(), FirestoreValue::from_string("nested-updated"));
+    patch.insert("a".to_string(), FirestoreValue::from_map(nested));
+    client.update_doc(&dotted, patch).await.expect("dotted update");
+    let doc = client.get_doc(&dotted).await.unwrap();
+    assert_eq!(
+        doc.get(FieldPath::new(["a.b"]).unwrap())
+            .unwrap()
+            .map(|v| v.kind().clone()),
+        Some(ValueKind::String("literal-updated".into()))
+    );
+    assert_eq!(
+        doc.get(field("a.b")).unwrap().map(|v| v.kind().clone()),
+        Some(ValueKind::String("nested-updated".into()))
+    );
+    let by_literal = mine
+        .where_field(
+            FieldPath::new(["a.b"]).unwrap(),
+            FilterOperator::Equal,
+            FirestoreValue::from_string("literal-updated"),
+        )
+        .unwrap();
+    assert_eq!(client.get_docs(&by_literal).await.unwrap().len(), 1);
+    let by_nested = mine
+        .where_field(
+            field("a.b"),
+            FilterOperator::Equal,
+            FirestoreValue::from_string("nested-updated"),
+        )
+        .unwrap();
+    assert_eq!(client.get_docs(&by_nested).await.unwrap().len(), 1);
+
+    cleanup_marker(client, &mine).await;
+    live.teardown().await;
+}
+
+/// Deletes every document matched by `query` (a marker-scoped query in these tests).
+async fn cleanup_marker(client: &FirestoreClient, query: &firebase_rs_sdk::firestore::Query) {
+    if let Ok(snapshot) = client.get_docs(query).await {
+        for doc in snapshot.documents() {
+            let _ = client.delete_doc(&format!("{LIVE_COLLECTION}/{}", doc.id())).await;
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn firestore_snapshot_cursor_pagination() {
+    let test = "firestore_snapshot_cursor_pagination";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    let live = LiveFirestore::connect(&config, "fs-pages").await;
+    let client = &live.client;
+    let marker = format!("pages-{}", nonce());
+    let field = |name: &str| FieldPath::from_dot_separated(name).expect("field path");
+
+    // Five documents; `group` has ties so the implicit `__name__` tiebreak matters.
+    for index in 0..5i64 {
+        let mut data = BTreeMap::new();
+        data.insert("marker".to_string(), FirestoreValue::from_string(marker.clone()));
+        data.insert("index".to_string(), FirestoreValue::from_integer(index));
+        data.insert(
+            "group".to_string(),
+            FirestoreValue::from_string(if index < 3 { "a" } else { "b" }),
+        );
+        if let Err(err) = client
+            .set_doc(&format!("{LIVE_COLLECTION}/{marker}-{index}"), data, None)
+            .await
+        {
+            if live.skip_if_unprovisioned(test, &err) {
+                live.teardown().await;
+                return;
+            }
+            panic!("seed failed: {err}");
+        }
+    }
+    let mine = live
+        .firestore
+        .collection(LIVE_COLLECTION)
+        .expect("collection")
+        .query()
+        .where_field(
+            field("marker"),
+            FilterOperator::Equal,
+            FirestoreValue::from_string(marker.clone()),
+        )
+        .expect("marker filter");
+    let indexes = |snapshot: &firebase_rs_sdk::firestore::QuerySnapshot| -> Vec<i64> {
+        snapshot
+            .documents()
+            .iter()
+            .filter_map(|d| d.data().and_then(|m| field_integer(m, "index")))
+            .collect()
+    };
+
+    // Page through by `index`, two at a time, using the last document of each page as the cursor.
+    let ordered = mine
+        .order_by(field("index"), OrderDirection::Ascending)
+        .unwrap()
+        .limit(2)
+        .unwrap();
+    let mut pages = Vec::new();
+    let mut cursor: Option<firebase_rs_sdk::firestore::DocumentSnapshot> = None;
+    loop {
+        let query = match &cursor {
+            Some(last) => ordered.start_after_snapshot(last).unwrap(),
+            None => ordered.clone(),
+        };
+        let page = match client.get_docs(&query).await {
+            Ok(page) => page,
+            Err(err) if live.skip_if_unprovisioned(test, &err) => {
+                cleanup_marker(client, &mine).await;
+                live.teardown().await;
+                return;
+            }
+            Err(err) => panic!("page failed: {err}"),
+        };
+        if page.is_empty() {
+            break;
+        }
+        pages.push(indexes(&page));
+        cursor = page.documents().last().cloned();
+    }
+    assert_eq!(pages, vec![vec![0, 1], vec![2, 3], vec![4]]);
+
+    // Ties on `group`: the cursor carries the document name, so paging never repeats or skips.
+    let by_group = mine
+        .order_by(field("group"), OrderDirection::Ascending)
+        .unwrap()
+        .limit(2)
+        .unwrap();
+    let first = client.get_docs(&by_group).await.unwrap();
+    let second = client
+        .get_docs(
+            &by_group
+                .start_after_snapshot(first.documents().last().unwrap())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let third = client
+        .get_docs(
+            &by_group
+                .start_after_snapshot(second.documents().last().unwrap())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut seen: Vec<i64> = [indexes(&first), indexes(&second), indexes(&third)].concat();
+    assert_eq!(seen.len(), 5, "pages: {seen:?}");
+    seen.sort();
+    assert_eq!(seen, vec![0, 1, 2, 3, 4]);
+
+    // end_before / start_at variants.
+    let all = client
+        .get_docs(&mine.order_by(field("index"), OrderDirection::Ascending).unwrap())
+        .await
+        .unwrap();
+    let third_doc = &all.documents()[2];
+    let before = client
+        .get_docs(
+            &mine
+                .order_by(field("index"), OrderDirection::Ascending)
+                .unwrap()
+                .end_before_snapshot(third_doc)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(indexes(&before), vec![0, 1]);
+    let from = client
+        .get_docs(
+            &mine
+                .order_by(field("index"), OrderDirection::Ascending)
+                .unwrap()
+                .start_at_snapshot(third_doc)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(indexes(&from), vec![2, 3, 4]);
+
+    cleanup_marker(client, &mine).await;
     live.teardown().await;
 }
 

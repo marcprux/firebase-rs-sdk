@@ -30,6 +30,8 @@ pub enum SentinelValue {
     ArrayUnion(Vec<FirestoreValue>),
     ArrayRemove(Vec<FirestoreValue>),
     NumericIncrement(Box<FirestoreValue>),
+    /// Removes the field on write (`deleteField()`); only valid in `update` and merge `set`.
+    DeleteField,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -117,6 +119,13 @@ impl FirestoreValue {
     ///
     /// TypeScript reference: `serverTimestamp()` in
     /// `packages/firestore/src/lite-api/field_value_impl.ts`.
+    /// Marks a field for deletion in an `update` or a merge `set`. Mirrors `deleteField()`.
+    pub fn delete_field() -> Self {
+        Self {
+            kind: ValueKind::Sentinel(SentinelValue::DeleteField),
+        }
+    }
+
     pub fn server_timestamp() -> Self {
         Self {
             kind: ValueKind::Sentinel(SentinelValue::ServerTimestamp),
