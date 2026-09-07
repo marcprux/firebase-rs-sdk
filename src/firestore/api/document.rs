@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 
 use crate::firestore::api::aggregate::{AggregateField, AggregateQuerySnapshot, AggregateSpec};
 use crate::firestore::api::operations::{self, SetOptions};
@@ -12,6 +13,7 @@ use std::sync::Arc;
 use crate::firestore::remote::datastore::{Datastore, HttpDatastore, InMemoryDatastore, TokenProviderArc};
 use crate::firestore::value::FirestoreValue;
 
+use super::transaction::{self, Transaction, TransactionOptions};
 use super::write_batch::WriteBatch;
 use super::{
     converter::FirestoreDataConverter,
@@ -73,6 +75,64 @@ impl FirestoreClient {
     /// `packages/firestore/src/lite-api/write_batch.ts`.
     pub fn batch(&self) -> WriteBatch {
         WriteBatch::new(self.firestore.clone(), Arc::clone(&self.datastore))
+    }
+
+    /// Executes `update` inside a read-write transaction and returns its result.
+    ///
+    /// Mirrors `runTransaction(firestore, updateFunction)` in the JS SDK. The closure receives a
+    /// [`Transaction`] handle for reads and staged writes; when it returns `Ok`, the writes are
+    /// committed atomically against the documents that were read. If another client modified any
+    /// of those documents first, the backend rejects the commit and the closure is run again
+    /// (up to [`TransactionOptions::max_attempts`], 5 by default), so it must be idempotent and
+    /// free of side effects. An `Err` from the closure rolls the transaction back and is returned
+    /// unchanged unless it is a retryable backend error.
+    ///
+    /// ```no_run
+    /// # use std::collections::BTreeMap;
+    /// # use firebase_rs_sdk::firestore::*;
+    /// # async fn demo(client: FirestoreClient, firestore: Firestore) -> FirestoreResult<()> {
+    /// let counter = firestore.doc("counters/visits")?;
+    /// let new_total = client
+    ///     .run_transaction(|txn| {
+    ///         let counter = counter.clone();
+    ///         async move {
+    ///             let snapshot = txn.get(&counter).await?;
+    ///             let current = snapshot
+    ///                 .data()
+    ///                 .and_then(|d| d.get("total"))
+    ///                 .and_then(|v| match v.kind() { ValueKind::Integer(i) => Some(*i), _ => None })
+    ///                 .unwrap_or(0);
+    ///             let mut data = BTreeMap::new();
+    ///             data.insert("total".to_string(), FirestoreValue::from_integer(current + 1));
+    ///             txn.set(&counter, data, None)?;
+    ///             Ok(current + 1)
+    ///         }
+    ///     })
+    ///     .await?;
+    /// println!("visits: {new_total}");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn run_transaction<F, Fut, T>(&self, update: F) -> FirestoreResult<T>
+    where
+        F: Fn(Arc<Transaction>) -> Fut,
+        Fut: Future<Output = FirestoreResult<T>>,
+    {
+        self.run_transaction_with_options(TransactionOptions::default(), update)
+            .await
+    }
+
+    /// Like [`run_transaction`](Self::run_transaction) with explicit retry settings.
+    pub async fn run_transaction_with_options<F, Fut, T>(
+        &self,
+        options: TransactionOptions,
+        update: F,
+    ) -> FirestoreResult<T>
+    where
+        F: Fn(Arc<Transaction>) -> Fut,
+        Fut: Future<Output = FirestoreResult<T>>,
+    {
+        transaction::run_transaction(self.firestore.clone(), Arc::clone(&self.datastore), options, update).await
     }
 
     /// Fetches the document located at `path`.

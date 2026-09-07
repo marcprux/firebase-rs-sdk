@@ -6,4 +6,5 @@ pub mod operations;
 pub mod query;
 pub mod reference;
 pub mod snapshot;
+pub mod transaction;
 pub mod write_batch;

@@ -21,7 +21,9 @@ use serde_json::{json, Value as JsonValue};
 
 use crate::platform::runtime::sleep as runtime_sleep;
 
-use super::{Datastore, NoopTokenProvider, TokenProviderArc, WriteOperation};
+use super::{
+    CommitResult, ConditionalWrite, Datastore, NoopTokenProvider, TokenProviderArc, WriteOperation, WriteResultInfo,
+};
 
 #[derive(Clone)]
 pub struct HttpDatastore {
@@ -105,7 +107,25 @@ impl HttpDatastore {
         }
     }
 
-    async fn execute_with_retry<F, Fut, T>(&self, mut operation: F) -> FirestoreResult<T>
+    async fn execute_with_retry<F, Fut, T>(&self, operation: F) -> FirestoreResult<T>
+    where
+        F: FnMut(&RequestContext) -> Fut,
+        Fut: Future<Output = FirestoreResult<T>>,
+    {
+        self.execute_with_retry_policy(operation, true).await
+    }
+
+    /// Like [`execute_with_retry`](Self::execute_with_retry) but for requests that must not be
+    /// replayed blindly (commits): only an expired credential is retried, after refreshing it.
+    async fn execute_non_idempotent<F, Fut, T>(&self, operation: F) -> FirestoreResult<T>
+    where
+        F: FnMut(&RequestContext) -> Fut,
+        Fut: Future<Output = FirestoreResult<T>>,
+    {
+        self.execute_with_retry_policy(operation, false).await
+    }
+
+    async fn execute_with_retry_policy<F, Fut, T>(&self, mut operation: F, idempotent: bool) -> FirestoreResult<T>
     where
         F: FnMut(&RequestContext) -> Fut,
         Fut: Future<Output = FirestoreResult<T>>,
@@ -116,7 +136,12 @@ impl HttpDatastore {
             match operation(&context).await {
                 Ok(result) => return Ok(result),
                 Err(err) => {
-                    if !self.retry.should_retry(attempt, &err) {
+                    let retryable = if idempotent {
+                        self.retry.should_retry(attempt, &err)
+                    } else {
+                        self.retry.should_retry_non_idempotent(attempt, &err)
+                    };
+                    if !retryable {
                         return Err(err);
                     }
 
@@ -152,6 +177,124 @@ impl HttpDatastore {
             .collect();
         json!({ "writes": encoded })
     }
+
+    fn encode_conditional_commit_body(&self, writes: &[ConditionalWrite]) -> JsonValue {
+        let encoded: Vec<JsonValue> = writes
+            .iter()
+            .map(|write| self.serializer.encode_conditional_write(write))
+            .collect();
+        json!({ "writes": encoded })
+    }
+
+    fn decode_commit_response(&self, response: &JsonValue, expected: usize) -> FirestoreResult<CommitResult> {
+        // The commit has already been applied at this point; an unparseable timestamp in the
+        // metadata must not turn a successful write into an error, so it decodes to `None`.
+        let decode_time = |value: Option<&JsonValue>| {
+            value
+                .and_then(JsonValue::as_str)
+                .and_then(|text| self.serializer.decode_timestamp_string(text).ok())
+        };
+        let commit_time = decode_time(response.get("commitTime"));
+        let mut write_results = Vec::with_capacity(expected);
+        if let Some(entries) = response.get("writeResults").and_then(JsonValue::as_array) {
+            for entry in entries {
+                write_results.push(WriteResultInfo {
+                    update_time: decode_time(entry.get("updateTime")),
+                });
+            }
+        }
+        // The backend returns one result per write; pad defensively so callers can index by
+        // write position even if a result is missing.
+        while write_results.len() < expected {
+            write_results.push(WriteResultInfo::default());
+        }
+        Ok(CommitResult {
+            write_results,
+            commit_time,
+        })
+    }
+
+    async fn commit_body(&self, commit_body: JsonValue, expected: usize) -> FirestoreResult<CommitResult> {
+        let response = self
+            .execute_non_idempotent(|context| {
+                let context = context.clone();
+                let body = commit_body.clone();
+                async move {
+                    self.connection
+                        .invoke_json(Method::POST, "documents:commit", Some(body.clone()), &context)
+                        .await
+                }
+            })
+            .await?;
+        self.decode_commit_response(&response, expected)
+    }
+
+    /// Decodes a `batchGet` / `runQuery` / `get` document payload into a snapshot, including the
+    /// backend's create and update times when present.
+    fn decode_document(&self, document: &JsonValue) -> FirestoreResult<DocumentSnapshot> {
+        let name = document
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| internal_error("Firestore document payload missing 'name' field"))?;
+        let key = self.serializer.document_key_from_name(name)?;
+        self.decode_document_with_key(key, document)
+    }
+
+    fn decode_document_with_key(&self, key: DocumentKey, document: &JsonValue) -> FirestoreResult<DocumentSnapshot> {
+        let map_value = self
+            .serializer
+            .decode_document_fields(document)?
+            .unwrap_or_else(|| MapValue::new(BTreeMap::new()));
+        let time = |field: &str| {
+            document
+                .get(field)
+                .and_then(JsonValue::as_str)
+                .and_then(|text| self.serializer.decode_timestamp_string(text).ok())
+        };
+        Ok(DocumentSnapshot::new(key, Some(map_value), SnapshotMetadata::new(false, false))
+            .with_times(time("createTime"), time("updateTime")))
+    }
+
+    fn decode_query_response(&self, response: &JsonValue) -> FirestoreResult<Vec<DocumentSnapshot>> {
+        let results = response
+            .as_array()
+            .ok_or_else(|| internal_error("Firestore runQuery response must be an array"))?;
+
+        let mut snapshots = Vec::new();
+        for entry in results {
+            if let Some(document) = entry.get("document") {
+                snapshots.push(self.decode_document(document)?);
+            }
+        }
+        Ok(snapshots)
+    }
+
+    fn query_request(&self, query: &QueryDefinition) -> FirestoreResult<(String, JsonValue)> {
+        let request_path = if query.parent_path().is_empty() {
+            "documents:runQuery".to_string()
+        } else {
+            format!("documents/{}:runQuery", query.parent_path().canonical_string())
+        };
+        let structured_query = encode_structured_query(&self.serializer, query)?;
+        Ok((request_path, json!({ "structuredQuery": structured_query })))
+    }
+
+    async fn run_query_internal(&self, query: &QueryDefinition) -> FirestoreResult<Vec<DocumentSnapshot>> {
+        let (request_path, body) = self.query_request(query)?;
+        let response = self
+            .execute_with_retry(|context| {
+                let context = context.clone();
+                let request_path = request_path.clone();
+                let body = body.clone();
+                async move {
+                    self.connection
+                        .invoke_json(Method::POST, &request_path, Some(body.clone()), &context)
+                        .await
+                }
+            })
+            .await?;
+        self.decode_query_response(&response)
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -159,7 +302,6 @@ impl HttpDatastore {
 impl Datastore for HttpDatastore {
     async fn get_document(&self, key: &DocumentKey) -> FirestoreResult<DocumentSnapshot> {
         let doc_path = format!("documents/{}", key.path().canonical_string());
-        let serializer = self.serializer.clone();
         let snapshot = self
             .execute_with_retry(|context| {
                 let context = context.clone();
@@ -173,14 +315,7 @@ impl Datastore for HttpDatastore {
             .await?;
 
         if let Some(json) = snapshot {
-            let map_value = serializer
-                .decode_document_fields(&json)?
-                .unwrap_or_else(|| MapValue::new(BTreeMap::new()));
-            Ok(DocumentSnapshot::new(
-                key.clone(),
-                Some(map_value),
-                SnapshotMetadata::new(false, false),
-            ))
+            self.decode_document_with_key(key.clone(), &json)
         } else {
             Ok(DocumentSnapshot::new(key.clone(), None, SnapshotMetadata::new(false, false)))
         }
@@ -203,56 +338,7 @@ impl Datastore for HttpDatastore {
     }
 
     async fn run_query(&self, query: &QueryDefinition) -> FirestoreResult<Vec<DocumentSnapshot>> {
-        let request_path = if query.parent_path().is_empty() {
-            "documents:runQuery".to_string()
-        } else {
-            format!("documents/{}:runQuery", query.parent_path().canonical_string())
-        };
-
-        let structured_query = encode_structured_query(&self.serializer, query)?;
-        let body = json!({
-            "structuredQuery": structured_query
-        });
-        let serializer = self.serializer.clone();
-
-        let response = self
-            .execute_with_retry(|context| {
-                let context = context.clone();
-                let request_path = request_path.clone();
-                let body = body.clone();
-                async move {
-                    self.connection
-                        .invoke_json(Method::POST, &request_path, Some(body.clone()), &context)
-                        .await
-                }
-            })
-            .await?;
-
-        let results = response
-            .as_array()
-            .ok_or_else(|| internal_error("Firestore runQuery response must be an array"))?;
-
-        let mut snapshots = Vec::new();
-        for entry in results {
-            let document = match entry.get("document") {
-                Some(value) => value,
-                None => continue,
-            };
-
-            let name = document
-                .get("name")
-                .and_then(JsonValue::as_str)
-                .ok_or_else(|| internal_error("Firestore runQuery document missing 'name' field"))?;
-            let key = self.serializer.document_key_from_name(name)?;
-
-            let map_value = serializer
-                .decode_document_fields(document)?
-                .unwrap_or_else(|| MapValue::new(BTreeMap::new()));
-
-            snapshots.push(DocumentSnapshot::new(key, Some(map_value), SnapshotMetadata::new(false, false)));
-        }
-
-        Ok(snapshots)
+        self.run_query_internal(query).await
     }
 
     async fn update_document(
@@ -280,22 +366,72 @@ impl Datastore for HttpDatastore {
     }
 
     async fn commit(&self, writes: Vec<WriteOperation>) -> FirestoreResult<()> {
-        if writes.is_empty() {
-            return Ok(());
-        }
+        self.commit_with_results(writes).await.map(|_| ())
+    }
 
-        let commit_body = self.encode_commit_body(&writes);
-        self.execute_with_retry(|context| {
-            let context = context.clone();
-            let body = commit_body.clone();
-            async move {
-                self.connection
-                    .invoke_json(Method::POST, "documents:commit", Some(body.clone()), &context)
-                    .await
-                    .map(|_| ())
+    async fn commit_with_results(&self, writes: Vec<WriteOperation>) -> FirestoreResult<CommitResult> {
+        if writes.is_empty() {
+            return Ok(CommitResult::default());
+        }
+        let expected = writes.len();
+        let body = self.encode_commit_body(&writes);
+        self.commit_body(body, expected).await
+    }
+
+    async fn batch_get_documents(&self, keys: &[DocumentKey]) -> FirestoreResult<Vec<DocumentSnapshot>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let names: Vec<String> = keys.iter().map(|key| self.serializer.document_name(key)).collect();
+        let body = json!({ "documents": names });
+        let response = self
+            .execute_with_retry(|context| {
+                let context = context.clone();
+                let body = body.clone();
+                async move {
+                    self.connection
+                        .invoke_json(Method::POST, "documents:batchGet", Some(body.clone()), &context)
+                        .await
+                }
+            })
+            .await?;
+
+        let entries = response
+            .as_array()
+            .ok_or_else(|| internal_error("Firestore batchGet response must be an array"))?;
+        let mut by_name: BTreeMap<String, DocumentSnapshot> = BTreeMap::new();
+        for entry in entries {
+            // `BatchGetDocumentsResponse` reports hits under `found` (not `document` as runQuery does).
+            if let Some(document) = entry.get("found").or_else(|| entry.get("document")) {
+                let snapshot = self.decode_document(document)?;
+                by_name.insert(self.serializer.document_name(snapshot.key()), snapshot);
+            } else if let Some(missing) = entry.get("missing").and_then(JsonValue::as_str) {
+                let key = self.serializer.document_key_from_name(missing)?;
+                by_name.insert(
+                    missing.to_string(),
+                    DocumentSnapshot::new(key, None, SnapshotMetadata::new(false, false)),
+                );
             }
-        })
-        .await
+        }
+        // batchGet may answer in any order; return snapshots in request order.
+        Ok(names
+            .iter()
+            .zip(keys)
+            .map(|(name, key)| {
+                by_name
+                    .remove(name)
+                    .unwrap_or_else(|| DocumentSnapshot::new(key.clone(), None, SnapshotMetadata::new(false, false)))
+            })
+            .collect())
+    }
+
+    async fn commit_conditional(&self, writes: Vec<ConditionalWrite>) -> FirestoreResult<CommitResult> {
+        if writes.is_empty() {
+            return Ok(CommitResult::default());
+        }
+        let expected = writes.len();
+        let body = self.encode_conditional_commit_body(&writes);
+        self.commit_body(body, expected).await
     }
 
     async fn run_aggregate(
@@ -424,6 +560,15 @@ impl RetrySettings {
         )
     }
 
+    /// Commits are not safe to replay: a request that was applied but whose response was lost
+    /// would double-apply `increment` and `arrayUnion`. Only an expired credential is retried.
+    fn should_retry_non_idempotent(&self, attempt: usize, error: &FirestoreError) -> bool {
+        if attempt + 1 >= self.max_attempts {
+            return false;
+        }
+        error.code == FirestoreErrorCode::Unauthenticated
+    }
+
     fn backoff_delay(&self, attempt: usize) -> Duration {
         let factor = self.multiplier.powi(attempt as i32);
         let delay = self.initial_delay.mul_f64(factor);
@@ -472,6 +617,171 @@ mod tests {
         };
         let error = internal_error("boom");
         assert!(!settings.should_retry(0, &error));
+    }
+
+    fn mock_datastore(server: &MockServer, database_id: &DatabaseId, retry: RetrySettings) -> HttpDatastore {
+        let connection_builder =
+            ConnectionBuilder::new(database_id.clone()).with_emulator_host(server.address().to_string());
+        HttpDatastore::builder(database_id.clone())
+            .with_connection_builder(connection_builder)
+            .with_retry_settings(retry)
+            .build()
+            .expect("datastore")
+    }
+
+    fn fast_retry(max_attempts: usize) -> RetrySettings {
+        RetrySettings {
+            max_attempts,
+            initial_delay: Duration::from_millis(1),
+            multiplier: 1.0,
+            max_delay: Duration::from_millis(1),
+            request_timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn try_server(name: &str) -> Option<MockServer> {
+        match panic::catch_unwind(start_mock_server) {
+            Ok(server) => Some(server),
+            Err(_) => {
+                eprintln!("Skipping {name}: unable to bind httpmock server in this environment.");
+                None
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_get_and_conditional_commit_use_the_rest_wire_format() {
+        let Some(server) = try_server("batch_get_and_conditional_commit_use_the_rest_wire_format") else {
+            return;
+        };
+        let database_id = DatabaseId::new("demo-project", "(default)");
+        let base = "/v1/projects/demo-project/databases/(default)";
+        let doc_a = "projects/demo-project/databases/(default)/documents/cities/A".to_string();
+        let doc_b = "projects/demo-project/databases/(default)/documents/cities/B".to_string();
+        let doc_c = "projects/demo-project/databases/(default)/documents/cities/C".to_string();
+
+        // batchGet answers out of order and reports B as missing.
+        let batch_get = server.mock(|when, then| {
+            when.method(POST)
+                .path(format!("{base}/documents:batchGet"))
+                .json_body(json!({ "documents": [doc_a, doc_b] }));
+            then.status(200).json_body(json!([
+                { "missing": doc_b, "readTime": "2026-09-07T00:00:00Z" },
+                { "found": {
+                    "name": doc_a,
+                    "fields": { "name": { "stringValue": "Amsterdam" } },
+                    "createTime": "2026-09-01T00:00:00Z",
+                    "updateTime": "2026-09-07T12:34:56.789Z"
+                } }
+            ]));
+        });
+        let commit = server.mock(|when, then| {
+            when.method(POST)
+                .path(format!("{base}/documents:commit"))
+                .json_body(json!({ "writes": [
+                    { "update": { "name": doc_a, "fields": {} },
+                      "currentDocument": { "updateTime": "2026-09-07T12:34:56.789000000Z" } },
+                    { "delete": doc_c, "currentDocument": { "exists": true } },
+                    { "verify": doc_b, "currentDocument": { "exists": false } }
+                ] }));
+            then.status(200).json_body(json!({
+                "writeResults": [ { "updateTime": "2026-09-07T12:35:00Z" }, {}, {} ],
+                "commitTime": "2026-09-07T12:35:00Z"
+            }));
+        });
+
+        let datastore = mock_datastore(&server, &database_id, fast_retry(1));
+        let keys = [
+            DocumentKey::from_string("cities/A").unwrap(),
+            DocumentKey::from_string("cities/B").unwrap(),
+        ];
+        let snapshots = datastore.batch_get_documents(&keys).await.expect("batchGet");
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].id(), "A");
+        assert!(snapshots[0].exists());
+        let version = snapshots[0].update_time().expect("updateTime decoded");
+        assert!(snapshots[0].create_time().is_some());
+        assert_eq!(snapshots[1].id(), "B");
+        assert!(!snapshots[1].exists());
+        assert!(snapshots[1].update_time().is_none());
+
+        let writes = vec![
+            super::super::ConditionalWrite::Write {
+                operation: WriteOperation::Set {
+                    key: keys[0].clone(),
+                    data: MapValue::new(BTreeMap::new()),
+                    mask: None,
+                    transforms: Vec::new(),
+                },
+                precondition: super::super::Precondition::UpdateTime(version),
+            },
+            super::super::ConditionalWrite::Write {
+                operation: WriteOperation::Delete {
+                    key: DocumentKey::from_string("cities/C").unwrap(),
+                },
+                precondition: super::super::Precondition::Exists(true),
+            },
+            super::super::ConditionalWrite::Verify {
+                key: keys[1].clone(),
+                precondition: super::super::Precondition::Exists(false),
+            },
+        ];
+        let result = datastore.commit_conditional(writes).await.expect("commit");
+        assert_eq!(result.write_results.len(), 3);
+        assert!(result.write_results[0].update_time.is_some());
+        assert!(result.write_results[1].update_time.is_none());
+        assert_eq!(result.commit_time, result.write_results[0].update_time);
+
+        batch_get.assert();
+        commit.assert();
+    }
+
+    #[tokio::test]
+    async fn commit_is_not_replayed_after_a_transport_style_failure() {
+        let Some(server) = try_server("commit_is_not_replayed_after_a_transport_style_failure") else {
+            return;
+        };
+        let database_id = DatabaseId::new("demo-project", "(default)");
+        let base = "/v1/projects/demo-project/databases/(default)";
+        let commit = server.mock(|when, then| {
+            when.method(POST).path(format!("{base}/documents:commit"));
+            then.status(503)
+                .json_body(json!({ "error": { "status": "UNAVAILABLE", "message": "try later" } }));
+        });
+        let query = server.mock(|when, then| {
+            when.method(POST).path(format!("{base}/documents:runQuery"));
+            then.status(503)
+                .json_body(json!({ "error": { "status": "UNAVAILABLE", "message": "try later" } }));
+        });
+
+        let datastore = mock_datastore(&server, &database_id, fast_retry(3));
+        let key = DocumentKey::from_string("cities/A").unwrap();
+        let err = datastore
+            .commit(vec![WriteOperation::Delete { key }])
+            .await
+            .expect_err("commit fails");
+        assert_eq!(err.code, FirestoreErrorCode::Unavailable);
+        assert_eq!(
+            commit.hits(),
+            1,
+            "a commit must not be replayed: it may already have been applied"
+        );
+
+        // Reads are idempotent and keep the retry policy.
+        let options = FirebaseOptions {
+            project_id: Some(database_id.project_id().to_string()),
+            ..Default::default()
+        };
+        let app = FirebaseApp::new(
+            options,
+            FirebaseAppConfig::new("commit-retry-test", false),
+            ComponentContainer::new("commit-retry-test"),
+        );
+        let firestore = Firestore::new(app, database_id.clone());
+        let firestore_query = firestore.collection("cities").unwrap().query().definition();
+        let err = datastore.run_query(&firestore_query).await.expect_err("query fails");
+        assert_eq!(err.code, FirestoreErrorCode::Unavailable);
+        assert_eq!(query.hits(), 3);
     }
 
     #[tokio::test]

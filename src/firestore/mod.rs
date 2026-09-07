@@ -48,6 +48,9 @@ pub use api::reference::{
 pub use api::snapshot::{DocumentSnapshot, SnapshotMetadata, TypedDocumentSnapshot};
 
 #[doc(inline)]
+pub use api::transaction::{is_retryable_transaction_error, Transaction, TransactionOptions};
+
+#[doc(inline)]
 pub use api::write_batch::WriteBatch;
 
 #[doc(inline)]
@@ -55,8 +58,9 @@ pub use constants::{DEFAULT_DATABASE_ID, FIRESTORE_COMPONENT_NAME};
 
 #[doc(inline)]
 pub use error::{
-    deadline_exceeded, internal_error, invalid_argument, missing_project_id, not_found, permission_denied,
-    resource_exhausted, unauthenticated, unavailable, FirestoreError, FirestoreErrorCode, FirestoreResult,
+    aborted, already_exists, deadline_exceeded, failed_precondition, internal_error, invalid_argument,
+    missing_project_id, not_found, permission_denied, resource_exhausted, unauthenticated, unavailable, FirestoreError,
+    FirestoreErrorCode, FirestoreResult,
 };
 
 #[doc(inline)]
@@ -82,6 +86,8 @@ pub use remote::connection::{Connection, ConnectionBuilder, RequestContext};
 #[doc(inline)]
 pub use remote::network::{NetworkLayer, NetworkLayerBuilder, NetworkStreamHandler, StreamCredentials};
 
+#[doc(inline)]
+pub use remote::datastore::{CommitResult, ConditionalWrite, Precondition, WriteResultInfo};
 #[doc(inline)]
 pub use remote::datastore::{
     Datastore, HttpDatastore, HttpDatastoreBuilder, InMemoryDatastore, NoopTokenProvider, RetrySettings, StreamHandle,

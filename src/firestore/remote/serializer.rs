@@ -9,7 +9,7 @@ use serde_json::{json, Value as JsonValue};
 use crate::firestore::api::operations::{FieldTransform, TransformOperation};
 use crate::firestore::error::{invalid_argument, FirestoreResult};
 use crate::firestore::model::{DatabaseId, DocumentKey, FieldPath, GeoPoint, Timestamp};
-use crate::firestore::remote::datastore::WriteOperation;
+use crate::firestore::remote::datastore::{ConditionalWrite, Precondition, WriteOperation};
 use crate::firestore::value::{BytesValue, FirestoreValue, MapValue, ValueKind};
 
 #[derive(Clone, Debug)]
@@ -200,6 +200,47 @@ impl JsonProtoSerializer {
             } => self.encode_update_write(key, data, field_paths, transforms),
             WriteOperation::Delete { key } => self.encode_delete_write(key),
         }
+    }
+
+    /// Encodes a precondition as a `currentDocument` payload; `None` for [`Precondition::None`].
+    pub fn encode_precondition(&self, precondition: &Precondition) -> Option<JsonValue> {
+        match precondition {
+            Precondition::None => None,
+            Precondition::Exists(exists) => Some(json!({ "exists": exists })),
+            Precondition::UpdateTime(timestamp) => Some(json!({ "updateTime": encode_timestamp(timestamp) })),
+        }
+    }
+
+    /// Encodes a transactional write. An explicit precondition replaces the default
+    /// `exists: true` that plain updates carry.
+    pub fn encode_conditional_write(&self, write: &ConditionalWrite) -> JsonValue {
+        match write {
+            ConditionalWrite::Write {
+                operation,
+                precondition,
+            } => {
+                let mut encoded = self.encode_write_operation(operation);
+                if let Some(current) = self.encode_precondition(precondition) {
+                    if let Some(object) = encoded.as_object_mut() {
+                        object.insert("currentDocument".to_string(), current);
+                    }
+                }
+                encoded
+            }
+            ConditionalWrite::Verify { key, precondition } => {
+                let mut object = serde_json::Map::new();
+                object.insert("verify".to_string(), JsonValue::String(self.document_name(key)));
+                if let Some(current) = self.encode_precondition(precondition) {
+                    object.insert("currentDocument".to_string(), current);
+                }
+                JsonValue::Object(object)
+            }
+        }
+    }
+
+    /// Formats a timestamp the way the REST API expects (RFC 3339, UTC, nanosecond precision).
+    pub fn encode_timestamp_string(&self, timestamp: &Timestamp) -> String {
+        encode_timestamp(timestamp)
     }
 
     pub fn decode_timestamp_string(&self, value: &str) -> FirestoreResult<Timestamp> {

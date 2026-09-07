@@ -27,6 +27,7 @@ DISCLAIMER: This is not an official Firebase product, nor it is guaranteed that 
 
 
 ## Implemented
+- `runTransaction` (`FirestoreClient::run_transaction`) ported from `lite-api/transaction.ts` + `core/transaction.ts` + `core/transaction_runner.ts`: optimistic transactions over `documents:batchGet` and `documents:commit` with `currentDocument` preconditions and `verify` writes, retried on `failed-precondition` / `aborted` / non-permanent errors (5 attempts, exponential backoff). Error codes `aborted`, `failed-precondition`, `already-exists` are mapped from the canonical status in error payloads. `DocumentSnapshot` exposes `create_time` / `update_time`; commits return `CommitResult` (`WriteBatch::commit_with_results`). Commits are no longer replayed on transport failures. Verified live by `tests/live_endpoints.rs`.
 
 - **Component wiring** – `firestore::api::register_firestore_component` hooks Firestore into the global component
   registry so apps can lazily resolve `Firestore` instances via `get_firestore` (with per-database overrides).

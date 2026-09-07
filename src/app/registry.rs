@@ -13,6 +13,11 @@ pub static APPS: LazyLock<Mutex<HashMap<String, FirebaseApp>>> = LazyLock::new(|
 pub static SERVER_APPS: LazyLock<Mutex<HashMap<String, FirebaseServerApp>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Serialises tests that reset the global app/component registries. Every test module that
+/// calls a `reset()` on these globals must lock this, otherwise modules race each other.
+#[cfg(test)]
+pub(crate) static TEST_REGISTRY_SERIAL: LazyLock<async_lock::Mutex<()>> = LazyLock::new(|| async_lock::Mutex::new(()));
+
 pub(crate) fn apps_guard() -> MutexGuard<'static, HashMap<String, FirebaseApp>> {
     APPS.lock().unwrap_or_else(|poison| poison.into_inner())
 }
@@ -54,18 +59,22 @@ pub fn clear_components() {
 }
 
 /// Registers a global component and propagates it to already-initialized apps.
+///
+/// The global component map is held for the whole operation, and the app map is taken inside
+/// it. `initialize_app` acquires the same two locks in the same order to snapshot the
+/// components and publish the new app atomically, so a component can never be missed by an app
+/// that is being created concurrently. Keep that lock order (components, then apps) everywhere.
 pub fn register_component(component: Component) -> bool {
-    let newly_registered = component::register_component(component.clone());
-    let component = if newly_registered {
-        component
+    let mut global = registered_components_guard();
+    let newly_registered = if global.contains_key(component.name()) {
+        false
     } else {
-        // If the component was already registered, reuse the stored version to ensure we still
-        // propagate it to any apps that may have been initialized without it.
-        registered_components_guard()
-            .get(component.name())
-            .cloned()
-            .unwrap_or(component)
+        global.insert(Arc::from(component.name().to_owned()), component.clone());
+        true
     };
+    // Reuse the stored version so an already-registered component is still propagated to any
+    // apps that may have been initialized without it.
+    let component = global.get(component.name()).cloned().unwrap_or(component);
 
     {
         let apps = apps_guard();
@@ -81,6 +90,7 @@ pub fn register_component(component: Component) -> bool {
         }
     }
 
+    drop(global);
     newly_registered
 }
 
@@ -131,8 +141,6 @@ mod tests {
     use std::sync::{Arc, LazyLock};
     use std::time::Duration;
 
-    static TEST_GUARD: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
-
     fn reset() {
         {
             let mut apps = apps_guard();
@@ -155,7 +163,7 @@ mod tests {
         F: FnOnce() -> Fut,
         Fut: std::future::Future,
     {
-        let _guard = TEST_GUARD.lock().await;
+        let _guard = TEST_REGISTRY_SERIAL.lock().await;
         reset();
         f().await
     }

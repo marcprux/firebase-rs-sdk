@@ -165,8 +165,15 @@ pub async fn initialize_app(options: FirebaseOptions, settings: Option<FirebaseA
 
     let config = FirebaseAppConfig::new(name.clone(), automatic);
 
-    {
-        let apps = apps_guard();
+    let container = ComponentContainer::new(name.clone());
+    let app = FirebaseApp::new(options.clone(), config.clone(), container.clone());
+
+    // Snapshot the registered components and publish the app under the same locks (components,
+    // then apps: the order `register_component` uses) so that a component registered concurrently
+    // is either in the snapshot or propagated to the published app, never lost.
+    let components: Vec<Component> = {
+        let global = registered_components_guard();
+        let mut apps = apps_guard();
         if let Some(existing) = apps.get(&name) {
             if deep_equal_options(&options, &existing.options()) && deep_equal_config(&config, &existing.config()) {
                 return Ok(existing.clone());
@@ -174,16 +181,9 @@ pub async fn initialize_app(options: FirebaseOptions, settings: Option<FirebaseA
                 return Err(AppError::DuplicateApp { app_name: name });
             }
         }
-    }
-
-    let container = ComponentContainer::new(name.clone());
-
-    let components: Vec<Component> = {
-        let global = registered_components_guard();
+        apps.insert(name.clone(), app.clone());
         global.values().cloned().collect()
     };
-
-    let app = FirebaseApp::new(options.clone(), config.clone(), container.clone());
 
     let app_for_factory = app.clone();
     let app_factory: InstanceFactory =
@@ -192,8 +192,6 @@ pub async fn initialize_app(options: FirebaseOptions, settings: Option<FirebaseA
     for component in components {
         let _ = container.add_component(component);
     }
-
-    apps_guard().insert(name.clone(), app.clone());
 
     Ok(app)
 }
@@ -410,7 +408,6 @@ mod tests {
     use std::time::Duration;
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
-    static TEST_SERIAL: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
     fn next_name(prefix: &str) -> String {
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -448,7 +445,7 @@ mod tests {
         F: FnOnce() -> Fut,
         Fut: Future,
     {
-        let _guard = TEST_SERIAL.lock().await;
+        let _guard = registry::TEST_REGISTRY_SERIAL.lock().await;
         reset();
         f().await
     }

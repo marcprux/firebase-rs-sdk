@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use crate::firestore::error::{internal_error, invalid_argument, not_found, FirestoreResult};
+use crate::firestore::error::{
+    already_exists, failed_precondition, internal_error, invalid_argument, not_found, FirestoreResult,
+};
 use crate::firestore::model::{DocumentKey, FieldPath, Timestamp};
 use crate::firestore::query_evaluator::apply_query_to_documents;
 use crate::firestore::value::{FirestoreValue, MapValue, ValueKind};
@@ -11,16 +13,72 @@ use crate::firestore::{DocumentSnapshot, SnapshotMetadata};
 
 use async_trait::async_trait;
 
-use super::{Datastore, WriteOperation};
+use super::{CommitResult, ConditionalWrite, Datastore, Precondition, WriteOperation, WriteResultInfo};
 
 #[derive(Clone, Default)]
 pub struct InMemoryDatastore {
     documents: std::sync::Arc<std::sync::Mutex<BTreeMap<String, MapValue>>>,
+    /// Monotonic per-document versions standing in for the backend's `updateTime`, so that
+    /// transaction preconditions can be enforced locally.
+    versions: std::sync::Arc<std::sync::Mutex<VersionTable>>,
+}
+
+#[derive(Default)]
+struct VersionTable {
+    next: i64,
+    by_path: BTreeMap<String, Timestamp>,
 }
 
 impl InMemoryDatastore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn bump_version(&self, canonical: &str) {
+        let mut table = self.versions.lock().unwrap();
+        table.next += 1;
+        let version = Timestamp::new(table.next, 0);
+        table.by_path.insert(canonical.to_string(), version);
+    }
+
+    fn forget_version(&self, canonical: &str) {
+        self.versions.lock().unwrap().by_path.remove(canonical);
+    }
+
+    fn version_of(&self, canonical: &str) -> Option<Timestamp> {
+        self.versions.lock().unwrap().by_path.get(canonical).copied()
+    }
+
+    fn check_precondition(&self, key: &DocumentKey, precondition: &Precondition) -> FirestoreResult<()> {
+        let canonical = key.path().canonical_string();
+        let current = self.version_of(&canonical);
+        match precondition {
+            Precondition::None => Ok(()),
+            Precondition::Exists(true) if current.is_none() => {
+                Err(not_found(format!("No document to update: {canonical}")))
+            }
+            Precondition::Exists(false) if current.is_some() => {
+                Err(already_exists(format!("Document already exists: {canonical}")))
+            }
+            Precondition::Exists(_) => Ok(()),
+            Precondition::UpdateTime(expected) => match current {
+                Some(actual) if actual == *expected => Ok(()),
+                Some(actual) => Err(failed_precondition(format!(
+                    "the stored version ({}) does not match the required base version ({}) for {canonical}",
+                    actual.seconds, expected.seconds
+                ))),
+                None => Err(failed_precondition(format!(
+                    "the stored document was deleted; required base version {} for {canonical}",
+                    expected.seconds
+                ))),
+            },
+        }
+    }
+
+    fn snapshot_for(&self, key: &DocumentKey, data: Option<MapValue>) -> DocumentSnapshot {
+        let update_time = self.version_of(&key.path().canonical_string());
+        DocumentSnapshot::new(key.clone(), data, SnapshotMetadata::new(false, false))
+            .with_times(update_time, update_time)
     }
 
     fn apply_set(
@@ -51,7 +109,9 @@ impl InMemoryDatastore {
 
         apply_field_transforms(&mut fields, &transforms)?;
 
-        store.insert(canonical, MapValue::new(fields));
+        store.insert(canonical.clone(), MapValue::new(fields));
+        drop(store);
+        self.bump_version(&canonical);
         Ok(())
     }
 
@@ -79,14 +139,37 @@ impl InMemoryDatastore {
 
         apply_field_transforms(&mut fields, &transforms)?;
 
-        store.insert(canonical, MapValue::new(fields));
+        store.insert(canonical.clone(), MapValue::new(fields));
+        drop(store);
+        self.bump_version(&canonical);
         Ok(())
     }
 
     fn apply_delete(&self, key: DocumentKey) -> FirestoreResult<()> {
+        let canonical = key.path().canonical_string();
         let mut store = self.documents.lock().unwrap();
-        store.remove(&key.path().canonical_string());
+        store.remove(&canonical);
+        drop(store);
+        self.forget_version(&canonical);
         Ok(())
+    }
+
+    fn apply_write(&self, write: WriteOperation) -> FirestoreResult<()> {
+        match write {
+            WriteOperation::Set {
+                key,
+                data,
+                mask,
+                transforms,
+            } => self.apply_set(key, data, mask, transforms),
+            WriteOperation::Update {
+                key,
+                data,
+                field_paths,
+                transforms,
+            } => self.apply_update(key, data, field_paths, transforms),
+            WriteOperation::Delete { key } => self.apply_delete(key),
+        }
     }
 }
 
@@ -145,29 +228,59 @@ impl Datastore for InMemoryDatastore {
 
     async fn commit(&self, writes: Vec<WriteOperation>) -> FirestoreResult<()> {
         for write in writes {
-            match write {
-                WriteOperation::Set {
-                    key,
-                    data,
-                    mask,
-                    transforms,
-                } => {
-                    self.apply_set(key, data, mask, transforms)?;
-                }
-                WriteOperation::Update {
-                    key,
-                    data,
-                    field_paths,
-                    transforms,
-                } => {
-                    self.apply_update(key, data, field_paths, transforms)?;
-                }
-                WriteOperation::Delete { key } => {
-                    self.apply_delete(key)?;
-                }
-            }
+            self.apply_write(write)?;
         }
         Ok(())
+    }
+
+    async fn commit_with_results(&self, writes: Vec<WriteOperation>) -> FirestoreResult<CommitResult> {
+        let mut write_results = Vec::with_capacity(writes.len());
+        for write in writes {
+            let canonical = write.key().path().canonical_string();
+            self.apply_write(write)?;
+            write_results.push(WriteResultInfo {
+                update_time: self.version_of(&canonical),
+            });
+        }
+        Ok(CommitResult {
+            write_results,
+            commit_time: self.versions.lock().unwrap().by_path.values().max().copied(),
+        })
+    }
+
+    async fn batch_get_documents(&self, keys: &[DocumentKey]) -> FirestoreResult<Vec<DocumentSnapshot>> {
+        let store = self.documents.lock().unwrap();
+        Ok(keys
+            .iter()
+            .map(|key| {
+                let data = store.get(&key.path().canonical_string()).cloned();
+                self.snapshot_for(key, data)
+            })
+            .collect())
+    }
+
+    async fn commit_conditional(&self, writes: Vec<ConditionalWrite>) -> FirestoreResult<CommitResult> {
+        // Check every precondition before applying anything so the commit stays atomic.
+        for write in &writes {
+            self.check_precondition(write.key(), write.precondition())?;
+        }
+        let mut write_results = Vec::with_capacity(writes.len());
+        for write in writes {
+            match write {
+                ConditionalWrite::Write { operation, .. } => {
+                    let canonical = operation.key().path().canonical_string();
+                    self.apply_write(operation)?;
+                    write_results.push(WriteResultInfo {
+                        update_time: self.version_of(&canonical),
+                    });
+                }
+                ConditionalWrite::Verify { .. } => write_results.push(WriteResultInfo::default()),
+            }
+        }
+        Ok(CommitResult {
+            write_results,
+            commit_time: self.versions.lock().unwrap().by_path.values().max().copied(),
+        })
     }
 
     async fn run_aggregate(

@@ -12,6 +12,13 @@ pub enum FirestoreErrorCode {
     Unavailable,
     DeadlineExceeded,
     ResourceExhausted,
+    /// The operation was aborted, typically because of a transaction conflict. Transactions
+    /// retry automatically on this code.
+    Aborted,
+    /// A precondition failed, e.g. an `update` on a missing document or a stale transaction.
+    FailedPrecondition,
+    /// A `create` precondition failed because the document already exists.
+    AlreadyExists,
 }
 
 impl FirestoreErrorCode {
@@ -26,6 +33,9 @@ impl FirestoreErrorCode {
             FirestoreErrorCode::Unavailable => "firestore/unavailable",
             FirestoreErrorCode::DeadlineExceeded => "firestore/deadline-exceeded",
             FirestoreErrorCode::ResourceExhausted => "firestore/resource-exhausted",
+            FirestoreErrorCode::Aborted => "firestore/aborted",
+            FirestoreErrorCode::FailedPrecondition => "firestore/failed-precondition",
+            FirestoreErrorCode::AlreadyExists => "firestore/already-exists",
         }
     }
 }
@@ -96,4 +106,16 @@ pub fn deadline_exceeded(message: impl Into<String>) -> FirestoreError {
 
 pub fn resource_exhausted(message: impl Into<String>) -> FirestoreError {
     FirestoreError::new(FirestoreErrorCode::ResourceExhausted, message)
+}
+
+pub fn aborted(message: impl Into<String>) -> FirestoreError {
+    FirestoreError::new(FirestoreErrorCode::Aborted, message)
+}
+
+pub fn failed_precondition(message: impl Into<String>) -> FirestoreError {
+    FirestoreError::new(FirestoreErrorCode::FailedPrecondition, message)
+}
+
+pub fn already_exists(message: impl Into<String>) -> FirestoreError {
+    FirestoreError::new(FirestoreErrorCode::AlreadyExists, message)
 }

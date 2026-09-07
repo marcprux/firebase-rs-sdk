@@ -7,7 +7,7 @@ use crate::firestore::api::{
 };
 use crate::firestore::error::{invalid_argument, resource_exhausted, FirestoreResult};
 use crate::firestore::model::DocumentKey;
-use crate::firestore::remote::datastore::{Datastore, WriteOperation};
+use crate::firestore::remote::datastore::{CommitResult, Datastore, WriteOperation};
 use crate::firestore::value::FirestoreValue;
 
 use super::reference::DocumentReference;
@@ -136,6 +136,12 @@ impl WriteBatch {
     /// `packages/firestore/src/lite-api/write_batch.ts`.
     pub async fn commit(self) -> FirestoreResult<()> {
         self.datastore.commit(self.writes).await
+    }
+
+    /// Commits the batch and returns the backend's per-write results (update times) and the
+    /// commit time, mirroring the `WriteResult`s of the Firestore Admin SDKs.
+    pub async fn commit_with_results(self) -> FirestoreResult<CommitResult> {
+        self.datastore.commit_with_results(self.writes).await
     }
 
     fn ensure_same_firestore(&self, other: &Firestore) -> FirestoreResult<()> {

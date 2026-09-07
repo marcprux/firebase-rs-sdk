@@ -9,7 +9,7 @@ use futures::future::LocalBoxFuture;
 
 use crate::firestore::api::snapshot::DocumentSnapshot;
 use crate::firestore::error::FirestoreResult;
-use crate::firestore::model::{DocumentKey, FieldPath};
+use crate::firestore::model::{DocumentKey, FieldPath, Timestamp};
 use crate::firestore::value::{FirestoreValue, MapValue};
 use crate::firestore::AggregateDefinition;
 use crate::firestore::FieldTransform;
@@ -50,6 +50,72 @@ impl WriteOperation {
         match self {
             WriteOperation::Set { key, .. } | WriteOperation::Update { key, .. } | WriteOperation::Delete { key } => {
                 key
+            }
+        }
+    }
+}
+
+/// Outcome of a single write inside a commit, mirroring `google.firestore.v1.WriteResult`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct WriteResultInfo {
+    /// The time the document was last updated after this write. `None` when the write was a
+    /// no-op (for example deleting a missing document) or the backend omitted it.
+    pub update_time: Option<Timestamp>,
+}
+
+/// Outcome of a `documents:commit` call.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct CommitResult {
+    /// One entry per write, in request order.
+    pub write_results: Vec<WriteResultInfo>,
+    /// The time at which the commit occurred, when reported by the backend.
+    pub commit_time: Option<Timestamp>,
+}
+
+/// Condition a write must satisfy for the whole commit to be applied.
+///
+/// Mirrors `google.firestore.v1.Precondition`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum Precondition {
+    /// No condition.
+    #[default]
+    None,
+    /// The document must (`true`) or must not (`false`) exist.
+    Exists(bool),
+    /// The document's current `updateTime` must equal this value.
+    UpdateTime(Timestamp),
+}
+
+/// A write with an attached precondition, or a pure verification, as sent by transactions.
+#[derive(Clone, Debug)]
+pub enum ConditionalWrite {
+    /// Apply `operation` if `precondition` holds.
+    Write {
+        operation: WriteOperation,
+        precondition: Precondition,
+    },
+    /// Apply nothing, but fail the commit unless `precondition` holds for `key`
+    /// (`google.firestore.v1.Write.verify`).
+    Verify {
+        key: DocumentKey,
+        precondition: Precondition,
+    },
+}
+
+impl ConditionalWrite {
+    /// The document targeted by this entry.
+    pub fn key(&self) -> &DocumentKey {
+        match self {
+            ConditionalWrite::Write { operation, .. } => operation.key(),
+            ConditionalWrite::Verify { key, .. } => key,
+        }
+    }
+
+    /// The precondition attached to this entry.
+    pub fn precondition(&self) -> &Precondition {
+        match self {
+            ConditionalWrite::Write { precondition, .. } | ConditionalWrite::Verify { precondition, .. } => {
+                precondition
             }
         }
     }
@@ -97,6 +163,38 @@ pub trait Datastore: Send + Sync + 'static {
         query: &QueryDefinition,
         aggregations: &[AggregateDefinition],
     ) -> FirestoreResult<BTreeMap<String, FirestoreValue>>;
+
+    /// Commits `writes` and returns the per-write results. The default delegates to
+    /// [`commit`](Self::commit) and reports no update times.
+    async fn commit_with_results(&self, writes: Vec<WriteOperation>) -> FirestoreResult<CommitResult> {
+        let count = writes.len();
+        self.commit(writes).await?;
+        Ok(CommitResult {
+            write_results: vec![WriteResultInfo::default(); count],
+            commit_time: None,
+        })
+    }
+
+    /// Reads several documents in one round trip (`documents:batchGet`), returning one snapshot
+    /// per key in request order with `update_time` populated for existing documents. The default
+    /// performs individual reads.
+    async fn batch_get_documents(&self, keys: &[DocumentKey]) -> FirestoreResult<Vec<DocumentSnapshot>> {
+        let mut snapshots = Vec::with_capacity(keys.len());
+        for key in keys {
+            snapshots.push(self.get_document(key).await?);
+        }
+        Ok(snapshots)
+    }
+
+    /// Atomically commits writes that carry preconditions, as produced by transactions. The
+    /// commit must fail as a whole with `failed-precondition` (or `already-exists` /
+    /// `not-found` for existence checks) when any precondition does not hold.
+    async fn commit_conditional(&self, writes: Vec<ConditionalWrite>) -> FirestoreResult<CommitResult> {
+        let _ = writes;
+        Err(crate::firestore::error::internal_error(
+            "this datastore does not support conditional writes",
+        ))
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]

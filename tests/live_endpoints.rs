@@ -775,6 +775,72 @@ fn auth_error_variant(err: &AuthError) -> &'static str {
 // Firestore
 // ---------------------------------------------------------------------------------------------
 
+/// Everything a live Firestore test needs: an anonymous user (so the security rules that require
+/// `request.auth != null` pass) and an authenticated client.
+struct LiveFirestore {
+    app: FirebaseApp,
+    auth: Arc<firebase_rs_sdk::auth::Auth>,
+    client: FirestoreClient,
+    firestore: Firestore,
+}
+
+impl LiveFirestore {
+    async fn connect(config: &LiveConfig, label: &str) -> Self {
+        let app = live_app(config, label).await;
+        let firestore = Firestore::from_arc(get_firestore(Some(app.clone())).await.expect("firestore service"));
+        register_auth_component();
+        let auth = auth_for_app(app.clone()).expect("auth service");
+        let client = if auth.sign_in_anonymously().await.is_ok() {
+            FirestoreClient::with_http_datastore_authenticated(firestore.clone(), auth.token_provider(), None)
+        } else {
+            eprintln!("firestore: anonymous auth unavailable, continuing unauthenticated");
+            FirestoreClient::with_http_datastore(firestore.clone())
+        }
+        .expect("firestore client");
+        Self {
+            app,
+            auth,
+            client,
+            firestore,
+        }
+    }
+
+    /// Prints a `SKIP:` line and returns `true` when `err` means the project is not provisioned
+    /// for this test (API disabled, no database, or rules that deny the scratch collection).
+    fn skip_if_unprovisioned(&self, test: &str, err: &firebase_rs_sdk::firestore::FirestoreError) -> bool {
+        let text = err.to_string();
+        if let Some(reason) = provisioning_skip_reason(&text) {
+            skip(test, &reason, &text);
+            return true;
+        }
+        if matches!(
+            err.code,
+            FirestoreErrorCode::PermissionDenied | FirestoreErrorCode::Unauthenticated
+        ) {
+            skip(
+                test,
+                "Firestore security rules deny writes to `rust_sdk_live_tests`. Allow read/write on that \
+                 collection for authenticated users (the test signs in anonymously when the provider is \
+                 enabled).",
+                &text,
+            );
+            return true;
+        }
+        false
+    }
+
+    async fn teardown(self) {
+        cleanup_auth(&self.auth).await;
+        delete_app(&self.app).await.ok();
+    }
+}
+
+const LIVE_COLLECTION: &str = "rust_sdk_live_tests";
+
+fn integer_field(snapshot: &firebase_rs_sdk::firestore::DocumentSnapshot, field: &str) -> i64 {
+    snapshot.data().and_then(|d| field_integer(d, field)).unwrap_or(0)
+}
+
 #[tokio::test]
 #[ignore = "requires live Firebase credentials"]
 async fn firestore_document_crud_and_query() {
@@ -782,59 +848,26 @@ async fn firestore_document_crud_and_query() {
     let Some(config) = require_config(test) else {
         return;
     };
-    let app = live_app(&config, "fs").await;
-    let firestore = get_firestore(Some(app.clone())).await.expect("firestore service");
-    let firestore = Firestore::from_arc(firestore);
+    let live = LiveFirestore::connect(&config, "fs").await;
+    let client = &live.client;
 
-    // Sign in anonymously when possible so that security rules requiring `request.auth != null`
-    // are satisfied; fall back to unauthenticated access otherwise.
-    register_auth_component();
-    let auth = auth_for_app(app.clone()).expect("auth service");
-    let authenticated = auth.sign_in_anonymously().await.is_ok();
-    let client = if authenticated {
-        FirestoreClient::with_http_datastore_authenticated(firestore.clone(), auth.token_provider(), None)
-    } else {
-        eprintln!("firestore: anonymous auth unavailable, continuing unauthenticated");
-        FirestoreClient::with_http_datastore(firestore.clone())
-    }
-    .expect("firestore client");
-
-    let collection = "rust_sdk_live_tests";
     let marker = nonce();
     let mut data = BTreeMap::new();
     data.insert("marker".to_string(), FirestoreValue::from_string(marker.clone()));
     data.insert("count".to_string(), FirestoreValue::from_integer(1));
     data.insert("active".to_string(), FirestoreValue::from_bool(true));
 
-    let added = match client.add_doc(collection, data).await {
+    let added = match client.add_doc(LIVE_COLLECTION, data).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
-            let text = err.to_string();
-            if let Some(reason) = provisioning_skip_reason(&text) {
-                skip(test, &reason, &text);
-                cleanup_auth(&auth).await;
-                delete_app(&app).await.ok();
+            if live.skip_if_unprovisioned(test, &err) {
+                live.teardown().await;
                 return;
             }
-            if matches!(
-                err.code,
-                FirestoreErrorCode::PermissionDenied | FirestoreErrorCode::Unauthenticated
-            ) {
-                skip(
-                    test,
-                    "Firestore security rules deny writes to `rust_sdk_live_tests`. Allow read/write on that \
-                     collection for authenticated users (the test signs in anonymously when the provider is \
-                     enabled).",
-                    &text,
-                );
-                cleanup_auth(&auth).await;
-                delete_app(&app).await.ok();
-                return;
-            }
-            panic!("add_doc failed: {text}");
+            panic!("add_doc failed: {err}");
         }
     };
-    let doc_path = format!("{collection}/{}", added.id());
+    let doc_path = format!("{LIVE_COLLECTION}/{}", added.id());
 
     let fetched = client.get_doc(&doc_path).await.expect("get_doc");
     assert!(fetched.exists(), "document must exist after add_doc");
@@ -848,8 +881,9 @@ async fn firestore_document_crud_and_query() {
     let updated = client.get_doc(&doc_path).await.expect("get_doc after update");
     assert_eq!(field_integer(updated.data().expect("data"), "count"), Some(2));
 
-    let query = firestore
-        .collection(collection)
+    let query = live
+        .firestore
+        .collection(LIVE_COLLECTION)
         .expect("collection")
         .query()
         .where_field(
@@ -862,12 +896,284 @@ async fn firestore_document_crud_and_query() {
     assert_eq!(results.documents().len(), 1, "query by marker must return exactly our document");
     assert_eq!(results.documents()[0].id(), added.id());
 
+    // A batch commit reports the backend's update time for each write.
+    let doc_ref = live.firestore.doc(&doc_path).expect("doc ref");
+    let mut batch = client.batch();
+    let mut patch = BTreeMap::new();
+    patch.insert("count".to_string(), FirestoreValue::from_integer(3));
+    batch.update(&doc_ref, patch).expect("batch update");
+    let commit = batch.commit_with_results().await.expect("commit_with_results");
+    assert_eq!(commit.write_results.len(), 1);
+    assert!(commit.write_results[0].update_time.is_some(), "backend must report updateTime");
+    assert!(commit.commit_time.is_some(), "backend must report commitTime");
+
     client.delete_doc(&doc_path).await.expect("delete_doc");
     let gone = client.get_doc(&doc_path).await.expect("get_doc after delete");
     assert!(!gone.exists(), "document must not exist after delete");
 
-    cleanup_auth(&auth).await;
-    delete_app(&app).await.expect("delete_app");
+    live.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn firestore_transaction_read_modify_write() {
+    let test = "firestore_transaction_read_modify_write";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    let live = LiveFirestore::connect(&config, "fs-txn").await;
+    let client = &live.client;
+    let path = format!("{LIVE_COLLECTION}/txn-{}", nonce());
+    let counter = live.firestore.doc(&path).expect("doc ref");
+
+    let mut seed = BTreeMap::new();
+    seed.insert("total".to_string(), FirestoreValue::from_integer(10));
+    if let Err(err) = client.set_doc(&path, seed, None).await {
+        if live.skip_if_unprovisioned(test, &err) {
+            live.teardown().await;
+            return;
+        }
+        panic!("seed set_doc failed: {err}");
+    }
+
+    let attempts = Arc::new(Mutex::new(0usize));
+    let returned = client
+        .run_transaction(|txn| {
+            let counter = counter.clone();
+            let attempts = Arc::clone(&attempts);
+            async move {
+                *attempts.lock().unwrap() += 1;
+                let snapshot = txn.get(&counter).await?;
+                assert!(snapshot.exists(), "seeded document must be visible inside the transaction");
+                let next = integer_field(&snapshot, "total") + 1;
+                let mut data = BTreeMap::new();
+                data.insert("total".to_string(), FirestoreValue::from_integer(next));
+                txn.set(&counter, data, None)?;
+                Ok(next)
+            }
+        })
+        .await
+        .expect("run_transaction");
+    assert_eq!(returned, 11);
+    assert_eq!(*attempts.lock().unwrap(), 1, "an uncontended transaction commits first time");
+
+    let stored = client.get_doc(&path).await.expect("get_doc");
+    assert_eq!(integer_field(&stored, "total"), 11);
+
+    // A read-only transaction with no writes commits cleanly and returns the closure value.
+    let seen = client
+        .run_transaction(|txn| {
+            let counter = counter.clone();
+            async move { Ok(integer_field(&txn.get(&counter).await?, "total")) }
+        })
+        .await
+        .expect("read-only transaction");
+    assert_eq!(seen, 11);
+
+    client.delete_doc(&path).await.expect("cleanup");
+    live.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn firestore_concurrent_transactions_serialize() {
+    let test = "firestore_concurrent_transactions_serialize";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    let live = LiveFirestore::connect(&config, "fs-txn-race").await;
+    let client = &live.client;
+    let path = format!("{LIVE_COLLECTION}/race-{}", nonce());
+    let counter = live.firestore.doc(&path).expect("doc ref");
+
+    let mut seed = BTreeMap::new();
+    seed.insert("total".to_string(), FirestoreValue::from_integer(0));
+    if let Err(err) = client.set_doc(&path, seed, None).await {
+        if live.skip_if_unprovisioned(test, &err) {
+            live.teardown().await;
+            return;
+        }
+        panic!("seed set_doc failed: {err}");
+    }
+
+    // Two transactions race on the same document. Firestore must serialise them: whichever
+    // commits second either waited for the first or was aborted and re-run, so the final
+    // total is exactly 2 with no lost update.
+    let attempts = Arc::new(Mutex::new(0usize));
+    let increment = |label: &'static str| {
+        let counter = counter.clone();
+        let attempts = Arc::clone(&attempts);
+        async move {
+            client
+                .run_transaction(move |txn| {
+                    let counter = counter.clone();
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        *attempts.lock().unwrap() += 1;
+                        let current = integer_field(&txn.get(&counter).await?, "total");
+                        let mut data = BTreeMap::new();
+                        data.insert("total".to_string(), FirestoreValue::from_integer(current + 1));
+                        data.insert("last_writer".to_string(), FirestoreValue::from_string(label));
+                        txn.set(&counter, data, None)?;
+                        Ok(current + 1)
+                    }
+                })
+                .await
+        }
+    };
+    let (first, second) = tokio::join!(increment("first"), increment("second"));
+    let first = first.expect("first transaction");
+    let second = second.expect("second transaction");
+    let mut results = vec![first, second];
+    results.sort_unstable();
+    assert_eq!(results, vec![1, 2], "each transaction must observe the other's increment");
+
+    let stored = client.get_doc(&path).await.expect("get_doc");
+    assert_eq!(integer_field(&stored, "total"), 2, "no lost update");
+    eprintln!(
+        "concurrent transactions: {} closure invocations for 2 commits",
+        *attempts.lock().unwrap()
+    );
+
+    client.delete_doc(&path).await.expect("cleanup");
+    live.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn firestore_transaction_rolls_back_on_closure_error() {
+    let test = "firestore_transaction_rolls_back_on_closure_error";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    let live = LiveFirestore::connect(&config, "fs-txn-rollback").await;
+    let client = &live.client;
+    let path = format!("{LIVE_COLLECTION}/rollback-{}", nonce());
+    let doc_ref = live.firestore.doc(&path).expect("doc ref");
+
+    // Probe provisioning with a real write first so the skip logic stays uniform.
+    let mut probe = BTreeMap::new();
+    probe.insert("probe".to_string(), FirestoreValue::from_bool(true));
+    if let Err(err) = client.set_doc(&path, probe, None).await {
+        if live.skip_if_unprovisioned(test, &err) {
+            live.teardown().await;
+            return;
+        }
+        panic!("probe set_doc failed: {err}");
+    }
+    client.delete_doc(&path).await.expect("probe cleanup");
+
+    let calls = Arc::new(Mutex::new(0usize));
+    let err = client
+        .run_transaction(|txn| {
+            let doc_ref = doc_ref.clone();
+            let calls = Arc::clone(&calls);
+            async move {
+                *calls.lock().unwrap() += 1;
+                let mut data = BTreeMap::new();
+                data.insert("should_not_persist".to_string(), FirestoreValue::from_bool(true));
+                txn.set(&doc_ref, data, None)?;
+                Err::<(), _>(firebase_rs_sdk::firestore::invalid_argument("business rule violated"))
+            }
+        })
+        .await
+        .expect_err("closure error must propagate");
+    assert_eq!(err.code, FirestoreErrorCode::InvalidArgument);
+    assert_eq!(*calls.lock().unwrap(), 1, "invalid-argument is not retried");
+
+    let after = client.get_doc(&path).await.expect("get_doc");
+    assert!(!after.exists(), "staged write must have been rolled back");
+
+    live.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires live Firebase credentials"]
+async fn firestore_transaction_verifies_documents_it_only_read() {
+    let test = "firestore_transaction_verifies_documents_it_only_read";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    let live = LiveFirestore::connect(&config, "fs-txn-verify").await;
+    let client = &live.client;
+    let tag = nonce();
+    let source_path = format!("{LIVE_COLLECTION}/verify-src-{tag}");
+    let target_path = format!("{LIVE_COLLECTION}/verify-dst-{tag}");
+    let source = live.firestore.doc(&source_path).expect("doc ref");
+    let target = live.firestore.doc(&target_path).expect("doc ref");
+
+    let mut seed = BTreeMap::new();
+    seed.insert("total".to_string(), FirestoreValue::from_integer(100));
+    if let Err(err) = client.set_doc(&source_path, seed, None).await {
+        if live.skip_if_unprovisioned(test, &err) {
+            live.teardown().await;
+            return;
+        }
+        panic!("seed set_doc failed: {err}");
+    }
+
+    // The closure reads `source` and only writes `target`. On the first attempt another writer
+    // changes `source` between the read and the commit; the commit must fail on the `verify`
+    // precondition and the closure must run again, now observing the new value.
+    let attempts = Arc::new(Mutex::new(0usize));
+    let interfering = client.clone();
+    let copied = client
+        .run_transaction(|txn| {
+            let (source, target) = (source.clone(), target.clone());
+            let attempts = Arc::clone(&attempts);
+            let interfering = interfering.clone();
+            let source_path = source_path.clone();
+            async move {
+                let attempt = {
+                    let mut guard = attempts.lock().unwrap();
+                    *guard += 1;
+                    *guard
+                };
+                let snapshot = txn.get(&source).await?;
+                assert!(snapshot.update_time().is_some(), "live reads must report updateTime");
+                let total = integer_field(&snapshot, "total");
+                if attempt == 1 {
+                    let mut bump = BTreeMap::new();
+                    bump.insert("total".to_string(), FirestoreValue::from_integer(total + 1));
+                    interfering.update_doc(&source_path, bump).await?;
+                }
+                let mut data = BTreeMap::new();
+                data.insert("copied_total".to_string(), FirestoreValue::from_integer(total));
+                txn.set(&target, data, None)?;
+                Ok(total)
+            }
+        })
+        .await
+        .expect("transaction with verify retry");
+
+    assert_eq!(*attempts.lock().unwrap(), 2, "the stale read must force exactly one retry");
+    assert_eq!(copied, 101, "the retry must observe the interfering write");
+    let stored = client.get_doc(&target_path).await.expect("get target");
+    assert_eq!(integer_field(&stored, "copied_total"), 101);
+
+    // Updating a document that was read as missing is rejected client-side, as in the JS SDK.
+    let ghost = live
+        .firestore
+        .doc(&format!("{LIVE_COLLECTION}/ghost-{tag}"))
+        .expect("doc ref");
+    let err = client
+        .run_transaction(|txn| {
+            let ghost = ghost.clone();
+            async move {
+                let _ = txn.get(&ghost).await?;
+                let mut data = BTreeMap::new();
+                data.insert("x".to_string(), FirestoreValue::from_integer(1));
+                txn.update(&ghost, data)?;
+                Ok(())
+            }
+        })
+        .await
+        .expect_err("update of a missing document must fail");
+    assert_eq!(err.code, FirestoreErrorCode::InvalidArgument);
+
+    client.delete_doc(&source_path).await.expect("cleanup source");
+    client.delete_doc(&target_path).await.expect("cleanup target");
+    live.teardown().await;
 }
 
 async fn cleanup_auth(auth: &std::sync::Arc<firebase_rs_sdk::auth::Auth>) {

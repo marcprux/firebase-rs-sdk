@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::firestore::error::FirestoreResult;
+use crate::firestore::model::Timestamp;
 use crate::firestore::model::{DocumentKey, IntoFieldPath};
 use crate::firestore::value::{FirestoreValue, MapValue};
 
@@ -42,11 +43,37 @@ pub struct DocumentSnapshot {
     key: DocumentKey,
     data: Option<MapValue>,
     metadata: SnapshotMetadata,
+    create_time: Option<Timestamp>,
+    update_time: Option<Timestamp>,
 }
 
 impl DocumentSnapshot {
     pub fn new(key: DocumentKey, data: Option<MapValue>, metadata: SnapshotMetadata) -> Self {
-        Self { key, data, metadata }
+        Self {
+            key,
+            data,
+            metadata,
+            create_time: None,
+            update_time: None,
+        }
+    }
+
+    /// Attaches the backend `createTime` / `updateTime` of the document.
+    pub fn with_times(mut self, create_time: Option<Timestamp>, update_time: Option<Timestamp>) -> Self {
+        self.create_time = create_time;
+        self.update_time = update_time;
+        self
+    }
+
+    /// The time the document was created, when reported by the backend.
+    pub fn create_time(&self) -> Option<Timestamp> {
+        self.create_time
+    }
+
+    /// The time the document was last updated, when reported by the backend. Transactions use
+    /// it as the precondition for their writes.
+    pub fn update_time(&self) -> Option<Timestamp> {
+        self.update_time
     }
 
     /// Returns whether the document exists on the backend.
@@ -83,6 +110,11 @@ impl DocumentSnapshot {
     }
 
     /// Returns the identifier of the document represented by this snapshot.
+    /// Returns the key (full document path) of this snapshot.
+    pub fn key(&self) -> &DocumentKey {
+        &self.key
+    }
+
     pub fn id(&self) -> &str {
         self.key.id()
     }
