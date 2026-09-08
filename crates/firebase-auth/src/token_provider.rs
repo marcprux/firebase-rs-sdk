@@ -1,0 +1,59 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use crate::error::AuthError;
+use crate::Auth;
+use firebase_core::platform::token::{TokenError, TokenProvider, TokenProviderArc};
+
+pub struct AuthTokenProvider {
+    auth: Arc<Auth>,
+    force_refresh: AtomicBool,
+}
+
+impl AuthTokenProvider {
+    /// Exposes Firebase Auth as a [`TokenProvider`] for any product that sends credentials.
+    pub fn new(auth: Arc<Auth>) -> Self {
+        Self {
+            auth,
+            force_refresh: AtomicBool::new(false),
+        }
+    }
+
+    /// Converts the provider into an `Arc` the products can hold.
+    pub fn into_arc(self) -> TokenProviderArc {
+        Arc::new(self)
+    }
+}
+
+impl Clone for AuthTokenProvider {
+    fn clone(&self) -> Self {
+        Self {
+            auth: self.auth.clone(),
+            force_refresh: AtomicBool::new(self.force_refresh.load(Ordering::SeqCst)),
+        }
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl TokenProvider for AuthTokenProvider {
+    async fn get_token(&self) -> Result<Option<String>, TokenError> {
+        let force_refresh = self.force_refresh.swap(false, Ordering::SeqCst);
+        self.auth.get_token(force_refresh).await.map_err(map_auth_error)
+    }
+
+    fn invalidate_token(&self) {
+        self.force_refresh.store(true, Ordering::SeqCst);
+    }
+}
+
+fn map_auth_error(error: AuthError) -> TokenError {
+    // Auth does not decide what a credential failure means for the caller's error type; the product
+    // consuming the token maps this at its own boundary.
+    TokenError::new(error.to_string())
+}
+
+/// Convenience helper that wraps an `Auth` instance into a token provider arc.
+pub fn auth_token_provider_arc(auth: Arc<Auth>) -> TokenProviderArc {
+    AuthTokenProvider::new(auth).into_arc()
+}

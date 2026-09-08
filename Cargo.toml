@@ -1,64 +1,61 @@
-[package]
-name = "firebase-rs-sdk"
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# Shared metadata: the products are versioned and released together, as one SDK.
+[workspace.package]
 version = "1.34.1"
 edition = "2021"
-description = "Rust port of the Firebase JS SDK"
-readme = "README.md"
-repository = "https://github.com/marcprux/firebase-rs-sdk"
-keywords = ["firebase", "sdk", "webassembly", "ai", "firestore"]
-categories = ["api-bindings", "authentication", "database", "wasm", "web-programming"]
-license = "Apache-2.0"
-authors = ["Duccio Marco Gasparri", "Marc Prud'hommeaux"]
 rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/marcprux/firebase-rs-sdk"
+authors = ["Duccio Marco Gasparri", "Marc Prud'hommeaux"]
 
-# which files go into the published tarball
-include = [
-  "examples/**",
-  "src/**",
-  "proto/**",
-  "Cargo.toml",
-  "LICENSE*",
-  "./RUSTDOC.md",
-  "./README.md"
-]
-
-[features]
-default = []
-wasm-web = ["wasm-bindgen", "js-sys", "web-sys", "wasm-bindgen-futures"]
-# ai-http = []
-experimental-indexed-db = []
-# firestore = []
-
-[dependencies]
-chrono = { version = "0.4", features = ["clock"] }
-serde_json = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-base64 = { version = "0.22", default-features = false, features = ["std"] }
-sha1 = "0.10"
-rand = "0.8"
-percent-encoding = "2"
-url = "2"
-sha2 = { version = "0.10.9", features = ["std"] }
-once_cell = "1.19"
-async-trait = "0.1"
+# One version of each third-party crate across the workspace. Target-specific entries (reqwest,
+# tokio) stay in the member manifests, because their feature sets differ between native and wasm.
+[workspace.dependencies]
+async-channel = "1"
 async-lock = "3"
+async-trait = "0.1"
+base64 = { version = "0.22", default-features = false, features = ["std"] }
 bytes = "1"
+chrono = { version = "0.4", features = ["clock"] }
 futures = { version = "0.3", default-features = false, features = ["executor", "std"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-async-channel = "1"
+getrandom = { version = "0.2", features = ["js"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+httpmock = "0.7"
+js-sys = "0.3"
 log = "0.4"
+once_cell = "1.19"
+percent-encoding = "2"
+prost = "0.12"
+prost-types = "0.12"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha1 = "0.10"
+sha2 = { version = "0.10.9", features = ["std"] }
+tokio-stream = "0.1"
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["rustls-tls-native-roots", "connect"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tonic = { version = "0.11", default-features = false, features = ["codegen", "prost", "transport", "tls", "tls-roots"] }
+url = "2"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+firebase-core = { path = "crates/firebase-core", version = "1.34.1" }
 
-[dependencies.wasm-bindgen]
-version = "0.2"
-optional = true
+[workspace.dependencies.reqwest]
+version = "0.11"
+default-features = false
+features = ["blocking", "json", "rustls-tls", "stream"]
 
-[dependencies.js-sys]
+[workspace.dependencies.tokio]
+version = "1"
+features = ["rt", "time", "net", "sync"]
+
+[workspace.dependencies.web-sys]
 version = "0.3"
-optional = true
-
-[dependencies.web-sys]
-version = "0.3"
-optional = true
 features = [
     "Window",
     "Document",
@@ -110,48 +107,118 @@ features = [
     "Notification",
     "NotificationPermission",
     "RegistrationOptions",
-    "ServiceWorkerUpdateViaCache",
+    "ServiceWorkerUpdateViaCache",]
+
+[package]
+name = "firebase-rs-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Rust port of the Firebase JS SDK"
+readme = "README.md"
+keywords = ["firebase", "sdk", "webassembly", "ai", "firestore"]
+categories = ["api-bindings", "authentication", "database", "wasm", "web-programming"]
+
+# which files go into the published tarball
+include = [
+  "examples/**",
+  "src/**",
+  "Cargo.toml",
+  "LICENSE*",
+  "./RUSTDOC.md",
+  "./README.md"
 ]
 
-[dependencies.wasm-bindgen-futures]
-version = "0.4"
-optional = true
+[features]
+# Every product is on by default, so depending on this crate behaves as it always has. Depend with
+# `default-features = false` and name the products you use to stop compiling the rest: a Remote
+# Config user has no reason to build gRPC, websockets or the Firestore proto bindings.
+default = ["ai", "analytics", "app-check", "auth", "data-connect", "database", "firestore", "functions", "installations", "messaging", "performance", "remote-config", "storage"]
+
+auth = ["dep:firebase-auth"]
+ai = ["dep:firebase-ai"]
+performance = ["dep:firebase-performance"]
+data-connect = ["dep:firebase-data-connect"]
+firestore = ["dep:firebase-firestore"]
+database = ["dep:firebase-database"]
+functions = ["dep:firebase-functions"]
+storage = ["dep:firebase-storage"]
+analytics = ["dep:firebase-analytics"]
+remote-config = ["dep:firebase-remote-config"]
+messaging = ["dep:firebase-messaging"]
+app-check = ["dep:firebase-app-check"]
+installations = ["dep:firebase-installations"]
+
+experimental-indexed-db = ["firebase-core/experimental-indexed-db", "firebase-app-check?/experimental-indexed-db", "firebase-messaging?/experimental-indexed-db", "firebase-remote-config?/experimental-indexed-db", "firebase-analytics?/experimental-indexed-db", "firebase-storage?/experimental-indexed-db", "firebase-functions?/experimental-indexed-db", "firebase-database?/experimental-indexed-db", "firebase-firestore?/experimental-indexed-db", "firebase-data-connect?/experimental-indexed-db", "firebase-performance?/experimental-indexed-db", "firebase-ai?/experimental-indexed-db", "firebase-auth?/experimental-indexed-db", "firebase-installations?/experimental-indexed-db"]
+wasm-web = [
+    "firebase-core/wasm-web",
+    "firebase-app-check?/wasm-web",
+    "firebase-messaging?/wasm-web",
+    "firebase-remote-config?/wasm-web",
+    "firebase-analytics?/wasm-web",
+    "firebase-storage?/wasm-web",
+    "firebase-functions?/wasm-web",
+    "firebase-database?/wasm-web",
+    "firebase-firestore?/wasm-web",
+    "firebase-data-connect?/wasm-web",
+    "firebase-performance?/wasm-web",
+    "firebase-ai?/wasm-web",
+    "firebase-auth?/wasm-web",
+    "firebase-installations?/wasm-web",
+]
+
+[dependencies]
+firebase-core.workspace = true
+firebase-app-check = { path = "crates/firebase-app-check", version = "1.34.1", optional = true }
+firebase-messaging = { path = "crates/firebase-messaging", version = "1.34.1", optional = true }
+firebase-remote-config = { path = "crates/firebase-remote-config", version = "1.34.1", optional = true }
+firebase-analytics = { path = "crates/firebase-analytics", version = "1.34.1", optional = true }
+firebase-storage = { path = "crates/firebase-storage", version = "1.34.1", optional = true }
+firebase-functions = { path = "crates/firebase-functions", version = "1.34.1", optional = true }
+firebase-database = { path = "crates/firebase-database", version = "1.34.1", optional = true }
+firebase-firestore = { path = "crates/firebase-firestore", version = "1.34.1", optional = true }
+firebase-data-connect = { path = "crates/firebase-data-connect", version = "1.34.1", optional = true }
+firebase-performance = { path = "crates/firebase-performance", version = "1.34.1", optional = true }
+firebase-ai = { path = "crates/firebase-ai", version = "1.34.1", optional = true }
+firebase-auth = { path = "crates/firebase-auth", version = "1.34.1", optional = true }
+firebase-installations = { path = "crates/firebase-installations", version = "1.34.1", optional = true }
 
 [dev-dependencies]
+# The façade itself needs no third-party crates; these are for the examples and the integration
+# tests under `tests/`.
+async-trait.workspace = true
+base64.workspace = true
+futures.workspace = true
+rand.workspace = true
+serde.workspace = true
+# `test_support` (mock server, throwaway apps) is shared with the product crates.
+firebase-core = { workspace = true, features = ["test-support"] }
+firebase-app-check = { path = "crates/firebase-app-check", features = ["test-support"] }
 serde-wasm-bindgen = "0.5"
 webbrowser = "0.8"
+serde_json.workspace = true
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
-tokio = { version = "1", features = ["rt", "time", "net", "sync"] }
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["rustls-tls-native-roots", "connect"] }
-# Firestore `Listen` (onSnapshot) speaks gRPC; one-shot reads and writes stay on REST.
-tonic = { version = "0.11", default-features = false, features = ["codegen", "prost", "transport", "tls", "tls-roots"] }
-prost = "0.12"
-prost-types = "0.12"
-tokio-stream = "0.1"
-tokio-util = { version = "0.7", features = ["io"] }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-reqwest = { version = "0.11", default-features = false, features = ["json"] }
-getrandom = { version = "0.2", features = ["js"] }
-gloo-timers = { version = "0.3", features = ["futures"] }
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+httpmock.workspace = true
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "fs", "io-util"] }
+reqwest.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
+# The browser examples use the JS glue directly.
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+web-sys.workspace = true
+wasm-bindgen-futures.workspace = true
+# The browser build of reqwest takes a different feature set, as in the product crates.
+reqwest = { version = "0.11", default-features = false, features = ["json"] }
 tokio = { version = "1", features = ["macros", "rt", "io-util"] }
-
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-httpmock = "0.7"
-tokio = { version = "1", features = ["macros", "rt", "fs", "io-util"] }
-
 
 [package.metadata.docs.rs]
 all-features = true
-
-# Cross-targets if needed (WASM, etc.)
-# default-target = "x86_64-unknown-linux-gnu"
-# targets = ["wasm32-unknown-unknown", "x86_64-unknown-linux-gnu"]
 
 [[example]]
 name = "ai_generate_text_basic"

@@ -125,6 +125,28 @@ The code you contribute MUST be licensed under Apache 2.0.
 
 In the analytics module a unit test that exercises the dispatcher is skipped by default unless `FIREBASE_NETWORK_TESTS=1` is set.
 
+## Workspace layout
+
+The SDK is a cargo workspace. `crates/firebase-core` holds the app lifecycle, the component
+container, credentials and the platform primitives; each product is a crate beside it, and the root
+package `firebase-rs-sdk` is a façade that re-exports them behind one feature per product.
+
+```bash
+cargo test --workspace              # every crate
+cargo test -p firebase-auth         # one product
+cargo build --no-default-features --features remote-config   # what a single-product user builds
+```
+
+Two rules keep the graph honest, and CI enforces both:
+
+- **Products depend on core, never on each other's internals.** Credentials are the reason this is
+  possible: `firebase_core::platform::token::TokenProvider` is implemented by Auth and App Check and
+  consumed by the products that talk to a backend, so no product has to depend on a credential
+  producer's error types. `firebase-functions` depends on `firebase-messaging` for the instance-id
+  token, which is a real dependency rather than a cycle.
+- **Each product must build on its own** (`--no-default-features --features <product>`), which is
+  what stops a Remote Config user from compiling gRPC.
+
 ## Coverage table
 
 Per-module coverage lives in `docs/coverage.toml` and nothing else. README.md's table is generated
@@ -145,8 +167,8 @@ bindings for `google.firestore.v1`:
 
 - `proto/` holds the `.proto` sources, vendored from
   [googleapis](https://github.com/googleapis/googleapis) (Apache-2.0).
-- `src/firestore/remote/proto/` holds the generated Rust, committed so that building the crate
-  needs no `protoc`.
+- `crates/firebase-firestore/src/remote/proto/` holds the generated Rust, committed so that building
+  the crate needs no `protoc`.
 
 After changing anything under `proto/`, regenerate with:
 

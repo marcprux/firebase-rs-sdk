@@ -1,0 +1,363 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use crate::error::FirestoreResult;
+use crate::model::Timestamp;
+use crate::model::{DocumentKey, IntoFieldPath};
+use crate::value::{FirestoreValue, MapValue};
+
+use super::converter::FirestoreDataConverter;
+use super::database::Firestore;
+use super::reference::DocumentReference;
+
+/// Metadata about the state of a document snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotMetadata {
+    from_cache: bool,
+    has_pending_writes: bool,
+}
+
+impl SnapshotMetadata {
+    /// Creates metadata with the provided cache/pending-write flags.
+    pub fn new(from_cache: bool, has_pending_writes: bool) -> Self {
+        Self {
+            from_cache,
+            has_pending_writes,
+        }
+    }
+
+    /// Indicates whether the snapshot was served from a local cache.
+    pub fn from_cache(&self) -> bool {
+        self.from_cache
+    }
+
+    /// Indicates whether the snapshot contains uncommitted local mutations.
+    pub fn has_pending_writes(&self) -> bool {
+        self.has_pending_writes
+    }
+}
+
+/// Snapshot of a document's contents.
+#[derive(Clone, Debug)]
+pub struct DocumentSnapshot {
+    key: DocumentKey,
+    data: Option<MapValue>,
+    metadata: SnapshotMetadata,
+    create_time: Option<Timestamp>,
+    update_time: Option<Timestamp>,
+}
+
+impl DocumentSnapshot {
+    pub fn new(key: DocumentKey, data: Option<MapValue>, metadata: SnapshotMetadata) -> Self {
+        Self {
+            key,
+            data,
+            metadata,
+            create_time: None,
+            update_time: None,
+        }
+    }
+
+    /// Attaches the backend `createTime` / `updateTime` of the document.
+    pub fn with_times(mut self, create_time: Option<Timestamp>, update_time: Option<Timestamp>) -> Self {
+        self.create_time = create_time;
+        self.update_time = update_time;
+        self
+    }
+
+    /// The time the document was created, when reported by the backend.
+    pub fn create_time(&self) -> Option<Timestamp> {
+        self.create_time
+    }
+
+    /// The time the document was last updated, when reported by the backend. Transactions use
+    /// it as the precondition for their writes.
+    pub fn update_time(&self) -> Option<Timestamp> {
+        self.update_time
+    }
+
+    /// Returns whether the document exists on the backend.
+    pub fn exists(&self) -> bool {
+        self.data.is_some()
+    }
+
+    /// Returns the decoded document fields if the snapshot contains data.
+    ///
+    /// The returned map borrows from the snapshot; mutate a clone before
+    /// writing it back to Firestore.
+    pub fn data(&self) -> Option<&BTreeMap<String, FirestoreValue>> {
+        self.data.as_ref().map(|map| map.fields())
+    }
+
+    /// Returns snapshot metadata describing cache and mutation state.
+    pub fn metadata(&self) -> &SnapshotMetadata {
+        &self.metadata
+    }
+
+    /// Returns the underlying map value for advanced conversions.
+    pub fn map_value(&self) -> Option<&MapValue> {
+        self.data.as_ref()
+    }
+
+    /// Convenience accessor matching the JS API.
+    pub fn from_cache(&self) -> bool {
+        self.metadata.from_cache()
+    }
+
+    /// Convenience accessor matching the JS API.
+    pub fn has_pending_writes(&self) -> bool {
+        self.metadata.has_pending_writes()
+    }
+
+    /// Returns the identifier of the document represented by this snapshot.
+    /// Deserializes the document fields into `T` via serde. Returns `Ok(None)` when the
+    /// document does not exist.
+    ///
+    /// ```no_run
+    /// # use firebase_firestore::*;
+    /// # #[derive(serde::Deserialize)] struct City { name: String }
+    /// # fn demo(snapshot: DocumentSnapshot) -> FirestoreResult<()> {
+    /// if let Some(city) = snapshot.data_as::<City>()? {
+    ///     println!("{}", city.name);
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub fn data_as<T: serde::de::DeserializeOwned>(&self) -> FirestoreResult<Option<T>> {
+        match &self.data {
+            Some(map) => crate::value::from_document(map.fields()).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Returns the key (full document path) of this snapshot.
+    pub fn key(&self) -> &DocumentKey {
+        &self.key
+    }
+
+    pub fn id(&self) -> &str {
+        self.key.id()
+    }
+
+    pub(crate) fn document_key(&self) -> &DocumentKey {
+        &self.key
+    }
+
+    /// Creates a document reference pointing at the same location as this snapshot.
+    pub fn reference(&self, firestore: Firestore) -> FirestoreResult<DocumentReference> {
+        DocumentReference::new(firestore, self.key.path().clone())
+    }
+
+    /// Retrieves the value stored at the provided field path if it exists.
+    ///
+    /// Mirrors the modular JS `DocumentSnapshot.get(...)` API from
+    /// `packages/firestore/src/lite-api/snapshot.ts`.
+    pub fn get<P>(&self, field_path: P) -> FirestoreResult<Option<&FirestoreValue>>
+    where
+        P: IntoFieldPath,
+    {
+        let field_path = field_path.into_field_path()?;
+        Ok(self.data.as_ref().and_then(|map| map.get(&field_path)))
+    }
+    /// Converts this snapshot into a typed snapshot using the provided converter.
+    pub fn into_typed<C>(self, converter: Arc<C>) -> TypedDocumentSnapshot<C>
+    where
+        C: FirestoreDataConverter,
+    {
+        TypedDocumentSnapshot::new(self, converter)
+    }
+
+    /// Returns a typed snapshot by cloning the underlying data and converter.
+    pub fn to_typed<C>(&self, converter: Arc<C>) -> TypedDocumentSnapshot<C>
+    where
+        C: FirestoreDataConverter,
+    {
+        self.clone().into_typed(converter)
+    }
+}
+
+/// Document snapshot carrying a converter for typed access.
+#[derive(Clone)]
+pub struct TypedDocumentSnapshot<C>
+where
+    C: FirestoreDataConverter,
+{
+    base: DocumentSnapshot,
+    converter: Arc<C>,
+}
+
+impl<C> TypedDocumentSnapshot<C>
+where
+    C: FirestoreDataConverter,
+{
+    pub fn new(base: DocumentSnapshot, converter: Arc<C>) -> Self {
+        Self { base, converter }
+    }
+
+    pub fn exists(&self) -> bool {
+        self.base.exists()
+    }
+
+    pub fn id(&self) -> &str {
+        self.base.id()
+    }
+
+    pub fn metadata(&self) -> &SnapshotMetadata {
+        self.base.metadata()
+    }
+
+    pub fn from_cache(&self) -> bool {
+        self.base.from_cache()
+    }
+
+    pub fn has_pending_writes(&self) -> bool {
+        self.base.has_pending_writes()
+    }
+
+    pub fn reference(&self, firestore: Firestore) -> FirestoreResult<DocumentReference> {
+        self.base.reference(firestore)
+    }
+
+    pub fn raw(&self) -> &DocumentSnapshot {
+        &self.base
+    }
+
+    pub fn into_raw(self) -> DocumentSnapshot {
+        self.base
+    }
+
+    /// Returns the typed model using the embedded converter.
+    pub fn data(&self) -> FirestoreResult<Option<C::Model>> {
+        match self.base.map_value() {
+            Some(map) => self.converter.from_map(map).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Retrieves the raw Firestore value at the provided field path if it exists.
+    ///
+    /// Mirrors the modular JS typed snapshot `get` API from
+    /// `packages/firestore/src/lite-api/snapshot.ts`.
+    pub fn get<P>(&self, field_path: P) -> FirestoreResult<Option<&FirestoreValue>>
+    where
+        P: IntoFieldPath,
+    {
+        self.base.get(field_path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::converter::{FirestoreDataConverter, PassthroughConverter};
+    use crate::model::{DocumentKey, FieldPath};
+    use crate::value::ValueKind;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn metadata_flags() {
+        let meta = SnapshotMetadata::new(true, false);
+        assert!(meta.from_cache());
+        assert!(!meta.has_pending_writes());
+    }
+
+    #[test]
+    fn snapshot_reports_existence() {
+        let key = DocumentKey::from_string("cities/sf").unwrap();
+        let snapshot = DocumentSnapshot::new(key, None, SnapshotMetadata::default());
+        assert!(!snapshot.exists());
+    }
+
+    #[derive(Clone)]
+    struct NameConverter;
+
+    impl FirestoreDataConverter for NameConverter {
+        type Model = String;
+
+        fn to_map(&self, value: &Self::Model) -> FirestoreResult<BTreeMap<String, FirestoreValue>> {
+            let mut map = BTreeMap::new();
+            map.insert("name".to_string(), FirestoreValue::from_string(value));
+            Ok(map)
+        }
+
+        fn from_map(&self, value: &MapValue) -> FirestoreResult<Self::Model> {
+            match value.fields().get("name").and_then(|val| match val.kind() {
+                ValueKind::String(s) => Some(s.clone()),
+                _ => None,
+            }) {
+                Some(name) => Ok(name),
+                None => Err(crate::error::invalid_argument("missing name field")),
+            }
+        }
+    }
+
+    #[test]
+    fn typed_snapshot_uses_converter() {
+        let key = DocumentKey::from_string("cities/sf").unwrap();
+        let mut map = BTreeMap::new();
+        map.insert("name".to_string(), FirestoreValue::from_string("San Francisco"));
+        let snapshot = DocumentSnapshot::new(key, Some(MapValue::new(map)), SnapshotMetadata::new(false, false));
+
+        let typed = snapshot.into_typed(Arc::new(NameConverter));
+        let name = typed.data().unwrap();
+        assert_eq!(name.as_deref(), Some("San Francisco"));
+    }
+
+    #[test]
+    fn passthrough_converter_roundtrip() {
+        let key = DocumentKey::from_string("cities/sf").unwrap();
+        let mut map = BTreeMap::new();
+        map.insert("name".to_string(), FirestoreValue::from_string("SF"));
+        let snapshot = DocumentSnapshot::new(key, Some(MapValue::new(map.clone())), SnapshotMetadata::default());
+
+        let typed = snapshot.into_typed(Arc::new(PassthroughConverter::default()));
+        let raw = typed.data().unwrap().unwrap();
+        assert_eq!(raw.get("name"), map.get("name"));
+    }
+
+    #[test]
+    fn snapshot_get_returns_nested_field() {
+        let key = DocumentKey::from_string("cities/sf").unwrap();
+        let mut stats = BTreeMap::new();
+        stats.insert("wins".to_string(), FirestoreValue::from_integer(10));
+        let mut map = BTreeMap::new();
+        map.insert("stats".to_string(), FirestoreValue::from_map(stats));
+        let snapshot = DocumentSnapshot::new(key, Some(MapValue::new(map)), SnapshotMetadata::default());
+
+        let value = snapshot.get("stats.wins").unwrap().unwrap();
+        match value.kind() {
+            ValueKind::Integer(v) => assert_eq!(*v, 10),
+            _ => panic!("expected integer"),
+        }
+
+        assert!(snapshot.get("stats.losses").unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_get_validates_field_path() {
+        let key = DocumentKey::from_string("cities/sf").unwrap();
+        let snapshot = DocumentSnapshot::new(key, None, SnapshotMetadata::default());
+        let err = snapshot.get("").unwrap_err();
+        assert_eq!(err.code_str(), "firestore/invalid-argument");
+
+        // Ensure FieldPath inputs are accepted as well.
+        let path = FieldPath::from_dot_separated("foo").unwrap();
+        assert!(snapshot.get(path).unwrap().is_none());
+    }
+
+    #[test]
+    fn typed_snapshot_get_delegates_to_base() {
+        let key = DocumentKey::from_string("cities/nyc").unwrap();
+        let mut stats = BTreeMap::new();
+        stats.insert("wins".to_string(), FirestoreValue::from_integer(5));
+        let mut map = BTreeMap::new();
+        map.insert("stats".to_string(), FirestoreValue::from_map(stats));
+        let snapshot = DocumentSnapshot::new(key, Some(MapValue::new(map)), SnapshotMetadata::default());
+
+        let typed = snapshot.into_typed(Arc::new(PassthroughConverter::default()));
+        let value = typed.get("stats.wins").unwrap().unwrap();
+        match value.kind() {
+            ValueKind::Integer(v) => assert_eq!(*v, 5),
+            _ => panic!("expected integer"),
+        }
+    }
+}

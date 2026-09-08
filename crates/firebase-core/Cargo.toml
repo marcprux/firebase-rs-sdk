@@ -1,0 +1,61 @@
+[package]
+name = "firebase-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared foundation for the Firebase Rust SDK: app lifecycle, the component container, credentials and platform primitives"
+keywords = ["firebase", "sdk"]
+categories = ["api-bindings", "web-programming"]
+
+[features]
+default = []
+wasm-web = ["dep:wasm-bindgen", "dep:js-sys", "dep:web-sys", "dep:wasm-bindgen-futures"]
+experimental-indexed-db = []
+# Test helpers other crates in the workspace use from their dev-dependencies. The mock server
+# behind it is native-only, so the dependency is target-gated below.
+test-support = ["dep:httpmock"]
+
+[dependencies]
+async-lock.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+chrono.workspace = true
+futures.workspace = true
+log.workspace = true
+once_cell.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+url.workspace = true
+wasm-bindgen = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+web-sys = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest.workspace = true
+tokio.workspace = true
+httpmock = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The browser build of reqwest takes a different feature set, so it is spelled out per crate
+# instead of inherited from the workspace.
+reqwest = { version = "0.11", default-features = false, features = ["json"] }
+getrandom.workspace = true
+gloo-timers.workspace = true
+
+[dev-dependencies]
+
+# Native-only: the wasm test runner has no mock server, and tokio's `net` feature does not build
+# for wasm at all.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+httpmock.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["macros", "rt"] }

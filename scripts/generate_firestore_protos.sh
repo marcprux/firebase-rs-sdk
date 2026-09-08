@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerates src/firestore/remote/proto/ from the vendored protos in proto/.
+# Regenerates crates/firebase-firestore/src/remote/proto/ from the vendored protos in proto/.
 #
 # The generated code is committed so that building the crate needs no `protoc`; run this only when
 # the vendored `.proto` files change. Requires `protoc` (brew install protobuf / apt install
@@ -45,7 +45,7 @@ if [ -z "$OUT" ]; then
   exit 1
 fi
 GEN_DIR="$(dirname "$OUT")"
-DEST="$ROOT/src/firestore/remote/proto"
+DEST="$ROOT/crates/firebase-firestore/src/remote/proto"
 # The upstream proto comments contain fenced code blocks that rustdoc would try to run as
 # doctests, so the doc comments are dropped on the way in; the .proto files under proto/ stay the
 # reference documentation.

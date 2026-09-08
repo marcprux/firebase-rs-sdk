@@ -61,13 +61,38 @@ jobs:
       - name: Check the generated coverage table
         run: python3 scripts/coverage_table.py --check
 
-      - name: Build (host, all targets)
-        run: cargo build --all-targets
+      - name: Build (host, all targets, every crate)
+        run: cargo build --workspace --all-targets
 
       # Warnings are not fatal yet: the crate carries a backlog of them. Keep the output visible
       # so new ones are obvious in review, and tighten to `-D warnings` once the backlog is gone.
       - name: Clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --workspace --all-targets
+
+  features:
+    name: per-product builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # A user who wants one product must not have to compile the others; this fails if a façade
+      # feature stops being self-contained.
+      - name: Build each product on its own
+        run: |
+          set -e
+          for product in ai analytics app-check auth data-connect database firestore functions \
+                         installations messaging performance remote-config storage; do
+            echo "== $product =="
+            cargo build --no-default-features --features "$product"
+          done
 
   test:
     name: offline tests
@@ -86,14 +111,14 @@ jobs:
       # The suite shares process-global state (the component registry, App Check state), so it is
       # run twice: once in parallel, which is how contributors run it, and once serially, which
       # catches ordering assumptions the parallel run can hide.
-      - name: Unit and doc tests
-        run: cargo test --all-targets
+      - name: Unit tests (every crate)
+        run: cargo test --workspace --all-targets
 
       - name: Doc tests
-        run: cargo test --doc
+        run: cargo test --workspace --doc
 
       - name: Unit tests, single threaded
-        run: cargo test --lib -- --test-threads=1
+        run: cargo test --workspace --lib -- --test-threads=1
 
   wasm:
     name: wasm32
@@ -113,7 +138,7 @@ jobs:
 
       # Catches code that only compiles on native, including test code behind cfg(test).
       - name: Check wasm build
-        run: cargo check --target wasm32-unknown-unknown --features wasm-web --all-targets
+        run: cargo check --workspace --target wasm32-unknown-unknown --features wasm-web --all-targets
 
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh

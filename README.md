@@ -7,31 +7,40 @@ the Firebase JavaScript SDK to Rust; this fork continues that work, with the emp
 each module against real Firebase backends (see [Coverage](#coverage) and
 [Live endpoint tests](#live-endpoint-tests)).
 
-## Modules
+## Layout
 
-The Firebase Rust SDK includes 14 modules, each mapping to a Firebase service:
+The SDK is a cargo workspace: `firebase-core` holds what every product needs (the app lifecycle and
+its component container, credentials, platform primitives, logging), and each Firebase product is a
+crate of its own that depends on core and nothing else it does not use.
 
-- [ai](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/ai)
-- [analytics](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/analytics)
-- [app](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/app)
-- [app_check](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/app_check)
-- [auth](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/auth)
-- [data_connect](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/data_connect)  
-- [database](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/database)
-- [firestore](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/firestore)
-- [functions](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/functions)
-- [installations](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/installations)
-- [messaging](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/messaging)
-- [performance](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/performance)
-- [remote_config](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/remote_config)
-- [storage](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/storage)
+| Crate | Module path | Feature |
+|---|---|---|
+| [firebase-core](crates/firebase-core) | `firebase_rs_sdk::{app, component, platform, logger, util}` | always |
+| [firebase-ai](crates/firebase-ai) | `firebase_rs_sdk::ai` | `ai` |
+| [firebase-analytics](crates/firebase-analytics) | `firebase_rs_sdk::analytics` | `analytics` |
+| [firebase-app-check](crates/firebase-app-check) | `firebase_rs_sdk::app_check` | `app-check` |
+| [firebase-auth](crates/firebase-auth) | `firebase_rs_sdk::auth` | `auth` |
+| [firebase-data-connect](crates/firebase-data-connect) | `firebase_rs_sdk::data_connect` | `data-connect` |
+| [firebase-database](crates/firebase-database) | `firebase_rs_sdk::database` | `database` |
+| [firebase-firestore](crates/firebase-firestore) | `firebase_rs_sdk::firestore` | `firestore` |
+| [firebase-functions](crates/firebase-functions) | `firebase_rs_sdk::functions` | `functions` |
+| [firebase-installations](crates/firebase-installations) | `firebase_rs_sdk::installations` | `installations` |
+| [firebase-messaging](crates/firebase-messaging) | `firebase_rs_sdk::messaging` | `messaging` |
+| [firebase-performance](crates/firebase-performance) | `firebase_rs_sdk::performance` | `performance` |
+| [firebase-remote-config](crates/firebase-remote-config) | `firebase_rs_sdk::remote_config` | `remote-config` |
+| [firebase-storage](crates/firebase-storage) | `firebase_rs_sdk::storage` | `storage` |
 
-The following modules are used internally by the library and have no direct public API.
+`firebase-rs-sdk` is the façade: it re-exports every product, all of them enabled by default, so
+`firebase-rs-sdk = "1"` behaves as it always has. Name the products you use to skip the rest —
+a Remote Config or Auth build then pulls no gRPC stack, no websocket stack and no Firestore proto
+bindings (168 crates down to 122):
 
-- [component](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/component)
-- [logger](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/logger)
-- [platform](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/platform)
-- [util](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/util)
+```toml
+[dependencies]
+firebase-rs-sdk = { version = "1", default-features = false, features = ["remote-config"] }
+```
+
+Products can also be depended on directly (`firebase-auth = "1"`) when the façade is not wanted.
 
 Note that this library is provided _as is_. Even the more mature modules have not been exhaustively tested. All the code published passes `cargo test`. There is an effort to port the tests of the official JavaScript SDK, but there is no guarantee that the test coverage is complete.
 
