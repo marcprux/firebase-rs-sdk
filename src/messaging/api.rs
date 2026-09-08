@@ -255,10 +255,9 @@ async fn request_permission_impl() -> MessagingResult<PermissionState> {
     Ok(PermissionState::Granted)
 }
 
-static MESSAGING_COMPONENT: LazyLock<()> = LazyLock::new(|| {
-    let component = Component::new(MESSAGING_COMPONENT_NAME, Arc::new(messaging_factory), ComponentType::Public)
-        .with_instantiation_mode(InstantiationMode::Lazy);
-    let _ = app::register_component(component);
+static MESSAGING_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
+    Component::new(MESSAGING_COMPONENT_NAME, Arc::new(messaging_factory), ComponentType::Public)
+        .with_instantiation_mode(InstantiationMode::Lazy)
 });
 
 fn messaging_factory(
@@ -276,7 +275,7 @@ fn messaging_factory(
 }
 
 fn ensure_registered() {
-    LazyLock::force(&MESSAGING_COMPONENT);
+    let _ = app::register_component(MESSAGING_COMPONENT.clone());
 }
 
 pub fn register_messaging_component() {

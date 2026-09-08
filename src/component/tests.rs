@@ -45,4 +45,44 @@ mod tests {
         let result = provider.initialize::<Value>(options.clone(), None).unwrap();
         assert_eq!(*result, options);
     }
+    /// Two threads asking the same container for a provider must get the same one.
+    ///
+    /// This is the shape of what happens at startup: `initialize_app` fills a container while
+    /// `register_component` propagates a newly registered component into the very same container.
+    /// When the two race, a provider that already holds a component must not be replaced by an
+    /// empty one, or every later lookup reports the service as unavailable.
+    #[test]
+    fn concurrent_lookups_never_discard_a_configured_provider() {
+        use std::sync::Barrier;
+
+        for _ in 0..500 {
+            let container = ComponentContainer::new("race");
+            let barrier = Arc::new(Barrier::new(2));
+
+            let adder = {
+                let container = container.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let _ = container.add_component(build_component("thing"));
+                })
+            };
+            let looker = {
+                let container = container.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    container.get_provider("thing");
+                })
+            };
+
+            adder.join().unwrap();
+            looker.join().unwrap();
+
+            assert!(
+                container.get_provider("thing").is_component_set(),
+                "the component was lost when a concurrent lookup replaced its provider"
+            );
+        }
+    }
 }

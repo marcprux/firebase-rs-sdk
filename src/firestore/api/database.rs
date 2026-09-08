@@ -81,12 +81,10 @@ impl Firestore {
     }
 }
 
-static FIRESTORE_COMPONENT: LazyLock<()> = LazyLock::new(|| {
-    let component = Component::new(FIRESTORE_COMPONENT_NAME, Arc::new(firestore_factory), ComponentType::Public)
+static FIRESTORE_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
+    Component::new(FIRESTORE_COMPONENT_NAME, Arc::new(firestore_factory), ComponentType::Public)
         .with_instantiation_mode(InstantiationMode::Lazy)
-        .with_multiple_instances(true);
-
-    let _ = app::register_component(component);
+        .with_multiple_instances(true)
 });
 
 fn firestore_factory(
@@ -138,7 +136,23 @@ fn parse_database_identifier(app: &FirebaseApp, identifier: &str) -> FirestoreRe
 }
 
 fn ensure_registered() {
-    LazyLock::force(&FIRESTORE_COMPONENT);
+    let _ = app::register_component(FIRESTORE_COMPONENT.clone());
+}
+
+/// Guarantees `app` can resolve Firestore.
+///
+/// Registration is global and propagates to the apps the registry knows about, which leaves out
+/// apps built directly (as tests do) or removed from the registry, so the component is attached to
+/// this app's container as well when it is missing.
+fn ensure_registered_for(app: &FirebaseApp) {
+    ensure_registered();
+    if !app
+        .container()
+        .get_provider(FIRESTORE_COMPONENT_NAME)
+        .is_component_set()
+    {
+        app::add_component(app, &FIRESTORE_COMPONENT);
+    }
 }
 
 pub fn register_firestore_component() {
@@ -156,6 +170,7 @@ pub async fn get_firestore(app: Option<FirebaseApp>) -> FirestoreResult<Arc<Fire
         None => get_app(None).await.map_err(|err| internal_error(err.to_string()))?,
     };
 
+    ensure_registered_for(&app);
     let provider = app::get_provider(&app, FIRESTORE_COMPONENT_NAME);
     provider
         .get_immediate_with_options::<Firestore>(None, false)
@@ -176,6 +191,25 @@ mod tests {
             name: Some(format!("firestore-api-{}", COUNTER.fetch_add(1, Ordering::SeqCst))),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn an_app_outside_the_registry_still_resolves_firestore() {
+        // Apps built directly never enter the global app map, so a component registered later
+        // cannot be propagated to them. The accessor attaches it to the container instead.
+        use crate::app::{FirebaseAppConfig, FirebaseOptions};
+        use crate::component::ComponentContainer;
+
+        let options = FirebaseOptions {
+            project_id: Some("project".into()),
+            ..Default::default()
+        };
+        let config = FirebaseAppConfig::new("unregistered-app", false);
+        let container = ComponentContainer::new("unregistered-app");
+        let app = FirebaseApp::new(options, config, container);
+
+        let firestore = get_firestore(Some(app)).await.expect("firestore for a detached app");
+        assert_eq!(firestore.project_id(), "project");
     }
 
     #[tokio::test]

@@ -468,24 +468,22 @@ fn generate_fid() -> InstallationsResult<String> {
     Err(internal_error("Failed to generate a valid Firebase Installation ID"))
 }
 
-static INSTALLATIONS_COMPONENT: LazyLock<()> = LazyLock::new(|| {
-    let component = Component::new(
+static INSTALLATIONS_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
+    Component::new(
         INSTALLATIONS_COMPONENT_NAME,
         Arc::new(installations_factory),
         ComponentType::Public,
     )
-    .with_instantiation_mode(InstantiationMode::Lazy);
-    let _ = app::register_component(component);
+    .with_instantiation_mode(InstantiationMode::Lazy)
 });
 
-static INSTALLATIONS_INTERNAL_COMPONENT: LazyLock<()> = LazyLock::new(|| {
-    let component = Component::new(
+static INSTALLATIONS_INTERNAL_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
+    Component::new(
         INSTALLATIONS_INTERNAL_COMPONENT_NAME,
         Arc::new(installations_internal_factory),
         ComponentType::Private,
     )
-    .with_instantiation_mode(InstantiationMode::Lazy);
-    let _ = app::register_component(component);
+    .with_instantiation_mode(InstantiationMode::Lazy)
 });
 
 fn installations_factory(
@@ -506,8 +504,8 @@ fn installations_factory(
 }
 
 fn ensure_registered() {
-    LazyLock::force(&INSTALLATIONS_COMPONENT);
-    LazyLock::force(&INSTALLATIONS_INTERNAL_COMPONENT);
+    let _ = app::register_component(INSTALLATIONS_COMPONENT.clone());
+    let _ = app::register_component(INSTALLATIONS_INTERNAL_COMPONENT.clone());
 }
 
 pub fn register_installations_component() {

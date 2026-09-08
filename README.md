@@ -46,7 +46,7 @@ percentages are estimates and deliberately stricter than the ones in each module
 |---|---:|---|:---:|---|
 | installations | 85% | real (Installations REST v1) | yes | FID generation, registration, token refresh, delete, id-change listeners |
 | storage | 85% | real (`firebasestorage.googleapis.com/v0`) | emulator | uploads, downloads, metadata, paginated list, delete, resumable uploads with progress/pause/resume/cancel, JS error codes and `encodeURIComponent` paths |
-| app | 70% | n/a | yes | app lifecycle, options, component container, heartbeat header |
+| app | 72% | n/a | yes | app lifecycle, options, component container (provider lookup is atomic and service registration is idempotent, so a service never resolves as "not initialized"), heartbeat header |
 | data_connect | 65% | real (`firebasedataconnect.googleapis.com/v1`) | no | executeQuery / executeMutation, emulator, subscriptions |
 | auth | 80% | real (Identity Toolkit v1/v2 + securetoken) | emulator + online | email, phone, custom-token, IdP credential and MFA flows verified end to end; sessions survive a restart through a pluggable persistence backend; typed error codes; listeners; OAuth popup/redirect UI flows still delegated to the host |
 | functions | 75% | real (`cloudfunctions.net` / custom domain / emulator) | emulator + online | callable protocol with auth, App Check and FID headers, streaming callables, URL callables, timeouts |

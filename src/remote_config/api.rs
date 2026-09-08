@@ -511,14 +511,13 @@ impl fmt::Debug for RemoteConfig {
     }
 }
 
-static REMOTE_CONFIG_COMPONENT: LazyLock<()> = LazyLock::new(|| {
-    let component = Component::new(
+static REMOTE_CONFIG_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
+    Component::new(
         REMOTE_CONFIG_COMPONENT_NAME,
         Arc::new(remote_config_factory),
         ComponentType::Public,
     )
-    .with_instantiation_mode(InstantiationMode::Lazy);
-    let _ = app::register_component(component);
+    .with_instantiation_mode(InstantiationMode::Lazy)
 });
 
 fn remote_config_factory(
@@ -544,7 +543,7 @@ fn current_timestamp_millis() -> u64 {
 }
 
 fn ensure_registered() {
-    LazyLock::force(&REMOTE_CONFIG_COMPONENT);
+    let _ = app::register_component(REMOTE_CONFIG_COMPONENT.clone());
 }
 
 pub fn register_remote_config_component() {

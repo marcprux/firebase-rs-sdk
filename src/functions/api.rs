@@ -549,11 +549,10 @@ impl Default for Endpoint {
     }
 }
 
-static FUNCTIONS_COMPONENT: LazyLock<()> = LazyLock::new(|| {
-    let component = Component::new(FUNCTIONS_COMPONENT_NAME, Arc::new(functions_factory), ComponentType::Public)
+static FUNCTIONS_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
+    Component::new(FUNCTIONS_COMPONENT_NAME, Arc::new(functions_factory), ComponentType::Public)
         .with_instantiation_mode(InstantiationMode::Lazy)
-        .with_multiple_instances(true);
-    let _ = app::register_component(component);
+        .with_multiple_instances(true)
 });
 
 fn functions_factory(
@@ -573,7 +572,7 @@ fn functions_factory(
 }
 
 fn ensure_registered() {
-    LazyLock::force(&FUNCTIONS_COMPONENT);
+    let _ = app::register_component(FUNCTIONS_COMPONENT.clone());
 }
 
 /// Registers the Functions component with the global app container.

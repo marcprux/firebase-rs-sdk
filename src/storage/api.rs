@@ -10,11 +10,10 @@ use crate::storage::reference::StorageReference;
 use crate::storage::service::FirebaseStorageImpl;
 use crate::storage::util::is_url;
 
-static STORAGE_COMPONENT_REGISTERED: LazyLock<()> = LazyLock::new(|| {
-    let component = Component::new(STORAGE_TYPE, Arc::new(storage_factory), ComponentType::Public)
+static STORAGE_COMPONENT_REGISTERED: LazyLock<Component> = LazyLock::new(|| {
+    Component::new(STORAGE_TYPE, Arc::new(storage_factory), ComponentType::Public)
         .with_instantiation_mode(InstantiationMode::Lazy)
-        .with_multiple_instances(true);
-    let _ = register_component(component);
+        .with_multiple_instances(true)
 });
 
 fn storage_factory(
@@ -47,7 +46,7 @@ fn storage_factory(
 }
 
 fn ensure_registered() {
-    LazyLock::force(&STORAGE_COMPONENT_REGISTERED);
+    let _ = register_component(STORAGE_COMPONENT_REGISTERED.clone());
 }
 
 pub fn register_storage_component() {

@@ -2902,19 +2902,30 @@ fn emulator_endpoints_for_host(host: &str) -> Option<(String, String)> {
 }
 
 /// Registers the Auth component so apps can resolve `Auth` instances.
-pub fn register_auth_component() {
-    use std::sync::LazyLock;
-    static REGISTERED: LazyLock<()> = LazyLock::new(|| {
-        let component = Component::new("auth", Arc::new(auth_factory), ComponentType::Public)
-            .with_instantiation_mode(InstantiationMode::Lazy);
-        let _ = register_component(component);
-        // Other services (Storage, Functions, Firestore) resolve the user's token through the
-        // private `auth-internal` component, exactly as in the JS SDK's `registerAuth`.
-        let internal = Component::new("auth-internal", Arc::new(auth_internal_factory), ComponentType::Private)
-            .with_instantiation_mode(InstantiationMode::Lazy);
-        let _ = register_component(internal);
+/// The public `auth` component, built once.
+fn auth_component() -> Component {
+    static PUBLIC: LazyLock<Component> = LazyLock::new(|| {
+        Component::new("auth", Arc::new(auth_factory), ComponentType::Public)
+            .with_instantiation_mode(InstantiationMode::Lazy)
     });
-    LazyLock::force(&REGISTERED);
+    PUBLIC.clone()
+}
+
+/// The private `auth-internal` component other services (Storage, Functions, Firestore) resolve
+/// the user's token through, exactly as in the JS SDK's `registerAuth`.
+fn auth_internal_component() -> Component {
+    static INTERNAL: LazyLock<Component> = LazyLock::new(|| {
+        Component::new("auth-internal", Arc::new(auth_internal_factory), ComponentType::Private)
+            .with_instantiation_mode(InstantiationMode::Lazy)
+    });
+    INTERNAL.clone()
+}
+
+pub fn register_auth_component() {
+    // Registration is idempotent and cheap, so it runs on every call: a registry that lost the
+    // components (or an app created before this module was first used) still ends up working.
+    let _ = register_component(auth_component());
+    let _ = register_component(auth_internal_component());
 }
 
 /// Persistence backends installed by [`initialize_auth`], keyed by app name. The component
@@ -3093,7 +3104,16 @@ fn is_dead_session_error(error: &AuthError) -> bool {
 }
 
 pub fn auth_for_app(app: FirebaseApp) -> AuthResult<Arc<Auth>> {
+    // Registering here (it is idempotent) means the caller gets a working Auth even for an app
+    // that was created before this module was first used, matching `get_firestore` and the other
+    // service accessors. Global registration only reaches apps the registry knows about, so an app
+    // built directly (as tests do) has the component attached to its container here.
+    register_auth_component();
     let provider = app.container().get_provider("auth");
+    if !provider.is_component_set() {
+        crate::app::add_component(&app, &auth_component());
+        crate::app::add_component(&app, &auth_internal_component());
+    }
     match provider.get_immediate_with_options::<Auth>(None, false) {
         Ok(Some(auth)) => Ok(auth),
         Ok(None) => Err(AuthError::App(AppError::ComponentFailure {
@@ -3228,6 +3248,22 @@ mod tests {
             sink.lock().unwrap().push(user.as_ref().map(|u| u.uid().to_string()));
         };
         (events, listener)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_app_outside_the_registry_still_resolves_auth() {
+        // Same guarantee as Firestore: an app that never entered the global registry (tests build
+        // these directly) still gets a working Auth, including the private `auth-internal` view
+        // that Storage, Functions and Firestore resolve the user's token through.
+        let app = test_firebase_app_with_api_key(TEST_API_KEY);
+
+        let public = auth_for_app(app.clone()).expect("auth for a detached app");
+        let internal = app
+            .container()
+            .get_provider("auth-internal")
+            .get_immediate::<Auth>()
+            .expect("auth-internal resolves");
+        assert!(Arc::ptr_eq(&public, &internal));
     }
 
     #[tokio::test(flavor = "current_thread")]

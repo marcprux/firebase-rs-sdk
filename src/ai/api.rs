@@ -492,11 +492,10 @@ impl Cache {
     }
 }
 
-static AI_COMPONENT: LazyLock<()> = LazyLock::new(|| {
-    let component = Component::new(AI_COMPONENT_NAME, Arc::new(ai_factory), ComponentType::Public)
+static AI_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
+    Component::new(AI_COMPONENT_NAME, Arc::new(ai_factory), ComponentType::Public)
         .with_instantiation_mode(InstantiationMode::Lazy)
-        .with_multiple_instances(true);
-    let _ = app::register_component(component);
+        .with_multiple_instances(true)
 });
 
 fn ai_factory(
@@ -565,7 +564,7 @@ fn ai_factory(
 }
 
 fn ensure_registered() {
-    LazyLock::force(&AI_COMPONENT);
+    let _ = app::register_component(AI_COMPONENT.clone());
 }
 
 /// Registers the AI component in the global registry.

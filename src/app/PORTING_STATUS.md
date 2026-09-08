@@ -15,6 +15,37 @@ _As of October 24th, 2025_
   `clear_components`, `register_component`) are re-exported through `app::registry`, mirroring
   `packages/app/src/internal.ts` for downstream modules.
 
+## 2026-09-08 update: component resolution is no longer racy
+
+`cargo test` failed roughly one run in four, usually with a burst of unrelated tests reporting
+"Failed to obtain Firestore instance" or "Auth service not initialized". Three separate causes:
+
+- **`ComponentContainer::get_provider` was a check-then-insert race.** It released the lock between
+  the lookup and the insert, so two threads each built a provider and the second overwrote the
+  first — discarding the component that had just been set on it, and leaving every later lookup
+  with an empty provider. Lookup and insert now happen under one lock, and
+  `add_or_overwrite_component` installs the replacement under the same lock.
+  Regression test: `component::tests::concurrent_lookups_never_discard_a_configured_provider`
+  (fails reliably without the fix).
+- **Service registration was one-shot.** Every module registered its component inside a
+  `LazyLock<()>`, so once fired it never ran again; a registry that had lost the component (or an
+  app created before the module was first used) stayed broken. The components are still built once,
+  but `register_component` — which is idempotent and propagates to existing apps — now runs on
+  every `register_*_component()` call.
+- **Registration could not reach an app the registry does not know about.** Propagation walks the
+  global app map, which excludes apps built directly (as unit tests do) or removed concurrently.
+  `get_firestore` and `auth_for_app` now attach the component to the app's own container when it is
+  missing. Regression tests: `an_app_outside_the_registry_still_resolves_firestore` /
+  `..._resolves_auth`.
+
+The app tests' `reset()` helper also wiped the process-global component registry before every
+serialized test, which is what turned a narrow race into a cascade; it now clears only the app map,
+versions and heartbeat store, and the `clear_components` test restores the registry under the same
+guard it clears it with, so no other test ever observes an empty registry.
+
+Measured after the fix: 12 consecutive full `cargo test --lib` runs with no failures (previously
+about one run in four failed, once taking 31 tests down at a time).
+
 ## Development status as of 24th October 2025
 
 - Core functionalities: Mostly implemented 

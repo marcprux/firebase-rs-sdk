@@ -850,10 +850,9 @@ pub fn is_supported() -> bool {
     }
 }
 
-static PERFORMANCE_COMPONENT: LazyLock<()> = LazyLock::new(|| {
-    let component = Component::new(PERFORMANCE_COMPONENT_NAME, Arc::new(performance_factory), ComponentType::Public)
-        .with_instantiation_mode(InstantiationMode::Lazy);
-    let _ = app::register_component(component);
+static PERFORMANCE_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
+    Component::new(PERFORMANCE_COMPONENT_NAME, Arc::new(performance_factory), ComponentType::Public)
+        .with_instantiation_mode(InstantiationMode::Lazy)
 });
 
 fn performance_factory(
@@ -882,7 +881,7 @@ fn performance_factory(
 }
 
 fn ensure_registered() {
-    LazyLock::force(&PERFORMANCE_COMPONENT);
+    let _ = app::register_component(PERFORMANCE_COMPONENT.clone());
 }
 
 /// Registers the performance component in the shared container (normally invoked automatically).

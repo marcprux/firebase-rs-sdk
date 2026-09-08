@@ -434,7 +434,10 @@ mod tests {
         }
 
         assert!(registry::apps_guard().is_empty());
-        crate::component::clear_global_components_for_test();
+        // The component registry is process-global and shared with every other test in the run;
+        // wiping it here used to make unrelated services report "not initialized" whenever their
+        // test happened to overlap with one of these. These tests do not need an empty registry,
+        // only an empty app map.
         clear_registered_versions_for_tests();
         clear_heartbeat_store_for_tests();
     }

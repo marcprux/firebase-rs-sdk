@@ -241,14 +241,26 @@ mod tests {
             let app = api::initialize_app(test_options(), None).await.expect("app init");
             let factory: InstanceFactory = Arc::new(|_, _| Ok(Arc::new(()) as DynService));
             register_component(make_component("clearable", factory));
-            assert!(registered_components_guard()
-                .keys()
-                .any(|name| name.as_ref() == "clearable"));
 
-            clear_components();
-            assert!(!registered_components_guard()
-                .keys()
-                .any(|name| name.as_ref() == "clearable"));
+            // The registry is global: clearing it and putting it back happens under one guard so
+            // no other test can observe the gap. Holding the lock means calling `clear_components`
+            // itself would deadlock, so this runs the operation it performs.
+            {
+                let mut global = registered_components_guard();
+                assert!(global.keys().any(|name| name.as_ref() == "clearable"));
+
+                let saved: Vec<Component> = global.values().cloned().collect();
+                global.clear();
+                assert!(global.is_empty(), "clearing drops every registered component");
+
+                for component in saved {
+                    if component.name() != "clearable" {
+                        global.insert(Arc::from(component.name().to_owned()), component);
+                    }
+                }
+            }
+
+            // Apps that already have the component keep it; clearing only affects new apps.
             assert!(app.container().get_provider("clearable").is_component_set());
         })
         .await;

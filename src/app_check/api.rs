@@ -34,29 +34,27 @@ struct AppCheckRegistryEntry {
 static REGISTRY: LazyLock<Mutex<HashMap<Arc<str>, AppCheckRegistryEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-static APP_CHECK_COMPONENT: LazyLock<()> = LazyLock::new(|| {
-    let component = Component::new(
+static APP_CHECK_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
+    Component::new(
         super::types::APP_CHECK_COMPONENT_NAME,
         Arc::new(app_check_factory),
         ComponentType::Public,
     )
-    .with_instantiation_mode(InstantiationMode::Explicit);
-    let _ = register_component(component);
+    .with_instantiation_mode(InstantiationMode::Explicit)
 });
 
-static APP_CHECK_INTERNAL_COMPONENT: LazyLock<()> = LazyLock::new(|| {
-    let component = Component::new(
+static APP_CHECK_INTERNAL_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
+    Component::new(
         super::types::APP_CHECK_INTERNAL_COMPONENT_NAME,
         Arc::new(app_check_internal_factory),
         ComponentType::Private,
     )
-    .with_instantiation_mode(InstantiationMode::Explicit);
-    let _ = register_component(component);
+    .with_instantiation_mode(InstantiationMode::Explicit)
 });
 
 fn ensure_components_registered() {
-    LazyLock::force(&APP_CHECK_COMPONENT);
-    LazyLock::force(&APP_CHECK_INTERNAL_COMPONENT);
+    let _ = register_component(APP_CHECK_COMPONENT.clone());
+    let _ = register_component(APP_CHECK_INTERNAL_COMPONENT.clone());
 }
 
 fn app_check_factory(

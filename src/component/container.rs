@@ -37,27 +37,35 @@ impl ComponentContainer {
         provider.set_component(component)
     }
 
+    /// Replaces whatever provider the container has for this component, dropping its instances.
+    ///
+    /// The old provider is removed and the new one installed under a single lock so a concurrent
+    /// [`get_provider`](Self::get_provider) cannot hand out the provider that is on its way out.
     pub fn add_or_overwrite_component(&self, component: Component) {
-        {
-            let mut guard = self.inner.providers.lock().unwrap();
-            if guard.contains_key(component.name()) {
-                guard.remove(component.name());
-            }
-        }
-        let _ = self.add_component(component);
+        let provider = {
+            let mut providers = self.inner.providers.lock().unwrap();
+            providers.remove(component.name());
+            let provider = Provider::new(component.name(), self.clone());
+            providers.insert(Arc::from(component.name().to_owned()), provider.clone());
+            provider
+        };
+        let _ = provider.set_component(component);
     }
 
+    /// Returns the container's provider for `name`, creating it the first time it is asked for.
+    ///
+    /// The lookup and the insert happen under one lock: dropping it in between let two threads
+    /// each create a provider, and the second one would overwrite the first — discarding the
+    /// component that had just been set on it, so every later lookup found a provider with no
+    /// component and reported the service as unavailable.
     pub fn get_provider(&self, name: &str) -> Provider {
-        if let Some(provider) = self.inner.providers.lock().unwrap().get(name) {
+        let mut providers = self.inner.providers.lock().unwrap();
+        if let Some(provider) = providers.get(name) {
             return provider.clone();
         }
 
         let provider = Provider::new(name, self.clone());
-        self.inner
-            .providers
-            .lock()
-            .unwrap()
-            .insert(Arc::from(name.to_owned()), provider.clone());
+        providers.insert(Arc::from(name.to_owned()), provider.clone());
         provider
     }
 
