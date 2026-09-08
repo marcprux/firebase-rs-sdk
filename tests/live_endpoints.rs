@@ -61,6 +61,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use firebase_rs_sdk::app::{delete_app, initialize_app, FirebaseApp, FirebaseAppSettings, FirebaseOptions};
 use firebase_rs_sdk::auth::{auth_for_app, register_auth_component, AuthError, AuthErrorCode, User};
+use serde_json::{json, Value};
+
+use firebase_rs_sdk::database::error::DatabaseErrorCode;
+use firebase_rs_sdk::database::{connect_database_emulator, get_database};
 use firebase_rs_sdk::firestore::{
     get_firestore, FieldPath, FilterOperator, Firestore, FirestoreClient, FirestoreErrorCode, FirestoreValue,
     OrderDirection, ValueKind,
@@ -98,6 +102,7 @@ struct LiveConfig {
 struct EmulatorHosts {
     auth: Option<String>,
     firestore: Option<String>,
+    database: Option<String>,
     storage: Option<String>,
     functions: Option<String>,
 }
@@ -107,13 +112,18 @@ impl EmulatorHosts {
         Self {
             auth: read_env("FIREBASE_AUTH_EMULATOR_HOST"),
             firestore: read_env("FIRESTORE_EMULATOR_HOST"),
+            database: read_env("FIREBASE_DATABASE_EMULATOR_HOST"),
             storage: read_env("FIREBASE_STORAGE_EMULATOR_HOST"),
             functions: read_env("FIREBASE_FUNCTIONS_EMULATOR_HOST"),
         }
     }
 
     fn any(&self) -> bool {
-        self.auth.is_some() || self.firestore.is_some() || self.storage.is_some() || self.functions.is_some()
+        self.auth.is_some()
+            || self.firestore.is_some()
+            || self.database.is_some()
+            || self.storage.is_some()
+            || self.functions.is_some()
     }
 }
 
@@ -396,6 +406,30 @@ async fn functions_for(config: &LiveConfig, app: &FirebaseApp) -> Arc<firebase_r
         functions.connect_emulator(&host, port);
     }
     functions
+}
+
+/// Polls `condition` for up to five seconds, panicking with `message` if it never becomes true.
+async fn wait_for<F>(mut condition: F, message: &str)
+where
+    F: FnMut() -> bool,
+{
+    for _ in 0..50 {
+        if condition() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("timed out waiting: {message}");
+}
+
+/// Resolves the Realtime Database for `app`, routed to its emulator when one is configured.
+async fn database_for(config: &LiveConfig, app: &FirebaseApp) -> Arc<firebase_rs_sdk::database::Database> {
+    let database = get_database(Some(app.clone())).await.expect("database service");
+    if let Some(host) = &config.emulators.database {
+        let (host, port) = split_host_port(host, 9000);
+        connect_database_emulator(&database, &host, port).expect("connect database emulator");
+    }
+    database
 }
 
 /// Classifies backend errors that mean "this product isn't provisioned on the project" rather
@@ -1818,6 +1852,405 @@ async fn cleanup_auth(auth: &std::sync::Arc<firebase_rs_sdk::auth::Auth>) {
             eprintln!("warning: failed to delete temporary anonymous user: {err}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Realtime Database
+// ---------------------------------------------------------------------------------------------
+
+/// Skips unless the Realtime Database emulator is configured; the online project has no RTDB
+/// instance provisioned.
+fn require_database(test: &str, config: &LiveConfig) -> bool {
+    if config.emulators.database.is_none() {
+        skip(
+            test,
+            "needs the Realtime Database emulator (scripts/emulator_test.sh); the project has no \
+             database instance",
+            "n/a",
+        );
+        return false;
+    }
+    true
+}
+
+/// Signs in anonymously (the emulator rules require `auth != null`) and returns the database.
+async fn database_test_setup(
+    config: &LiveConfig,
+    label: &str,
+) -> (
+    FirebaseApp,
+    Arc<firebase_rs_sdk::auth::Auth>,
+    Arc<firebase_rs_sdk::database::Database>,
+) {
+    let app = live_app(config, label).await;
+    let auth = auth_for(config, &app);
+    auth.sign_in_anonymously().await.expect("anonymous sign-in");
+    let database = database_for(config, &app).await;
+    (app, auth, database)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Firebase credentials"]
+async fn database_writes_reads_queries_and_server_values() {
+    let test = "database_writes_reads_queries_and_server_values";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    if !require_database(test, &config) {
+        return;
+    }
+    let (app, auth, database) = database_test_setup(&config, "database-rest").await;
+
+    let root_path = format!("rust_sdk_live_tests/{}", nonce());
+    let base = database.reference(&root_path).expect("reference");
+
+    // --- set / get / update / remove ---------------------------------------------------------
+    let profile = base.child("profile").expect("child");
+    profile.set(json!({"name": "Ada", "score": 10})).await.expect("set");
+    assert_eq!(profile.get().await.expect("get"), json!({"name": "Ada", "score": 10}));
+
+    let mut updates = serde_json::Map::new();
+    updates.insert("score".to_string(), json!(11));
+    updates.insert("nested/flag".to_string(), json!(true));
+    profile.update(updates).await.expect("update");
+    assert_eq!(
+        profile.get().await.expect("get"),
+        json!({"name": "Ada", "score": 11, "nested": {"flag": true}})
+    );
+
+    profile.child("nested").expect("child").remove().await.expect("remove");
+    assert_eq!(profile.get().await.expect("get"), json!({"name": "Ada", "score": 11}));
+
+    // `push` mints ordered keys, mirroring the JS SDK's push IDs.
+    let messages = base.child("messages").expect("child");
+    let first = messages.push_with_value(json!("first")).await.expect("push");
+    let second = messages.push_with_value(json!("second")).await.expect("push");
+    let first_key = first.key().expect("key").to_string();
+    let second_key = second.key().expect("key").to_string();
+    assert!(first_key < second_key, "push IDs must sort chronologically");
+    assert_eq!(
+        messages.get().await.expect("get"),
+        json!({ first_key.clone(): "first", second_key: "second" })
+    );
+
+    // --- server values --------------------------------------------------------------------
+    let stamped = base.child("stamped").expect("child");
+    stamped
+        .set(json!({"at": firebase_rs_sdk::database::server_timestamp()}))
+        .await
+        .expect("set with server timestamp");
+    let stored = stamped.get().await.expect("get");
+    let at = stored
+        .get("at")
+        .and_then(|value| value.as_u64())
+        .expect("server timestamp must resolve to a number");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+    assert!(
+        at.abs_diff(now) < 5 * 60 * 1000,
+        "server timestamp {at} is not close to now ({now})"
+    );
+
+    // Increments are applied by the server, so concurrent bumps cannot lose updates the way a
+    // read-modify-write on the client would.
+    let counter = base.child("counter").expect("child");
+    counter.set(json!(10)).await.expect("seed counter");
+    let bumps = (0..5).map(|_| {
+        let counter = counter.clone();
+        async move {
+            counter
+                .set(firebase_rs_sdk::database::increment(1.0))
+                .await
+                .expect("increment");
+        }
+    });
+    futures::future::join_all(bumps).await;
+    assert_eq!(
+        counter.get().await.expect("get"),
+        json!(15.0),
+        "five concurrent increments must all land"
+    );
+
+    // --- queries --------------------------------------------------------------------------
+    // `players` is the one path the emulator rules index (see firebase-emulator/database.rules.json).
+    let players = base.child("players").expect("child");
+    players
+        .set(json!({
+            "ada": {"name": "Ada", "score": 30},
+            "bob": {"name": "Bob", "score": 10},
+            "cy": {"name": "Cy", "score": 20}
+        }))
+        .await
+        .expect("seed players");
+
+    let top_two = players
+        .order_by_child("score")
+        .expect("order_by_child")
+        .limit_to_last(2)
+        .expect("limit_to_last")
+        .get()
+        .await
+        .expect("query");
+    assert_eq!(
+        top_two.as_object().map(|map| map.len()),
+        Some(2),
+        "limit_to_last must trim the result: {top_two}"
+    );
+    assert!(top_two.get("ada").is_some() && top_two.get("cy").is_some(), "got {top_two}");
+
+    let above_fifteen = players
+        .order_by_child("score")
+        .expect("order_by_child")
+        .start_at(json!(15))
+        .expect("start_at")
+        .get()
+        .await
+        .expect("query");
+    assert!(
+        above_fifteen.get("bob").is_none() && above_fifteen.get("ada").is_some(),
+        "start_at must drop lower scores: {above_fifteen}"
+    );
+
+    let exactly_bob = players
+        .order_by_child("name")
+        .expect("order_by_child")
+        .equal_to(json!("Bob"))
+        .expect("equal_to")
+        .get()
+        .await
+        .expect("query");
+    assert_eq!(exactly_bob.as_object().map(|map| map.len()), Some(1), "got {exactly_bob}");
+
+    let first_key_only = players
+        .order_by_key()
+        .expect("order_by_key")
+        .limit_to_first(1)
+        .expect("limit_to_first")
+        .get()
+        .await
+        .expect("query");
+    assert!(first_key_only.get("ada").is_some(), "got {first_key_only}");
+
+    // Ordering by an unindexed child is a server-side error, not silently unordered data.
+    let err = players
+        .order_by_child("rank")
+        .expect("order_by_child")
+        .get()
+        .await
+        .expect_err("unindexed queries must fail");
+    assert!(
+        err.to_string().contains("indexOn"),
+        "the error should name the missing index: {err}"
+    );
+
+    base.remove().await.expect("cleanup");
+    cleanup_auth(&auth).await;
+    delete_app(&app).await.expect("delete_app");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Firebase credentials"]
+async fn database_listeners_receive_remote_writes() {
+    let test = "database_listeners_receive_remote_writes";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    if !require_database(test, &config) {
+        return;
+    }
+    let (app, auth, database) = database_test_setup(&config, "database-listen").await;
+    // A second client so the updates genuinely travel through the server.
+    let (writer_app, writer_auth, writer_database) = database_test_setup(&config, "database-writer").await;
+
+    let root_path = format!("rust_sdk_live_tests/{}", nonce());
+    let watched = database.reference(&root_path).expect("reference");
+    let remote = writer_database.reference(&root_path).expect("reference");
+
+    let values: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&values);
+    let registration = watched
+        .on_value(move |event| {
+            if let Ok(snapshot) = event {
+                recorder.lock().expect("lock").push(snapshot.value().clone());
+            }
+        })
+        .await
+        .expect("on_value");
+
+    let children: Arc<std::sync::Mutex<Vec<(String, Value)>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let child_recorder = Arc::clone(&children);
+    let child_registration = watched
+        .on_child_added(move |event| {
+            if let Ok(event) = event {
+                child_recorder.lock().expect("lock").push((
+                    event.snapshot.key().unwrap_or_default().to_string(),
+                    event.snapshot.value().clone(),
+                ));
+            }
+        })
+        .await
+        .expect("on_child_added");
+
+    // The initial event reports "no data yet".
+    assert_eq!(values.lock().expect("lock").as_slice(), &[Value::Null]);
+
+    remote
+        .child("a")
+        .expect("child")
+        .set(json!(1))
+        .await
+        .expect("remote set");
+    wait_for(
+        || values.lock().expect("lock").len() >= 2,
+        "value listener must see the remote write",
+    )
+    .await;
+    assert_eq!(values.lock().expect("lock").last().cloned(), Some(json!({"a": 1})));
+
+    remote
+        .child("b")
+        .expect("child")
+        .set(json!(2))
+        .await
+        .expect("remote set");
+    wait_for(
+        || children.lock().expect("lock").len() >= 2,
+        "child_added must fire for the second child",
+    )
+    .await;
+    assert_eq!(
+        children.lock().expect("lock").as_slice(),
+        &[("a".to_string(), json!(1)), ("b".to_string(), json!(2))]
+    );
+
+    // A location kept in sync by a listener reads back from that live view.
+    assert_eq!(watched.get().await.expect("get"), json!({"a": 1, "b": 2}));
+
+    // Detaching stops the events.
+    registration.detach();
+    child_registration.detach();
+    let seen_before = values.lock().expect("lock").len();
+    remote
+        .child("c")
+        .expect("child")
+        .set(json!(3))
+        .await
+        .expect("remote set");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        values.lock().expect("lock").len(),
+        seen_before,
+        "a detached listener must not receive events"
+    );
+    // ... and reads go back to the server.
+    assert_eq!(watched.get().await.expect("get"), json!({"a": 1, "b": 2, "c": 3}));
+
+    remote.remove().await.expect("cleanup");
+    cleanup_auth(&auth).await;
+    cleanup_auth(&writer_auth).await;
+    delete_app(&app).await.expect("delete_app");
+    delete_app(&writer_app).await.expect("delete_app");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Firebase credentials"]
+async fn database_transactions_use_compare_and_set() {
+    let test = "database_transactions_use_compare_and_set";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    if !require_database(test, &config) {
+        return;
+    }
+    let (app, auth, database) = database_test_setup(&config, "database-txn").await;
+    let (other_app, other_auth, other_database) = database_test_setup(&config, "database-txn-other").await;
+
+    let root_path = format!("rust_sdk_live_tests/{}", nonce());
+    let counter = database.reference(&format!("{root_path}/counter")).expect("reference");
+    let other_counter = other_database
+        .reference(&format!("{root_path}/counter"))
+        .expect("reference");
+
+    // A transaction on a location that does not exist yet sees `null`.
+    let result = counter
+        .run_transaction(|current| {
+            assert_eq!(current, Value::Null, "a missing node must be reported as null");
+            Some(json!(1))
+        })
+        .await
+        .expect("transaction");
+    assert!(result.committed);
+    assert_eq!(result.snapshot.value(), &json!(1));
+
+    // Two clients incrementing at once must both land: the loser retries against fresh data.
+    let mine = counter.run_transaction(|current| Some(json!(current.as_i64().unwrap_or(0) + 1)));
+    let theirs = other_counter.run_transaction(|current| Some(json!(current.as_i64().unwrap_or(0) + 1)));
+    let (mine, theirs) = futures::future::join(mine, theirs).await;
+    assert!(mine.expect("transaction").committed);
+    assert!(theirs.expect("transaction").committed);
+    assert_eq!(
+        counter.get().await.expect("get"),
+        json!(3),
+        "concurrent transactions must not lose an update"
+    );
+
+    // Returning `None` aborts without writing.
+    let aborted = counter.run_transaction(|_| None).await.expect("transaction");
+    assert!(!aborted.committed);
+    assert_eq!(aborted.snapshot.value(), &json!(3));
+    assert_eq!(counter.get().await.expect("get"), json!(3));
+
+    database
+        .reference(&root_path)
+        .expect("reference")
+        .remove()
+        .await
+        .expect("cleanup");
+    cleanup_auth(&auth).await;
+    cleanup_auth(&other_auth).await;
+    delete_app(&app).await.expect("delete_app");
+    delete_app(&other_app).await.expect("delete_app");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Firebase credentials"]
+async fn database_rules_report_permission_denied() {
+    let test = "database_rules_report_permission_denied";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    if !require_database(test, &config) {
+        return;
+    }
+    let (app, auth, database) = database_test_setup(&config, "database-rules").await;
+
+    // Nothing outside `rust_sdk_live_tests/` is readable or writable.
+    let forbidden = database.reference("forbidden/area").expect("reference");
+    let err = forbidden.set(json!(1)).await.expect_err("rules must deny the write");
+    assert_eq!(err.code, DatabaseErrorCode::PermissionDenied, "got {err}");
+    let err = forbidden.get().await.expect_err("rules must deny the read");
+    assert_eq!(err.code, DatabaseErrorCode::PermissionDenied, "got {err}");
+
+    // Attaching a listener to a location the rules hide fails immediately instead of hanging on a
+    // listen the server will never answer.
+    let err = forbidden
+        .on_value(|_| {})
+        .await
+        .expect_err("rules must deny the listen");
+    assert_eq!(err.code, DatabaseErrorCode::PermissionDenied, "got {err}");
+
+    // Reads and writes inside the test area still work for the signed-in user.
+    let allowed = database
+        .reference(&format!("rust_sdk_live_tests/{}/ok", nonce()))
+        .expect("reference");
+    allowed.set(json!("visible")).await.expect("write inside the rules");
+    assert_eq!(allowed.get().await.expect("get"), json!("visible"));
+    allowed.remove().await.expect("cleanup");
+
+    cleanup_auth(&auth).await;
+    delete_app(&app).await.expect("delete_app");
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -111,6 +111,24 @@ impl OnDisconnectAction {
     }
 }
 
+/// Wire action codes from `packages/database/src/core/PersistentConnection.ts`: `q` starts a
+/// listen, `n` cancels one. The server closes the connection when it is sent anything else.
+/// Builds the wire query object for a filtered listen, or `None` for a plain path listen.
+fn wire_query(spec: &ListenSpec) -> Option<serde_json::Map<String, JsonValue>> {
+    if spec.params().is_empty() {
+        return None;
+    }
+    Some(
+        spec.params()
+            .iter()
+            .map(|(key, value)| (key.clone(), JsonValue::String(value.clone())))
+            .collect(),
+    )
+}
+
+const LISTEN_ACTION: &str = "q";
+const UNLISTEN_ACTION: &str = "n";
+
 fn path_to_string(path: &[String]) -> String {
     if path.is_empty() {
         "/".to_string()
@@ -410,7 +428,7 @@ mod native {
     use std::sync::{Mutex as StdMutex, Weak};
 
     pub(super) fn websocket_transport(app: &FirebaseApp, repo: Weak<Repo>) -> Option<Arc<dyn RealtimeTransport>> {
-        let url = app.options().database_url?;
+        let url = crate::database::backend::database_url_for(app)?;
         let parsed = Url::parse(&url).ok()?;
         let info = RepoInfo::from_url(parsed)?;
         Some(Arc::new(NativeWebSocketTransport::new(info, app.clone(), repo)))
@@ -429,12 +447,17 @@ mod native {
     impl RepoInfo {
         fn from_url(mut url: Url) -> Option<Self> {
             let secure = matches!(url.scheme(), "https" | "wss");
-            let host = url.host_str()?.to_owned();
+            let hostname = url.host_str()?.to_owned();
+            // Emulators listen on a non-default port, which must survive into the websocket URL.
+            let host = match url.port() {
+                Some(port) => format!("{hostname}:{port}"),
+                None => hostname.clone(),
+            };
             let namespace = url
                 .query_pairs()
                 .find(|(key, _)| key == "ns")
                 .map(|(_, value)| value.into_owned())
-                .or_else(|| host.split('.').next().map(|segment| segment.to_owned()))?;
+                .or_else(|| hostname.split('.').next().map(|segment| segment.to_owned()))?;
             // The Realtime Database requires paths to be empty for root listens.
             url.set_path("");
             Some(Self {
@@ -508,6 +531,9 @@ mod native {
         next_request_id: AtomicU32,
         repo: StdMutex<Weak<Repo>>,
         pending_error: StdMutex<Option<DatabaseError>>,
+        /// Paths of listens waiting for their server response, so a rejected listen can be
+        /// reported to the listener that asked for it.
+        pending_listens: StdMutex<HashMap<u32, String>>,
     }
 
     impl NativeState {
@@ -519,6 +545,7 @@ mod native {
                 next_request_id: AtomicU32::new(0),
                 repo: StdMutex::new(repo),
                 pending_error: StdMutex::new(None),
+                pending_listens: StdMutex::new(HashMap::new()),
             }
         }
 
@@ -639,9 +666,30 @@ mod native {
             return Ok(());
         };
 
-        if data.contains_key("r") {
-            // Response frame; remove the pending handler once we track them.
-            NATIVE_LOGGER.debug("realtime response received".to_string());
+        if let Some(request_id) = data.get("r").and_then(|value| value.as_u64()) {
+            let path = state.pending_listens.lock().unwrap().remove(&(request_id as u32));
+            let status = data
+                .get("b")
+                .and_then(|body| body.get("s"))
+                .and_then(|status| status.as_str())
+                .unwrap_or("ok");
+            if status != "ok" {
+                let detail = data
+                    .get("b")
+                    .and_then(|body| body.get("d"))
+                    .and_then(|detail| detail.as_str())
+                    .unwrap_or(status)
+                    .to_string();
+                NATIVE_LOGGER.warn(format!("realtime request {request_id} rejected: {status} ({detail})"));
+                // A rejected listen must reach the listener that asked for it; the repo's cancel
+                // path already tears the listener down and reports the error.
+                if let (Some(path), Some(repo)) = (path, state.repo()) {
+                    let body = json!({ "p": path, "s": status, "d": detail });
+                    if let Err(err) = repo.handle_action("c", &body).await {
+                        NATIVE_LOGGER.warn(format!("failed to cancel rejected listen: {err}"));
+                    }
+                }
+            }
             return Ok(());
         }
 
@@ -770,33 +818,26 @@ mod native {
     }
 
     fn serialize_listen(state: &NativeState, spec: &ListenSpec) -> DatabaseResult<String> {
-        let mut params = JsonMap::new();
-        for (key, value) in spec.params() {
-            params.insert(key.clone(), JsonValue::String(value.clone()));
+        let mut body = JsonMap::new();
+        body.insert("p".to_string(), JsonValue::String(spec.path_string()));
+        // `q` is only sent for filtered listens; an empty object would make the server treat the
+        // listen as a query and reject it for having no tag.
+        if let Some(query) = wire_query(spec) {
+            body.insert("q".to_string(), JsonValue::Object(query));
         }
+        body.insert("h".to_string(), JsonValue::String(String::new()));
 
-        let body = json!({
-            "p": spec.path_string(),
-            "q": JsonValue::Object(params.clone()),
-            "h": "",
-        });
-
-        serialize_request(state, "listen", body)
+        serialize_request(state, LISTEN_ACTION, JsonValue::Object(body))
     }
 
     fn serialize_unlisten(state: &NativeState, spec: &ListenSpec) -> DatabaseResult<String> {
-        let mut params = JsonMap::new();
-        for (key, value) in spec.params() {
-            params.insert(key.clone(), JsonValue::String(value.clone()));
+        let mut body = JsonMap::new();
+        body.insert("p".to_string(), JsonValue::String(spec.path_string()));
+        if let Some(query) = wire_query(spec) {
+            body.insert("q".to_string(), JsonValue::Object(query));
         }
 
-        let body = json!({
-            "p": spec.path_string(),
-            "q": JsonValue::Object(params.clone()),
-            "h": "",
-        });
-
-        serialize_request(state, "unlisten", body)
+        serialize_request(state, UNLISTEN_ACTION, JsonValue::Object(body))
     }
 
     fn serialize_on_disconnect(state: &NativeState, command: &OnDisconnectCommand) -> DatabaseResult<String> {
@@ -840,6 +881,15 @@ mod native {
 
     fn serialize_request(state: &NativeState, action: &str, body: JsonValue) -> DatabaseResult<String> {
         let request_id = next_request_id(state);
+        if action == LISTEN_ACTION {
+            if let Some(path) = body.get("p").and_then(|value| value.as_str()) {
+                state
+                    .pending_listens
+                    .lock()
+                    .unwrap()
+                    .insert(request_id, path.to_string());
+            }
+        }
         let envelope = json!({
             "t": "d",
             "d": {
@@ -889,7 +939,7 @@ mod wasm {
     const LONG_POLL_ERROR_BACKOFF_MS: u32 = 5_000;
 
     pub(super) fn transport(app: &FirebaseApp, repo: Weak<Repo>) -> Option<Arc<dyn RealtimeTransport>> {
-        let url = app.options().database_url?;
+        let url = crate::database::backend::database_url_for(app)?;
         let parsed = Url::parse(&url).ok()?;
         let info = RepoInfo::from_url(parsed)?;
         Some(Arc::new(WasmRealtimeTransport::new(info, app.clone(), repo)))
@@ -908,12 +958,17 @@ mod wasm {
     impl RepoInfo {
         fn from_url(url: Url) -> Option<Self> {
             let secure = matches!(url.scheme(), "https" | "wss");
-            let host = url.host_str()?.to_string();
+            let hostname = url.host_str()?.to_string();
+            // Emulators listen on a non-default port, which must survive into the websocket URL.
+            let host = match url.port() {
+                Some(port) => format!("{hostname}:{port}"),
+                None => hostname.clone(),
+            };
             let namespace = url
                 .query_pairs()
                 .find(|(key, _)| key == "ns")
                 .map(|(_, value)| value.into_owned())
-                .or_else(|| host.split('.').next().map(|segment| segment.to_owned()))?;
+                .or_else(|| hostname.split('.').next().map(|segment| segment.to_owned()))?;
             Some(Self {
                 secure,
                 host,
@@ -1743,33 +1798,26 @@ mod wasm {
     }
 
     fn serialize_listen(state: &WasmState, spec: &ListenSpec) -> DatabaseResult<String> {
-        let mut params = JsonMap::new();
-        for (key, value) in spec.params() {
-            params.insert(key.clone(), JsonValue::String(value.clone()));
+        let mut body = JsonMap::new();
+        body.insert("p".to_string(), JsonValue::String(spec.path_string()));
+        // `q` is only sent for filtered listens; an empty object would make the server treat the
+        // listen as a query and reject it for having no tag.
+        if let Some(query) = wire_query(spec) {
+            body.insert("q".to_string(), JsonValue::Object(query));
         }
+        body.insert("h".to_string(), JsonValue::String(String::new()));
 
-        let body = json!({
-            "p": spec.path_string(),
-            "q": JsonValue::Object(params),
-            "h": "",
-        });
-
-        serialize_request(state, "listen", body)
+        serialize_request(state, LISTEN_ACTION, JsonValue::Object(body))
     }
 
     fn serialize_unlisten(state: &WasmState, spec: &ListenSpec) -> DatabaseResult<String> {
-        let mut params = JsonMap::new();
-        for (key, value) in spec.params() {
-            params.insert(key.clone(), JsonValue::String(value.clone()));
+        let mut body = JsonMap::new();
+        body.insert("p".to_string(), JsonValue::String(spec.path_string()));
+        if let Some(query) = wire_query(spec) {
+            body.insert("q".to_string(), JsonValue::Object(query));
         }
 
-        let body = json!({
-            "p": spec.path_string(),
-            "q": JsonValue::Object(params),
-            "h": "",
-        });
-
-        serialize_request(state, "unlisten", body)
+        serialize_request(state, UNLISTEN_ACTION, JsonValue::Object(body))
     }
 
     fn serialize_on_disconnect(state: &WasmState, command: &OnDisconnectCommand) -> DatabaseResult<String> {
@@ -1871,6 +1919,33 @@ mod tests {
             ));
             Ok(())
         }
+    }
+
+    #[test]
+    fn plain_listens_carry_no_query_object() {
+        let spec = ListenSpec::new(vec!["rooms".into(), "lobby".into()], Vec::new());
+        assert!(
+            wire_query(&spec).is_none(),
+            "an empty query object makes the server treat the listen as an untagged query and drop \
+             the connection"
+        );
+        assert_eq!(spec.path_string(), "/rooms/lobby");
+    }
+
+    #[test]
+    fn filtered_listens_carry_their_parameters() {
+        let spec = ListenSpec::new(vec!["rooms".into()], vec![("orderBy".to_string(), "\"score\"".to_string())]);
+        let query = wire_query(&spec).expect("filtered listens send a query object");
+        assert_eq!(query.get("orderBy").and_then(|value| value.as_str()), Some("\"score\""));
+    }
+
+    #[test]
+    fn wire_actions_match_the_realtime_protocol() {
+        assert_eq!(LISTEN_ACTION, "q");
+        assert_eq!(UNLISTEN_ACTION, "n");
+        assert_eq!(OnDisconnectAction::Put.code(), "o");
+        assert_eq!(OnDisconnectAction::Merge.code(), "om");
+        assert_eq!(OnDisconnectAction::Cancel.code(), "oc");
     }
 
     #[tokio::test]

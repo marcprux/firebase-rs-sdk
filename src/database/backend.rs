@@ -1,7 +1,5 @@
-#[cfg(not(target_arch = "wasm32"))]
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
-#[cfg(target_arch = "wasm32")]
-use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 #[cfg(not(target_arch = "wasm32"))]
@@ -26,6 +24,7 @@ use crate::auth::Auth;
 use crate::database::error::DatabaseResult;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::database::error::{internal_error, invalid_argument, permission_denied, DatabaseError};
+use crate::database::server_value::{contains_server_value, extract_data_ref, resolve_server_values};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::logger::Logger;
 #[cfg(not(target_arch = "wasm32"))]
@@ -37,16 +36,74 @@ type TokenFetcher = Arc<dyn Fn() -> BoxFuture<'static, DatabaseResult<Option<Str
 )]
 #[cfg_attr(not(all(feature = "wasm-web", target_arch = "wasm32")), async_trait)]
 pub(crate) trait DatabaseBackend: Send + Sync {
-    async fn set(&self, path: &[String], value: Value) -> DatabaseResult<()>;
-    async fn update(&self, base_path: &[String], updates: Vec<(Vec<String>, Value)>) -> DatabaseResult<()>;
+    /// Writes `value` and returns what the server actually stored, with any
+    /// [`ServerValue`](crate::database::server_timestamp) placeholders resolved.
+    async fn set(&self, path: &[String], value: Value) -> DatabaseResult<Value>;
+    /// Applies a multi-path update and returns the stored value for each path.
+    async fn update(
+        &self,
+        base_path: &[String],
+        updates: Vec<(Vec<String>, Value)>,
+    ) -> DatabaseResult<Vec<(Vec<String>, Value)>>;
     async fn delete(&self, path: &[String]) -> DatabaseResult<()>;
     async fn get(&self, path: &[String], query: &[(String, String)]) -> DatabaseResult<Value>;
+    /// Reads a value together with the version tag needed for a compare-and-set write.
+    async fn read_for_update(&self, path: &[String]) -> DatabaseResult<VersionedValue>;
+    /// Writes `value` only when the stored data still matches `version`, mirroring the REST
+    /// `if-match` / ETag protocol the Realtime Database exposes for transactions.
+    async fn compare_and_set(
+        &self,
+        path: &[String],
+        value: Value,
+        version: Option<String>,
+    ) -> DatabaseResult<CasOutcome>;
+}
+
+/// A value plus the opaque version tag that identifies it (an ETag for the REST backend).
+#[derive(Clone, Debug)]
+pub(crate) struct VersionedValue {
+    pub value: Value,
+    pub version: Option<String>,
+}
+
+/// Outcome of a [`DatabaseBackend::compare_and_set`] attempt.
+#[derive(Clone, Debug)]
+pub(crate) enum CasOutcome {
+    /// The write went through; carries the stored value.
+    Committed(Value),
+    /// Somebody else wrote first; carries the data as it is now.
+    Conflict(VersionedValue),
+}
+
+/// Database URLs installed by [`connect_database_emulator`](crate::database::connect_database_emulator),
+/// keyed by app name. Both the REST backend and the realtime transport resolve their endpoint
+/// through [`database_url_for`], so pointing an app at an emulator moves every channel at once.
+static URL_OVERRIDES: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Points `app_name` at `url` until it is overridden again.
+pub(crate) fn set_database_url_override(app_name: &str, url: String) {
+    URL_OVERRIDES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(app_name.to_string(), url);
+}
+
+/// The database URL an app should talk to: an emulator override when one is installed, otherwise
+/// the `databaseURL` from the app's options.
+pub(crate) fn database_url_for(app: &FirebaseApp) -> Option<String> {
+    if let Some(url) = URL_OVERRIDES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(app.name())
+    {
+        return Some(url.clone());
+    }
+    app.options().database_url
 }
 
 pub(crate) fn select_backend(app: &FirebaseApp) -> Arc<dyn DatabaseBackend> {
-    let options = app.options();
     #[cfg(not(target_arch = "wasm32"))]
-    if let Some(url) = options.database_url {
+    if let Some(url) = database_url_for(app) {
         let app_for_auth = app.clone();
         let auth_fetcher: TokenFetcher = Arc::new(move || {
             let container = app_for_auth.container();
@@ -114,7 +171,7 @@ pub(crate) fn select_backend(app: &FirebaseApp) -> Arc<dyn DatabaseBackend> {
     }
 
     #[cfg(target_arch = "wasm32")]
-    if let Some(_url) = options.database_url {
+    if let Some(_url) = database_url_for(app) {
         // REST backend not yet supported on wasm; fall back to in-memory.
     }
     Arc::new(InMemoryBackend::default())
@@ -138,18 +195,26 @@ impl Default for InMemoryBackend {
 )]
 #[cfg_attr(not(all(feature = "wasm-web", target_arch = "wasm32")), async_trait)]
 impl DatabaseBackend for InMemoryBackend {
-    async fn set(&self, path: &[String], value: Value) -> DatabaseResult<()> {
+    async fn set(&self, path: &[String], value: Value) -> DatabaseResult<Value> {
         let mut data = self.data.lock().unwrap();
-        set_at_path(&mut data, path, value);
-        Ok(())
+        let resolved = resolve_locally(&data, path, value)?;
+        set_at_path(&mut data, path, resolved.clone());
+        Ok(resolved)
     }
 
-    async fn update(&self, _base_path: &[String], updates: Vec<(Vec<String>, Value)>) -> DatabaseResult<()> {
+    async fn update(
+        &self,
+        _base_path: &[String],
+        updates: Vec<(Vec<String>, Value)>,
+    ) -> DatabaseResult<Vec<(Vec<String>, Value)>> {
         let mut data = self.data.lock().unwrap();
+        let mut stored = Vec::with_capacity(updates.len());
         for (path, value) in updates {
-            set_at_path(&mut data, &path, value);
+            let resolved = resolve_locally(&data, &path, value)?;
+            set_at_path(&mut data, &path, resolved.clone());
+            stored.push((path, resolved));
         }
-        Ok(())
+        Ok(stored)
     }
 
     async fn delete(&self, path: &[String]) -> DatabaseResult<()> {
@@ -162,6 +227,58 @@ impl DatabaseBackend for InMemoryBackend {
         let data = self.data.lock().unwrap();
         Ok(get_at_path(&data, path).cloned().unwrap_or(Value::Null))
     }
+
+    async fn read_for_update(&self, path: &[String]) -> DatabaseResult<VersionedValue> {
+        let data = self.data.lock().unwrap();
+        let value = get_at_path(&data, path).cloned().unwrap_or(Value::Null);
+        let version = Some(version_tag(&value));
+        Ok(VersionedValue { value, version })
+    }
+
+    async fn compare_and_set(
+        &self,
+        path: &[String],
+        value: Value,
+        version: Option<String>,
+    ) -> DatabaseResult<CasOutcome> {
+        let mut data = self.data.lock().unwrap();
+        let current = get_at_path(&data, path).cloned().unwrap_or(Value::Null);
+        if let Some(expected) = version {
+            if expected != version_tag(&current) {
+                return Ok(CasOutcome::Conflict(VersionedValue {
+                    version: Some(version_tag(&current)),
+                    value: current,
+                }));
+            }
+        }
+        let resolved = resolve_locally(&data, path, value)?;
+        if resolved.is_null() {
+            delete_at_path(&mut data, path);
+        } else {
+            set_at_path(&mut data, path, resolved.clone());
+        }
+        Ok(CasOutcome::Committed(resolved))
+    }
+}
+
+/// Resolves `.sv` placeholders against the local snapshot; the in-memory backend has no server to
+/// do it for us.
+fn resolve_locally(root: &Value, path: &[String], value: Value) -> DatabaseResult<Value> {
+    if !contains_server_value(&value) {
+        return Ok(value);
+    }
+    let current = get_at_path(root, path).cloned().unwrap_or(Value::Null);
+    resolve_server_values(value, Some(extract_data_ref(&current)))
+}
+
+/// Stable tag for a value, standing in for the REST backend's ETag.
+fn version_tag(value: &Value) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    value.to_string().hash(&mut hasher);
+    format!("{:x}", hasher.finish())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -314,19 +431,37 @@ async fn fetch_token(fetcher: &TokenFetcher) -> DatabaseResult<Option<String>> {
 #[cfg_attr(not(all(feature = "wasm-web", target_arch = "wasm32")), async_trait)]
 #[cfg(not(target_arch = "wasm32"))]
 impl DatabaseBackend for RestBackend {
-    async fn set(&self, path: &[String], value: Value) -> DatabaseResult<()> {
+    async fn set(&self, path: &[String], value: Value) -> DatabaseResult<Value> {
+        // The server resolves `.sv` placeholders and echoes the stored value back when we do not
+        // ask for a silent response, so a write with server values still costs a single request.
+        let resolves_server_values = contains_server_value(&value);
         let mut params = Vec::with_capacity(1);
-        params.push(("print".to_string(), "silent".to_string()));
+        if !resolves_server_values {
+            params.push(("print".to_string(), "silent".to_string()));
+        }
         let response = self.send_request(Method::PUT, path, &params, Some(&value)).await?;
-        self.ensure_success(response).await.map(|_| ())
+        let response = self.ensure_success(response).await?;
+        if !resolves_server_values {
+            return Ok(value);
+        }
+        response
+            .json()
+            .await
+            .map_err(|err| internal_error(format!("Failed to decode database response: {err}")))
     }
 
-    async fn update(&self, base_path: &[String], updates: Vec<(Vec<String>, Value)>) -> DatabaseResult<()> {
+    async fn update(
+        &self,
+        base_path: &[String],
+        updates: Vec<(Vec<String>, Value)>,
+    ) -> DatabaseResult<Vec<(Vec<String>, Value)>> {
         if updates.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let mut payload = Map::with_capacity(updates.len());
+        let mut keys = Vec::with_capacity(updates.len());
+        let mut resolves_server_values = false;
         for (absolute_path, value) in updates {
             if !path_starts_with(&absolute_path, base_path) {
                 return Err(internal_error("Database update contained a path outside the reference"));
@@ -337,16 +472,35 @@ impl DatabaseBackend for RestBackend {
                     "Database update path cannot be empty relative to the reference",
                 ));
             }
-            payload.insert(relative.join("/"), value);
+            resolves_server_values |= contains_server_value(&value);
+            let key = relative.join("/");
+            keys.push((key.clone(), absolute_path, value.clone()));
+            payload.insert(key, value);
         }
 
         let body = Value::Object(payload);
         let mut params = Vec::with_capacity(1);
-        params.push(("print".to_string(), "silent".to_string()));
+        if !resolves_server_values {
+            params.push(("print".to_string(), "silent".to_string()));
+        }
         let response = self
             .send_request(Method::PATCH, base_path, &params, Some(&body))
             .await?;
-        self.ensure_success(response).await.map(|_| ())
+        let response = self.ensure_success(response).await?;
+
+        let stored: Option<Map<String, Value>> = if resolves_server_values {
+            response.json().await.ok()
+        } else {
+            None
+        };
+
+        Ok(keys
+            .into_iter()
+            .map(|(key, absolute_path, value)| {
+                let stored_value = stored.as_ref().and_then(|map| map.get(&key).cloned()).unwrap_or(value);
+                (absolute_path, stored_value)
+            })
+            .collect())
     }
 
     async fn delete(&self, path: &[String]) -> DatabaseResult<()> {
@@ -379,6 +533,75 @@ impl DatabaseBackend for RestBackend {
             .await
             .map_err(|err| internal_error(format!("Failed to decode database response: {err}")))
     }
+
+    async fn read_for_update(&self, path: &[String]) -> DatabaseResult<VersionedValue> {
+        let params = vec![("format".to_string(), "export".to_string())];
+        let augmented_query = self.query_with_tokens(&params).await?;
+        let url = self.url_for_path(path, &augmented_query)?;
+        let response = self
+            .client
+            .get(url)
+            .header(FIREBASE_ETAG_HEADER, "true")
+            .send()
+            .await
+            .map_err(|err| self.handle_reqwest_error(err))?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(VersionedValue {
+                value: Value::Null,
+                version: None,
+            });
+        }
+
+        let version = etag_of(&response);
+        let response = self.ensure_success(response).await?;
+        let value = response
+            .json()
+            .await
+            .map_err(|err| internal_error(format!("Failed to decode database response: {err}")))?;
+        Ok(VersionedValue { value, version })
+    }
+
+    async fn compare_and_set(
+        &self,
+        path: &[String],
+        value: Value,
+        version: Option<String>,
+    ) -> DatabaseResult<CasOutcome> {
+        let augmented_query = self.query_with_tokens(&[]).await?;
+        let url = self.url_for_path(path, &augmented_query)?;
+        let mut request = self.client.put(url).json(&value);
+        if let Some(version) = version.as_deref() {
+            request = request.header(IF_MATCH_HEADER, version);
+        }
+        let response = request.send().await.map_err(|err| self.handle_reqwest_error(err))?;
+
+        if response.status() == StatusCode::PRECONDITION_FAILED {
+            // The body carries the data as it is now, so a retry needs no extra read.
+            let version = etag_of(&response);
+            let value = response.json().await.unwrap_or(Value::Null);
+            return Ok(CasOutcome::Conflict(VersionedValue { value, version }));
+        }
+
+        let response = self.ensure_success(response).await?;
+        let stored = response.json().await.unwrap_or(value);
+        Ok(CasOutcome::Committed(stored))
+    }
+}
+
+/// Header that asks the Realtime Database REST API to return an ETag for the read value.
+#[cfg(not(target_arch = "wasm32"))]
+const FIREBASE_ETAG_HEADER: &str = "X-Firebase-ETag";
+#[cfg(not(target_arch = "wasm32"))]
+const IF_MATCH_HEADER: &str = "if-match";
+
+#[cfg(not(target_arch = "wasm32"))]
+fn etag_of(response: &Response) -> Option<String> {
+    response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string())
 }
 
 fn set_at_path(root: &mut Value, path: &[String], value: Value) {
@@ -506,6 +729,103 @@ mod tests {
         backend.get(&["items".to_string()], &[]).await.unwrap();
 
         get_mock.assert();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rest_backend_lets_the_server_resolve_server_values() {
+        let server = MockServer::start();
+
+        // No `print=silent`: the response body carries the value the server stored.
+        let put_mock = server.mock(|when, then| {
+            when.method(PUT)
+                .path("/stamped.json")
+                .json_body(json!({"at": {".sv": "timestamp"}}));
+            then.status(200).body(r#"{"at":1700000000000}"#);
+        });
+
+        let backend = RestBackend::new(server.url("/"), empty_token(), empty_token()).unwrap();
+        let stored = backend
+            .set(&["stamped".to_string()], json!({"at": {".sv": "timestamp"}}))
+            .await
+            .unwrap();
+
+        put_mock.assert();
+        assert_eq!(stored, json!({"at": 1_700_000_000_000_u64}));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rest_backend_reads_and_writes_with_etags() {
+        let server = MockServer::start();
+
+        let read_mock = server.mock(|when, then| {
+            when.method(GET).path("/counter.json").header("X-Firebase-ETag", "true");
+            then.status(200).header("ETag", "tag-1").body("7");
+        });
+        let write_mock = server.mock(|when, then| {
+            when.method(PUT).path("/counter.json").header("if-match", "tag-1");
+            then.status(200).body("8");
+        });
+
+        let backend = RestBackend::new(server.url("/"), empty_token(), empty_token()).unwrap();
+        let current = backend.read_for_update(&["counter".to_string()]).await.unwrap();
+        assert_eq!(current.value, json!(7));
+        assert_eq!(current.version.as_deref(), Some("tag-1"));
+
+        let outcome = backend
+            .compare_and_set(&["counter".to_string()], json!(8), current.version)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CasOutcome::Committed(value) if value == json!(8)));
+
+        read_mock.assert();
+        write_mock.assert();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rest_backend_reports_a_lost_race_as_a_conflict() {
+        let server = MockServer::start();
+
+        // 412 carries the data as it is now, so the caller can retry without another read.
+        let conflict_mock = server.mock(|when, then| {
+            when.method(PUT).path("/counter.json").header("if-match", "stale");
+            then.status(412).header("ETag", "tag-2").body("9");
+        });
+
+        let backend = RestBackend::new(server.url("/"), empty_token(), empty_token()).unwrap();
+        let outcome = backend
+            .compare_and_set(&["counter".to_string()], json!(8), Some("stale".to_string()))
+            .await
+            .unwrap();
+
+        conflict_mock.assert();
+        match outcome {
+            CasOutcome::Conflict(latest) => {
+                assert_eq!(latest.value, json!(9));
+                assert_eq!(latest.version.as_deref(), Some("tag-2"));
+            }
+            CasOutcome::Committed(value) => panic!("expected a conflict, committed {value}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_memory_backend_resolves_server_values_and_detects_conflicts() {
+        let backend = InMemoryBackend::default();
+        let path = vec!["counter".to_string()];
+
+        backend.set(&path, json!(5)).await.unwrap();
+        let stored = backend.set(&path, json!({".sv": {"increment": 3}})).await.unwrap();
+        assert_eq!(stored, json!(8.0));
+
+        let current = backend.read_for_update(&path).await.unwrap();
+        let outcome = backend.compare_and_set(&path, json!(9), current.version).await.unwrap();
+        assert!(matches!(outcome, CasOutcome::Committed(_)));
+
+        let outcome = backend
+            .compare_and_set(&path, json!(10), Some("not-the-current-tag".to_string()))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CasOutcome::Conflict(_)), "a stale tag must not write");
+        assert_eq!(backend.get(&path, &[]).await.unwrap(), json!(9));
     }
 
     #[tokio::test(flavor = "multi_thread")]

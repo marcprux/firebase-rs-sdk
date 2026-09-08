@@ -2,21 +2,23 @@
 
 This module ports core pieces of the Realtime Database from the Firebase JS SDK to Rust.
 
-It wires the Database component into the `FirebaseApp`, provides an in-memory backend for quick tests, and can fall back to the REST API for basic reads and writes against an emulator or hosted backend. 
+It wires the Database component into the `FirebaseApp`, provides an in-memory backend for quick tests, and talks to a real database over REST for reads, writes, queries and transactions.
 
-Live streaming connections and the richer reference/query surface from the JS SDK are still pending.
+Listeners run over the Realtime Database websocket protocol, so `on_value` and the child events see writes made by other clients. Filtered listens are still served by re-running the query when the path changes, and the connection does not yet reconnect on its own.
 
 It includes error handling, configuration options, and integration with Firebase apps.
 
-Porting status: 30% `[###       ]` ([details](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/database/PORTING_STATUS.md))
+Porting status: 55% `[#####+    ]` ([details](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/database/PORTING_STATUS.md))
 
 ## Features
 
 - Component registration and shared get_database resolution
 - Reference CRUD with auto-ID push and path navigation (parent/root)
-- Priority-aware writes plus server value helpers (server_timestamp increment)
+- Priority-aware writes plus server value helpers (`server_timestamp`, `increment`) resolved by the server
+- Compare-and-set transactions over the REST ETag protocol
+- `connect_database_emulator` for the Realtime Database emulator
 - Snapshot traversal (child, has_child, size, to_json) and value/child listeners
-- Dual backends (in-memory + REST) with unit test coverage
+- Dual backends (in-memory + REST) with unit test coverage, plus emulator-backed integration tests
 
 ## Quick Start Example
 

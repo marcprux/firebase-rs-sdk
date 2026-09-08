@@ -132,7 +132,8 @@ In the analytics module a unit test that exercises the dispatcher is skipped by 
 
 ### Against the Local Emulator Suite (default, no credentials)
 
-Auth, Firestore, Storage and callable Functions run against the Firebase emulators. One-time setup:
+Auth, Firestore, Realtime Database, Storage and callable Functions run against the Firebase
+emulators. One-time setup:
 
 ```bash
 npm install -g firebase-tools     # needs Node 20+ and Java 11+
@@ -148,11 +149,11 @@ scripts/emulator_test.sh firestore_transaction  # only matching tests
 
 The script wraps `firebase emulators:exec` with a `demo-*` project id, so the CLI never contacts
 Google and needs no login. The emulated project is defined entirely under `firebase-emulator/`
-(`firebase.json`, `firestore.rules`, `storage.rules`, `functions/index.js`); the rules mirror what
-the online project uses.
+(`firebase.json`, `firestore.rules`, `database.rules.json`, `storage.rules`, `functions/index.js`);
+the rules mirror what the online project uses.
 The harness reads the standard `FIREBASE_AUTH_EMULATOR_HOST`, `FIRESTORE_EMULATOR_HOST`,
-`FIREBASE_STORAGE_EMULATOR_HOST` and `FIREBASE_FUNCTIONS_EMULATOR_HOST` variables, so any other
-way of starting the emulators works too.
+`FIREBASE_DATABASE_EMULATOR_HOST`, `FIREBASE_STORAGE_EMULATOR_HOST` and
+`FIREBASE_FUNCTIONS_EMULATOR_HOST` variables, so any other way of starting the emulators works too.
 
 ### Against the online project (Installations, Remote Config)
 

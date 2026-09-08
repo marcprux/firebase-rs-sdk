@@ -31,7 +31,9 @@ impl OnDisconnect {
     where
         V: Into<Value>,
     {
-        let resolved = self.reference.resolve_for_current_path(value.into()).await?;
+        // `.sv` placeholders travel to the server untouched: onDisconnect writes are resolved
+        // when the connection actually drops, not when they are registered.
+        let resolved = value.into();
         self.reference
             .database()
             .repo()
@@ -51,7 +53,9 @@ impl OnDisconnect {
             return Err(invalid_argument("set_with_priority failed: read-only child key"));
         }
 
-        let resolved = self.reference.resolve_for_current_path(value.into()).await?;
+        // `.sv` placeholders travel to the server untouched: onDisconnect writes are resolved
+        // when the connection actually drops, not when they are registered.
+        let resolved = value.into();
         let payload = pack_with_priority(resolved, priority);
         self.reference
             .database()
@@ -82,7 +86,7 @@ impl OnDisconnect {
 
             let mut absolute = base_path.clone();
             absolute.extend(relative_segments.clone());
-            let resolved = self.reference.resolve_for_absolute_path(&absolute, value).await?;
+            let resolved = value;
             let canonical = relative_segments.join("/");
             payload.insert(canonical, resolved);
         }

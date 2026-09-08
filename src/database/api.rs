@@ -1,25 +1,27 @@
 use std::collections::{BTreeMap, HashMap};
-use std::convert::TryInto;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Value};
 
 use crate::app;
 use crate::app::FirebaseApp;
 use crate::component::types::{ComponentError, DynService, InstanceFactoryOptions, InstantiationMode};
 use crate::component::{Component, ComponentType};
-use crate::database::backend::{select_backend, DatabaseBackend};
+use crate::database::backend::{select_backend, CasOutcome, DatabaseBackend};
 use crate::database::constants::DATABASE_COMPONENT_NAME;
-use crate::database::error::{internal_error, invalid_argument, DatabaseError, DatabaseResult};
+use crate::database::error::{internal_error, invalid_argument, permission_denied, DatabaseError, DatabaseResult};
 use crate::database::on_disconnect::OnDisconnect;
 use crate::database::push_id::next_push_id;
 use crate::database::query::{QueryBound, QueryIndex, QueryLimit, QueryParams};
 use crate::database::realtime::{ListenSpec, Repo};
+use crate::database::server_value::{current_time_millis, extract_data_ref};
 use crate::logger::Logger;
 use crate::platform::runtime;
+
+/// Attempts a transaction makes before giving up, matching the Web SDK's retry budget.
+const MAX_TRANSACTION_ATTEMPTS: usize = 25;
 
 static REALTIME_LOGGER: LazyLock<Logger> = LazyLock::new(|| Logger::new("@firebase/database/realtime"));
 
@@ -30,11 +32,16 @@ pub struct Database {
 
 struct DatabaseInner {
     app: FirebaseApp,
-    backend: Arc<dyn DatabaseBackend>,
-    repo: Arc<Repo>,
+    /// Swappable so `connect_database_emulator` can re-point a database that has already been
+    /// created, the way `connectDatabaseEmulator` does in the JS SDK.
+    backend: RwLock<Arc<dyn DatabaseBackend>>,
+    repo: RwLock<Arc<Repo>>,
     listeners: Mutex<HashMap<u64, Listener>>,
     next_listener_id: AtomicU64,
-    root_cache: Mutex<Option<Value>>,
+    /// Partial mirror of the server's tree, holding only the data this client has read or
+    /// received for its listeners. The Web SDK keeps the same kind of local view in its
+    /// `SyncTree`; nothing here is ever populated by reading the whole database.
+    mirror: Mutex<Value>,
 }
 
 impl fmt::Debug for DatabaseInner {
@@ -217,6 +224,12 @@ impl DataSnapshot {
 
 /// RAII-style listener registration; dropping the handle detaches the
 /// underlying listener.
+impl fmt::Debug for ListenerRegistration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ListenerRegistration").field("id", &self.id).finish()
+    }
+}
+
 pub struct ListenerRegistration {
     database: Database,
     id: Option<u64>,
@@ -539,12 +552,12 @@ impl Database {
     fn new(app: FirebaseApp) -> Self {
         let repo = Repo::new_for_app(&app);
         let inner = Arc::new(DatabaseInner {
-            backend: select_backend(&app),
-            repo: repo.clone(),
+            backend: RwLock::new(select_backend(&app)),
+            repo: RwLock::new(repo.clone()),
             app,
             listeners: Mutex::new(HashMap::new()),
             next_listener_id: AtomicU64::new(1),
-            root_cache: Mutex::new(None),
+            mirror: Mutex::new(Value::Object(Map::new())),
         });
         let database = Self { inner };
         let handler_db = database.clone();
@@ -555,18 +568,115 @@ impl Database {
         database
     }
 
-    fn cache_root(&self, value: Value) {
-        *self.inner.root_cache.lock().unwrap() = Some(value);
+    /// True when a value listener keeps `path` (or one of its ancestors) in sync, so the mirror
+    /// holds a complete view of it.
+    fn is_synced(&self, path: &[String]) -> bool {
+        let listeners = self.inner.listeners.lock().unwrap();
+        listeners.values().any(|listener| match &listener.target {
+            ListenerTarget::Reference(listen_path) => {
+                listen_path.len() <= path.len() && path[..listen_path.len()] == listen_path[..]
+            }
+            ListenerTarget::Query { .. } => false,
+        })
+    }
+
+    /// Returns the current local mirror. This never touches the network: data lands here when a
+    /// listener is attached, when the realtime connection pushes an update, and after local writes.
+    fn mirror_snapshot(&self) -> Value {
+        self.inner.mirror.lock().unwrap().clone()
+    }
+
+    /// Applies a write to the local mirror and notifies listeners about what changed.
+    async fn apply_local_write(&self, path: &[String], value: Value) -> DatabaseResult<()> {
+        let (old_root, new_root) = {
+            let mut mirror = self.inner.mirror.lock().unwrap();
+            let old_root = mirror.clone();
+            apply_realtime_value(&mut mirror, path, value);
+            (old_root, mirror.clone())
+        };
+        self.dispatch_listeners(path, &old_root, &new_root).await
+    }
+
+    /// Seeds the mirror for a newly attached listener and returns the mirror.
+    async fn seed_listener_path(&self, target: &ListenerTarget) -> DatabaseResult<Value> {
+        match target {
+            ListenerTarget::Reference(path) => self.seed_mirror(path).await,
+            // Query listeners re-read their window from the server on every event, so there is
+            // nothing to seed.
+            ListenerTarget::Query { .. } => Ok(self.mirror_snapshot()),
+        }
+    }
+
+    /// Reads `path` from the server and seeds the mirror with it, so a freshly attached listener
+    /// can report an initial value without reading the whole database.
+    async fn seed_mirror(&self, path: &[String]) -> DatabaseResult<Value> {
+        let value = self.backend().get(path, &[]).await?;
+        let mut mirror = self.inner.mirror.lock().unwrap();
+        apply_realtime_value(&mut mirror, path, value);
+        Ok(mirror.clone())
     }
 
     pub(crate) fn repo(&self) -> Arc<Repo> {
-        self.inner.repo.clone()
+        self.inner.repo.read().unwrap().clone()
+    }
+
+    fn backend(&self) -> Arc<dyn DatabaseBackend> {
+        self.inner.backend.read().unwrap().clone()
+    }
+
+    /// The Realtime Database namespace this instance talks to (`<project>-default-rtdb` unless the
+    /// configured `databaseURL` names another one).
+    fn namespace(&self) -> String {
+        let configured = self.inner.app.options().database_url.and_then(|url| {
+            let parsed = url::Url::parse(&url).ok()?;
+            parsed
+                .query_pairs()
+                .find(|(key, _)| key == "ns")
+                .map(|(_, value)| value.into_owned())
+                .or_else(|| {
+                    parsed
+                        .host_str()
+                        .and_then(|host| host.split('.').next().map(|label| label.to_string()))
+                })
+        });
+        configured.unwrap_or_else(|| {
+            let project = self.inner.app.options().project_id.unwrap_or_default();
+            format!("{project}-default-rtdb")
+        })
+    }
+
+    /// Routes this database at the Realtime Database emulator, mirroring `connectDatabaseEmulator`.
+    ///
+    /// Both the REST channel and the realtime connection move, so reads, writes and listeners all
+    /// talk to the emulator. Call it before attaching listeners; the JS SDK likewise refuses once
+    /// the instance is in use.
+    pub fn connect_emulator(&self, host: &str, port: u16) -> DatabaseResult<()> {
+        if !self.inner.listeners.lock().unwrap().is_empty() {
+            return Err(invalid_argument(
+                "connect_database_emulator must be called before attaching listeners",
+            ));
+        }
+
+        let url = format!("http://{host}:{port}/?ns={}", self.namespace());
+        crate::database::backend::set_database_url_override(self.inner.app.name(), url);
+
+        *self.inner.backend.write().unwrap() = select_backend(&self.inner.app);
+
+        let repo = Repo::new_for_app(&self.inner.app);
+        let handler_db = self.clone();
+        repo.set_event_handler(Arc::new(move |action, body| {
+            let database = handler_db.clone();
+            Box::pin(async move { database.handle_realtime_action(&action, &body).await })
+        }));
+        *self.inner.repo.write().unwrap() = repo;
+        *self.inner.mirror.lock().unwrap() = Value::Object(Map::new());
+        Ok(())
     }
 
     #[allow(dead_code)]
     #[cfg(test)]
-    fn clear_root_cache_for_test(&self) {
-        *self.inner.root_cache.lock().unwrap() = None;
+    fn clear_mirror_for_test(&self) {
+        *self.inner.mirror.lock().unwrap() = Value::Object(Map::new());
     }
 
     async fn handle_realtime_action(&self, action: &str, body: &serde_json::Value) -> DatabaseResult<()> {
@@ -599,7 +709,7 @@ impl Database {
         let data = body.get("d").cloned().unwrap_or(serde_json::Value::Null);
 
         let segments = normalize_path(path)?;
-        let old_root = self.root_snapshot().await?;
+        let old_root = self.mirror_snapshot();
         let mut new_root = old_root.clone();
 
         match action {
@@ -619,9 +729,8 @@ impl Database {
 
         REALTIME_LOGGER.debug(format!("realtime payload action={action} path={path} data={data:?}"));
 
-        let new_root_for_cache = new_root.clone();
+        *self.inner.mirror.lock().unwrap() = new_root.clone();
         self.dispatch_listeners(&segments, &old_root, &new_root).await?;
-        self.cache_root(new_root_for_cache);
         Ok(())
     }
 
@@ -661,12 +770,24 @@ impl Database {
         }
 
         for listener in &removed {
-            if let Err(err) = self.inner.repo.unlisten(listener.spec.clone()).await {
+            if let Err(err) = self.repo().unlisten(listener.spec.clone()).await {
                 REALTIME_LOGGER.warn(format!("failed to detach revoked realtime listener: {err}"));
             }
         }
 
-        let error = internal_error("listener revoked by server".to_string());
+        // Preserve what the server said: a listen rejected by the rules must surface as
+        // `permission_denied`, matching the JS SDK's cancel callback.
+        let status = body.get("s").and_then(|value| value.as_str()).unwrap_or_default();
+        let detail = body
+            .get("d")
+            .and_then(|value| value.as_str())
+            .unwrap_or("listener revoked by server")
+            .to_string();
+        let error = if status == "permission_denied" {
+            permission_denied(detail)
+        } else {
+            internal_error(detail)
+        };
         for listener in removed {
             match listener.kind {
                 ListenerKind::Value(callback) => {
@@ -704,11 +825,11 @@ impl Database {
     }
 
     pub async fn go_online(&self) -> DatabaseResult<()> {
-        self.inner.repo.go_online().await
+        self.repo().go_online().await
     }
 
     pub async fn go_offline(&self) -> DatabaseResult<()> {
-        self.inner.repo.go_offline().await
+        self.repo().go_offline().await
     }
 
     pub fn app(&self) -> &FirebaseApp {
@@ -730,22 +851,19 @@ impl Database {
         }
     }
 
+    /// Every listener subscribes to a plain path on the realtime connection.
+    ///
+    /// The wire protocol only accepts a filtered listen when it carries a tag that routes the
+    /// server's windowed pushes (an untagged query listen makes the server drop the whole
+    /// connection). Until tagged views are ported, a query listener subscribes to its path and
+    /// re-runs the query against the server whenever that path changes; sharing one spec across
+    /// every query on a path also lets the repo reference-count them.
     fn listen_spec_for_target(&self, target: &ListenerTarget) -> DatabaseResult<ListenSpec> {
-        match target {
-            ListenerTarget::Reference(path) => Ok(ListenSpec::new(path.clone(), Vec::new())),
-            ListenerTarget::Query { path, params } => {
-                let mut rest_params = params.to_rest_params()?;
-                // REST params may omit `format=export` when not required; add it
-                // to stabilise server-side hashing so multiple listeners with
-                // equivalent semantics collapse to the same spec. This mirrors
-                // the JS SDK behaviour where the listen ID incorporates the
-                // complete query object, including defaults.
-                if rest_params.iter().all(|(key, _)| key != "format") {
-                    rest_params.push(("format".to_string(), "export".to_string()));
-                }
-                Ok(ListenSpec::new(path.clone(), rest_params))
-            }
-        }
+        let path = match target {
+            ListenerTarget::Reference(path) => path.clone(),
+            ListenerTarget::Query { path, .. } => path.clone(),
+        };
+        Ok(ListenSpec::new(path, Vec::new()))
     }
 
     async fn register_listener(
@@ -778,16 +896,15 @@ impl Database {
             }
         }
 
-        if let Err(err) = self.inner.repo.listen(spec.clone()).await {
-            let mut listeners = self.inner.listeners.lock().unwrap();
-            listeners.remove(&id);
+        if let Err(err) = self.repo().listen(spec.clone()).await {
+            self.inner.listeners.lock().unwrap().remove(&id);
             if first_listener {
                 let _ = self.go_offline().await;
             }
             return Err(err);
         }
 
-        let current_root = match self.root_snapshot().await {
+        let current_root = match self.seed_listener_path(&target).await {
             Ok(root) => root,
             Err(err) => {
                 self.remove_listener(id);
@@ -819,7 +936,7 @@ impl Database {
         };
 
         if let Some(listener) = listener {
-            let repo = self.inner.repo.clone();
+            let repo = self.repo();
             let spec = listener.spec.clone();
             runtime::spawn_detached(async move {
                 if let Err(err) = repo.unlisten(spec).await {
@@ -856,6 +973,13 @@ impl Database {
         for listener in listeners {
             match &listener.kind {
                 ListenerKind::Value(callback) => {
+                    // The Web SDK only raises a value event when the view actually changed; without
+                    // this the server's echo of a local write would fire a duplicate event.
+                    if let ListenerTarget::Reference(path) = &listener.target {
+                        if value_at_path(old_root, path) == value_at_path(new_root, path) {
+                            continue;
+                        }
+                    }
                     let snapshot = self.snapshot_from_root(&listener.target, new_root).await?;
                     callback(Ok(snapshot));
                 }
@@ -865,15 +989,6 @@ impl Database {
             }
         }
         Ok(())
-    }
-
-    async fn root_snapshot(&self) -> DatabaseResult<Value> {
-        if let Some(value) = self.inner.root_cache.lock().unwrap().clone() {
-            return Ok(value);
-        }
-        let value = self.inner.backend.get(&[], &[]).await?;
-        *self.inner.root_cache.lock().unwrap() = Some(value.clone());
-        Ok(value)
     }
 
     async fn snapshot_from_root(&self, target: &ListenerTarget, root: &Value) -> DatabaseResult<DataSnapshot> {
@@ -996,13 +1111,13 @@ impl Database {
     async fn snapshot_for_target(&self, target: &ListenerTarget) -> DatabaseResult<DataSnapshot> {
         match target {
             ListenerTarget::Reference(path) => {
-                let value = self.inner.backend.get(path, &[]).await?;
+                let value = self.backend().get(path, &[]).await?;
                 let reference = self.reference_from_segments(path.clone());
                 Ok(DataSnapshot { reference, value })
             }
             ListenerTarget::Query { path, params } => {
                 let rest_params = params.to_rest_params()?;
-                let value = self.inner.backend.get(path, rest_params.as_slice()).await?;
+                let value = self.backend().get(path, rest_params.as_slice()).await?;
                 let reference = self.reference_from_segments(path.clone());
                 Ok(DataSnapshot { reference, value })
             }
@@ -1042,20 +1157,14 @@ impl DatabaseReference {
         }
     }
 
+    /// Writes `value` at this location, mirroring `set()` in the JS SDK.
+    ///
+    /// `ServerValue` placeholders ([`server_timestamp`](crate::database::server_timestamp),
+    /// [`increment`](crate::database::increment)) are resolved by the server, so an `increment` is
+    /// atomic even when several clients write at once.
     pub async fn set(&self, value: Value) -> DatabaseResult<()> {
-        let value = self.resolve_value_for_path(&self.path, value).await?;
-        let old_root = self.database.root_snapshot().await?;
-        let value_for_local = value.clone();
-        self.database.inner.backend.set(&self.path, value).await?;
-
-        let mut new_root = old_root.clone();
-        apply_realtime_value(&mut new_root, &self.path, value_for_local);
-
-        self.database
-            .dispatch_listeners(&self.path, &old_root, &new_root)
-            .await?;
-        self.database.cache_root(new_root);
-        Ok(())
+        let stored = self.database.backend().set(&self.path, value).await?;
+        self.database.apply_local_write(&self.path, stored).await
     }
 
     /// Creates a query anchored at this reference, mirroring the JS `query()` helper.
@@ -1161,43 +1270,50 @@ impl DatabaseReference {
         self.path.clone()
     }
 
-    pub(crate) async fn resolve_for_current_path(&self, value: Value) -> DatabaseResult<Value> {
-        self.resolve_value_for_path(&self.path, value).await
-    }
-
-    pub(crate) async fn resolve_for_absolute_path(&self, path: &[String], value: Value) -> DatabaseResult<Value> {
-        self.resolve_value_for_path(path, value).await
-    }
-
     /// Runs a transaction on this reference. The closure receives the current value and may
     /// return `Some(next)` to commit or `None` to abort, mirroring the JS SDK contract.
     pub async fn run_transaction<F>(&self, mut update: F) -> DatabaseResult<TransactionResult>
     where
         F: FnMut(Value) -> Option<Value>,
     {
-        let current_value = self.get().await?;
-        let maybe_new = update(current_value.clone());
+        let mut current = self.database.backend().read_for_update(&self.path).await?;
 
-        match maybe_new {
-            Some(new_value) => {
-                self.set(new_value.clone()).await?;
-                let snapshot = DataSnapshot {
-                    reference: self.clone(),
-                    value: new_value,
-                };
-                Ok(TransactionResult {
-                    committed: true,
-                    snapshot,
-                })
+        for _ in 0..MAX_TRANSACTION_ATTEMPTS {
+            let input = extract_data_ref(&current.value).clone();
+            let Some(new_value) = update(input) else {
+                return Ok(TransactionResult {
+                    committed: false,
+                    snapshot: DataSnapshot {
+                        reference: self.clone(),
+                        value: current.value,
+                    },
+                });
+            };
+
+            match self
+                .database
+                .backend()
+                .compare_and_set(&self.path, new_value, current.version.clone())
+                .await?
+            {
+                CasOutcome::Committed(stored) => {
+                    self.database.apply_local_write(&self.path, stored.clone()).await?;
+                    return Ok(TransactionResult {
+                        committed: true,
+                        snapshot: DataSnapshot {
+                            reference: self.clone(),
+                            value: stored,
+                        },
+                    });
+                }
+                // Somebody wrote first: run the closure again against the data as it is now.
+                CasOutcome::Conflict(latest) => current = latest,
             }
-            None => Ok(TransactionResult {
-                committed: false,
-                snapshot: DataSnapshot {
-                    reference: self.clone(),
-                    value: current_value,
-                },
-            }),
         }
+
+        Err(internal_error(format!(
+            "Transaction failed after {MAX_TRANSACTION_ATTEMPTS} attempts"
+        )))
     }
 
     /// Applies the provided partial updates to the current location using a single
@@ -1221,44 +1337,32 @@ impl DatabaseReference {
                 return Err(invalid_argument("Database update path cannot reference the current location"));
             }
             segments.extend(relative);
-            let resolved = self.resolve_value_for_path(&segments, value).await?;
-            operations.push((segments, resolved));
+            operations.push((segments, value));
         }
 
-        let old_root = self.database.root_snapshot().await?;
-        let ops_for_local = operations.clone();
-        self.database.inner.backend.update(&self.path, operations).await?;
-
-        let mut new_root = old_root.clone();
-        for (absolute, value) in ops_for_local {
-            apply_realtime_value(&mut new_root, &absolute, value);
+        let stored = self.database.backend().update(&self.path, operations).await?;
+        for (absolute, value) in stored {
+            self.database.apply_local_write(&absolute, value).await?;
         }
-
-        self.database
-            .dispatch_listeners(&self.path, &old_root, &new_root)
-            .await?;
-        self.database.cache_root(new_root);
         Ok(())
     }
 
+    /// Reads the value at this location, mirroring `get()` in the JS SDK.
+    ///
+    /// When a listener keeps this location in sync the value comes from that live view (like
+    /// `repoGetValue` consulting the sync tree); otherwise the read goes to the server. It is never
+    /// served from a stale snapshot of some ancestor that nobody is listening to.
     pub async fn get(&self) -> DatabaseResult<Value> {
-        if let Some(root) = self.database.inner.root_cache.lock().unwrap().clone() {
-            return Ok(value_at_path(&root, &self.path));
+        if self.database.is_synced(&self.path) {
+            return Ok(value_at_path(&self.database.mirror_snapshot(), &self.path));
         }
-        self.database.inner.backend.get(&self.path, &[]).await
+        self.database.backend().get(&self.path, &[]).await
     }
 
     /// Deletes the value at this location using the backend's `DELETE` support.
     pub async fn remove(&self) -> DatabaseResult<()> {
-        let old_root = self.database.root_snapshot().await?;
-        self.database.inner.backend.delete(&self.path).await?;
-        let mut new_root = old_root.clone();
-        apply_realtime_value(&mut new_root, &self.path, Value::Null);
-        self.database
-            .dispatch_listeners(&self.path, &old_root, &new_root)
-            .await?;
-        self.database.cache_root(new_root);
-        Ok(())
+        self.database.backend().delete(&self.path).await?;
+        self.database.apply_local_write(&self.path, Value::Null).await
     }
 
     /// Writes the provided value together with its priority, mirroring
@@ -1274,20 +1378,9 @@ impl DatabaseReference {
             return Err(invalid_argument("set_with_priority failed: read-only child key"));
         }
 
-        let value = self.resolve_value_for_path(&self.path, value.into()).await?;
-        let payload = pack_with_priority(value, priority);
-        let payload_for_local = payload.clone();
-        let old_root = self.database.root_snapshot().await?;
-        self.database.inner.backend.set(&self.path, payload).await?;
-
-        let mut new_root = old_root.clone();
-        apply_realtime_value(&mut new_root, &self.path, payload_for_local);
-
-        self.database
-            .dispatch_listeners(&self.path, &old_root, &new_root)
-            .await?;
-        self.database.cache_root(new_root);
-        Ok(())
+        let payload = pack_with_priority(value.into(), priority);
+        let stored = self.database.backend().set(&self.path, payload).await?;
+        self.database.apply_local_write(&self.path, stored).await
     }
 
     /// Updates the priority for this location, mirroring `setPriority()` in the JS SDK.
@@ -1298,21 +1391,11 @@ impl DatabaseReference {
         let priority = priority.into();
         validate_priority_value(&priority)?;
 
-        let current = self.database.inner.backend.get(&self.path, &[]).await?;
+        let current = self.database.backend().get(&self.path, &[]).await?;
         let value = extract_data_owned(&current);
         let payload = pack_with_priority(value, priority);
-        let payload_for_local = payload.clone();
-        let old_root = self.database.root_snapshot().await?;
-        self.database.inner.backend.set(&self.path, payload).await?;
-
-        let mut new_root = old_root.clone();
-        apply_realtime_value(&mut new_root, &self.path, payload_for_local);
-
-        self.database
-            .dispatch_listeners(&self.path, &old_root, &new_root)
-            .await?;
-        self.database.cache_root(new_root);
-        Ok(())
+        let stored = self.database.backend().set(&self.path, payload).await?;
+        self.database.apply_local_write(&self.path, stored).await
     }
 
     /// Creates a child location with an auto-generated key, mirroring `push()` from the JS SDK.
@@ -1341,16 +1424,6 @@ impl DatabaseReference {
         V: Into<Value>,
     {
         self.push_internal(Some(value.into())).await
-    }
-
-    async fn resolve_value_for_path(&self, path: &[String], value: Value) -> DatabaseResult<Value> {
-        if contains_server_value(&value) {
-            let current = self.database.inner.backend.get(path, &[]).await?;
-            let current_ref = extract_data_ref(&current);
-            resolve_server_values(value, Some(current_ref))
-        } else {
-            Ok(value)
-        }
     }
 
     async fn push_internal(&self, value: Option<Value>) -> DatabaseResult<DatabaseReference> {
@@ -1523,8 +1596,7 @@ impl DatabaseQuery {
         let params = self.params.to_rest_params()?;
         self.reference
             .database
-            .inner
-            .backend
+            .backend()
             .get(&self.reference.path, params.as_slice())
             .await
     }
@@ -1633,91 +1705,8 @@ pub(crate) fn pack_with_priority(value: Value, priority: Value) -> Value {
     Value::Object(map)
 }
 
-fn extract_data_ref<'a>(value: &'a Value) -> &'a Value {
-    value.as_object().and_then(|obj| obj.get(".value")).unwrap_or(value)
-}
-
 fn extract_data_owned(value: &Value) -> Value {
     extract_data_ref(value).clone()
-}
-
-fn contains_server_value(value: &Value) -> bool {
-    match value {
-        Value::Object(map) => {
-            if map.contains_key(".sv") {
-                return true;
-            }
-            map.values().any(contains_server_value)
-        }
-        Value::Array(items) => items.iter().any(contains_server_value),
-        _ => false,
-    }
-}
-
-fn resolve_server_values(value: Value, current: Option<&Value>) -> DatabaseResult<Value> {
-    match value {
-        Value::Object(mut map) => {
-            if let Some(spec) = map.remove(".sv") {
-                return resolve_server_placeholder(spec, current.map(extract_data_ref));
-            }
-            let mut resolved = Map::with_capacity(map.len());
-            for (key, child) in map.into_iter() {
-                let child_current = current
-                    .and_then(|curr| match curr {
-                        Value::Object(obj) => obj.get(&key),
-                        Value::Array(arr) => key.parse::<usize>().ok().and_then(|idx| arr.get(idx)),
-                        _ => None,
-                    })
-                    .map(extract_data_ref);
-                let child_resolved = resolve_server_values(child, child_current)?;
-                resolved.insert(key, child_resolved);
-            }
-            Ok(Value::Object(resolved))
-        }
-        Value::Array(items) => {
-            let mut resolved = Vec::with_capacity(items.len());
-            for (index, child) in items.into_iter().enumerate() {
-                let child_current = current
-                    .and_then(|curr| match curr {
-                        Value::Array(arr) => arr.get(index),
-                        _ => None,
-                    })
-                    .map(extract_data_ref);
-                resolved.push(resolve_server_values(child, child_current)?);
-            }
-            Ok(Value::Array(resolved))
-        }
-        other => Ok(other),
-    }
-}
-
-fn resolve_server_placeholder(spec: Value, current: Option<&Value>) -> DatabaseResult<Value> {
-    match spec {
-        Value::String(token) if token == "timestamp" => {
-            let millis = current_time_millis()?;
-            Ok(Value::Number(Number::from(millis)))
-        }
-        Value::Object(mut map) => {
-            if let Some(delta) = map.remove("increment") {
-                let delta = delta
-                    .as_f64()
-                    .ok_or_else(|| invalid_argument("ServerValue.increment delta must be numeric"))?;
-                let base = current
-                    .and_then(|value| match value {
-                        Value::Number(number) => number.as_f64(),
-                        _ => None,
-                    })
-                    .unwrap_or(0.0);
-                let total = base + delta;
-                let number = Number::from_f64(total)
-                    .ok_or_else(|| invalid_argument("ServerValue.increment produced an invalid number"))?;
-                Ok(Value::Number(number))
-            } else {
-                Err(invalid_argument("Unsupported server value placeholder"))
-            }
-        }
-        _ => Err(invalid_argument("Unsupported server value placeholder")),
-    }
 }
 
 fn value_at_path(root: &Value, path: &[String]) -> Value {
@@ -1795,16 +1784,6 @@ fn get_value_at_path(root: &Value, segments: &[String]) -> Option<Value> {
     Some(current.clone())
 }
 
-fn current_time_millis() -> DatabaseResult<u64> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| internal_error("System time is before the Unix epoch"))?;
-    let millis = duration.as_millis();
-    millis
-        .try_into()
-        .map_err(|_| internal_error("Timestamp exceeds 64-bit range"))
-}
-
 static DATABASE_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
     Component::new(DATABASE_COMPONENT_NAME, Arc::new(database_factory), ComponentType::Public)
         .with_instantiation_mode(InstantiationMode::Lazy)
@@ -1841,6 +1820,20 @@ fn ensure_component_attached(app: &FirebaseApp) {
 
 pub fn register_database_component() {
     ensure_registered();
+}
+
+/// Routes `database` at the Realtime Database emulator, mirroring `connectDatabaseEmulator(db, host, port)`.
+///
+/// ```no_run
+/// # use firebase_rs_sdk::database::{connect_database_emulator, get_database};
+/// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+/// let database = get_database(None).await?;
+/// connect_database_emulator(&database, "127.0.0.1", 9000)?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn connect_database_emulator(database: &Database, host: &str, port: u16) -> DatabaseResult<()> {
+    database.connect_emulator(host, port)
 }
 
 pub async fn get_database(app: Option<FirebaseApp>) -> DatabaseResult<Arc<Database>> {
@@ -1882,6 +1875,8 @@ pub async fn get_database(app: Option<FirebaseApp>) -> DatabaseResult<Arc<Databa
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use crate::app::initialize_app;
     use crate::app::{FirebaseApp, FirebaseAppConfig, FirebaseAppSettings, FirebaseOptions};
     use crate::component::ComponentContainer;
@@ -2198,7 +2193,7 @@ mod tests {
             .set(json!({ "greeting": "hello" }))
             .await
             .expect("set over REST");
-        database.clear_root_cache_for_test();
+        database.clear_mirror_for_test();
         let value = reference.get().await.expect("get over REST");
 
         assert_eq!(value, json!({ "greeting": "hello" }));
@@ -2272,6 +2267,9 @@ mod tests {
         };
         let app = initialize_app(options, Some(unique_settings())).await.unwrap();
         let database = get_database(Some(app)).await.unwrap();
+
+        // The mirror only tracks locations somebody listens to, so attach a listener first.
+        let _registration = database.reference("items").unwrap().on_value(|_| {}).await.unwrap();
 
         database
             .handle_realtime_action(
@@ -2758,5 +2756,38 @@ mod tests {
                 "d": { "score": 50 }
             })
         );
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_emulator_points_every_channel_at_the_emulator() {
+        let options = FirebaseOptions {
+            project_id: Some("demo-project".into()),
+            ..Default::default()
+        };
+        let app = initialize_app(options, Some(unique_settings())).await.unwrap();
+        let database = get_database(Some(app.clone())).await.unwrap();
+
+        database.connect_emulator("127.0.0.1", 9000).unwrap();
+
+        assert_eq!(
+            crate::database::backend::database_url_for(&app).as_deref(),
+            Some("http://127.0.0.1:9000/?ns=demo-project-default-rtdb"),
+            "the namespace defaults to <project>-default-rtdb, like the JS SDK"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_emulator_is_refused_once_listeners_exist() {
+        let options = FirebaseOptions {
+            project_id: Some("demo-project".into()),
+            ..Default::default()
+        };
+        let app = initialize_app(options, Some(unique_settings())).await.unwrap();
+        let database = get_database(Some(app)).await.unwrap();
+        let _registration = database.reference("items").unwrap().on_value(|_| {}).await.unwrap();
+
+        let err = database
+            .connect_emulator("127.0.0.1", 9000)
+            .expect_err("re-pointing a database in use must fail");
+        assert_eq!(err.code, crate::database::error::DatabaseErrorCode::InvalidArgument);
     }
 }

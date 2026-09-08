@@ -10,9 +10,10 @@
 #
 # The emulator configuration lives in firebase-emulator/ (firebase.json, rules, functions).
 #
-# `firebase emulators:exec` exports FIREBASE_AUTH_EMULATOR_HOST, FIRESTORE_EMULATOR_HOST and
-# FIREBASE_STORAGE_EMULATOR_HOST for the wrapped command; tests/live_endpoints.rs routes Auth,
-# Firestore and Storage through them and Functions through FIREBASE_FUNCTIONS_EMULATOR_HOST.
+# `firebase emulators:exec` exports FIREBASE_AUTH_EMULATOR_HOST, FIRESTORE_EMULATOR_HOST,
+# FIREBASE_DATABASE_EMULATOR_HOST and FIREBASE_STORAGE_EMULATOR_HOST for the wrapped command;
+# tests/live_endpoints.rs routes Auth, Firestore, Realtime Database and Storage through them and
+# Functions through FIREBASE_FUNCTIONS_EMULATOR_HOST.
 # Installations and Remote Config have no emulator and are skipped unless real credentials are
 # configured (see CONTRIBUTING.md).
 set -euo pipefail
@@ -37,6 +38,6 @@ export FIREBASE_EMULATOR_PROJECT_ID="$PROJECT_ID"
 # from the emulator directory and hop back to the crate root for cargo.
 cd "$EMULATOR_DIR"
 exec firebase emulators:exec \
-  --only auth,firestore,storage,functions \
+  --only auth,firestore,database,storage,functions \
   --project "$PROJECT_ID" \
   "cd '$ROOT' && cargo test --test live_endpoints -- --ignored --nocapture --test-threads=2 $*"

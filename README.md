@@ -53,7 +53,7 @@ percentages are estimates and deliberately stricter than the ones in each module
 | remote_config | 50% | real (`firebaseremoteconfig.googleapis.com/v1`) | yes | fetch, ETag-based activate, defaults with correct value sources, custom signals, typed getters |
 | app_check | 45% | real exchange endpoint, untested | no | custom provider and refresher only on native; reCAPTCHA is wasm-only |
 | firestore | 50% | real REST for one-shot ops; realtime is simulated | emulator + online | CRUD, composite queries, snapshot cursors, batches, aggregates, optimistic transactions, serde structs; no `onSnapshot` or offline |
-| database | 30% | real REST; WebSocket partial | no | reads/writes/queries over REST; realtime listeners and transactions incomplete |
+| database | 55% | real REST + realtime WebSocket | emulator | reads/writes/queries, server-resolved `.sv` values, compare-and-set transactions, value/child listeners over the wire protocol; query listeners re-query instead of subscribing to a filtered view |
 | messaging | 0% native / 40% wasm | real on wasm only | no | native path returns placeholder tokens; no message delivery anywhere |
 | performance | 15% | trace API local; upload body not accepted by backend | no | traces and metrics are recorded but never ingested |
 | analytics | 15% | GA4 Measurement Protocol, not gtag | no | needs an `api_secret`; not equivalent to the JS SDK |
@@ -118,15 +118,17 @@ percentages are estimates and deliberately stricter than the ones in each module
 | JS API | Status |
 |---|---|
 | `getDatabase`, `ref`, `child`, `parent`, `root`, `key`, `push` | implemented |
-| `set`, `update`, `remove`, `setPriority`, `setWithPriority` | implemented over REST |
-| `onDisconnect().set/setWithPriority/update/remove/cancel` | implemented over WebSocket |
-| `query`, `orderByChild/Key/Value/Priority`, `startAt/After`, `endAt/Before`, `equalTo`, `limitToFirst/Last` | implemented for REST `get`; broken for realtime listeners |
-| `get` | partial, may serve a stale whole-database cache |
-| `onValue`, `onChildAdded`, `onChildChanged`, `onChildRemoved` | partial, local diffing; realtime only for reference listens |
-| `serverTimestamp`, `increment` | partial, resolved client-side instead of on the server |
-| `runTransaction` | stub, get-then-set without compare-and-swap |
+| `set`, `update`, `remove`, `setPriority`, `setWithPriority` | implemented over REST; a write no longer reads the whole database first |
+| `connectDatabaseEmulator` | implemented; moves the REST channel and the realtime connection together, verified against the Database emulator |
+| `onDisconnect().set/setWithPriority/update/remove/cancel` | implemented over WebSocket; `.sv` values are left for the server to resolve at disconnect time |
+| `query`, `orderByChild/Key/Value/Priority`, `startAt/After`, `endAt/Before`, `equalTo`, `limitToFirst/Last` | implemented for `get`, verified against the emulator (missing `.indexOn` surfaces the server's error) |
+| `get` | implemented; served from a listener's live view when one is attached, otherwise from the server |
+| `onValue`, `onChildAdded`, `onChildChanged`, `onChildRemoved` | implemented over the realtime protocol (`q` / `n` frames); remote writes reach listeners, denied listens report `database/permission-denied` |
+| Query listeners (`onValue(query, ...)`) | partial: the client listens to the path and re-runs the query on change; no tagged server-side filtered views yet |
+| `serverTimestamp`, `increment` | implemented; resolved by the server, so concurrent increments cannot lose updates |
+| `runTransaction` | implemented as compare-and-set over the REST ETag / `if-match` protocol, retrying on conflict (25 attempts) |
 | `goOnline`, `goOffline` | partial |
-| `onChildMoved`, `off`, `connectDatabaseEmulator`, `enableLogging`, `refFromURL`, `DataSnapshot.forEach/exportVal` | missing |
+| `onChildMoved`, `off`, `enableLogging`, `refFromURL`, `DataSnapshot.forEach/exportVal` | missing |
 | Keepalive, reconnect and re-listen, control frames, multi-frame messages on the WebSocket | missing |
 
 ### storage
@@ -348,7 +350,8 @@ For further details, refer to the example [`./examples/firestore_select_document
 ## Live endpoint tests
 
 Besides the offline unit tests, `tests/live_endpoints.rs` exercises real backends: Auth, Firestore,
-Storage and Functions against the Firebase Local Emulator Suite (no credentials needed), and
+Realtime Database, Storage and Functions against the Firebase Local Emulator Suite (no credentials
+needed), and
 Installations and Remote Config against a real project when credentials are configured. See
 [`CONTRIBUTING.md`](https://github.com/dgasparri/firebase-rs-sdk/blob/main/CONTRIBUTING.md#live-endpoint-tests).
 

@@ -1,0 +1,13 @@
+{
+  "rules": {
+    "rust_sdk_live_tests": {
+      "$run": {
+        ".read": "auth != null",
+        ".write": "auth != null",
+        "players": {
+          ".indexOn": ["score", "name"]
+        }
+      }
+    }
+  }
+}
