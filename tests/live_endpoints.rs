@@ -991,13 +991,11 @@ impl LiveFirestore {
         let app = live_app(config, label).await;
         let firestore = Firestore::from_arc(get_firestore(Some(app.clone())).await.expect("firestore service"));
         let auth = auth_for(config, &app);
-        let client = if auth.sign_in_anonymously().await.is_ok() {
-            FirestoreClient::with_http_datastore_authenticated(firestore.clone(), auth.token_provider(), None)
-        } else {
+        if auth.sign_in_anonymously().await.is_err() {
             eprintln!("firestore: anonymous auth unavailable, continuing unauthenticated");
-            FirestoreClient::with_http_datastore(firestore.clone())
         }
-        .expect("firestore client");
+        // No manual wiring: the client resolves the user's token (and App Check) from the app.
+        let client = FirestoreClient::with_http_datastore(firestore.clone()).expect("firestore client");
         Self {
             app,
             auth,
@@ -1859,6 +1857,69 @@ async fn cleanup_auth(auth: &std::sync::Arc<firebase_rs_sdk::auth::Auth>) {
             eprintln!("warning: failed to delete temporary anonymous user: {err}");
         }
     }
+}
+
+/// The client sends the app's credentials without being told to, and stops when the user signs out.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Firebase credentials"]
+async fn firestore_client_uses_the_apps_credentials() {
+    let test = "firestore_client_uses_the_apps_credentials";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    let app = live_app(&config, "fs-credentials").await;
+    let auth = auth_for(&config, &app);
+    if auth.sign_in_anonymously().await.is_err() {
+        skip(test, "anonymous auth is unavailable, so there is no token to attach", "n/a");
+        delete_app(&app).await.ok();
+        return;
+    }
+
+    // Built straight from the app: no token provider is passed in anywhere.
+    let client = FirestoreClient::for_app(app.clone()).await.expect("firestore client");
+
+    let marker = format!("credentials-{}", nonce());
+    let path = format!("{LIVE_COLLECTION}/{marker}");
+    let mut data = BTreeMap::new();
+    data.insert("marker".to_string(), FirestoreValue::from_string(marker.clone()));
+
+    match client.set_doc(&path, data.clone(), None).await {
+        Ok(_) => {}
+        Err(err) => {
+            // The scratch collection requires a signed-in user; anything else is a real failure.
+            let live = LiveFirestore {
+                app: app.clone(),
+                auth: auth.clone(),
+                client: client.clone(),
+                firestore: Firestore::from_arc(get_firestore(Some(app.clone())).await.expect("firestore")),
+            };
+            if live.skip_if_unprovisioned(test, &err) {
+                live.teardown().await;
+                return;
+            }
+            panic!("write with the app's credentials failed: {err}");
+        }
+    }
+
+    let snapshot = client.get_doc(&path).await.expect("read back");
+    assert!(snapshot.exists(), "the document written with the app's token must be readable");
+
+    // Signing out has to take effect on the same client: credentials are resolved per request.
+    cleanup_auth(&auth).await;
+    auth.sign_out();
+    let err = client
+        .set_doc(&path, data, None)
+        .await
+        .expect_err("a signed-out client must be refused by the rules");
+    assert!(
+        matches!(
+            err.code,
+            FirestoreErrorCode::PermissionDenied | FirestoreErrorCode::Unauthenticated
+        ),
+        "unexpected error after sign-out: {err}"
+    );
+
+    delete_app(&app).await.expect("delete_app");
 }
 
 /// Watches a query over the Firestore `Listen` gRPC stream and checks that writes made through the

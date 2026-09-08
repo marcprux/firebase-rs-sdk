@@ -16,6 +16,27 @@ Roughly 83 % of the Firestore JS SDK now has a Rust counterpart.
 - Remaining gaps focus on the sync engine: RemoteSyncer integration, transactions, offline persistence, cross-platform transports, and advanced bundle/listener plumbing.
 
 
+## 2026-09-08 update: the client uses the app's credentials
+
+Firestore was the only service that did not read `auth-internal` and `app-check-internal` out of the
+app's component container: `FirestoreClient::with_http_datastore` produced anonymous requests, and
+credentials had to be passed in by hand through `with_http_datastore_authenticated`. With the usual
+`request.auth != null` rules that meant the documented path returned permission-denied, and App
+Check never protected Firestore at all.
+
+- `with_http_datastore` (and the new one-call `FirestoreClient::for_app`) now resolve both providers
+  from the app, matching Storage, Functions and the Realtime Database. `Listen` streams get the same
+  credentials, so snapshot listeners are authenticated too.
+- Resolution is lazy and per request: building a client neither forces Auth to initialise nor pins a
+  signed-out state, so signing in (or initialising App Check) later takes effect, and signing out
+  stops the token immediately.
+- `with_http_datastore_unauthenticated` keeps the old behaviour for callers who deliberately want
+  anonymous requests.
+- Verified by `firestore_client_uses_the_apps_credentials` against the emulator (write, read back,
+  then sign out and get refused), by mock-server tests asserting the App Check header arrives and
+  that neither header is sent when the app has no credentials, and by the rest of the live suite,
+  whose harness no longer wires a token provider by hand.
+
 ## 2026-09-07 update: snapshot listeners over gRPC
 
 `on_snapshot` is real. Firestore's `Listen` RPC (`google.firestore.v1.Firestore/Listen`) has no

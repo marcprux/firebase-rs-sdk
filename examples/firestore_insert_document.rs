@@ -12,8 +12,9 @@ async fn insert_documents() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     let app = initialize_app(options, Some(FirebaseAppSettings::default())).await?;
-    let firestore = get_firestore(Some(app.clone())).await?;
-    let client = FirestoreClient::with_http_datastore(Firestore::from_arc(firestore.clone()))?;
+    // The client picks up the signed-in user's token and the App Check token from the app, so a
+    // database whose rules require authentication works as soon as somebody signs in.
+    let client = FirestoreClient::for_app(app).await?;
     let mut ada = BTreeMap::new();
     ada.insert("first".into(), FirestoreValue::from_string("Ada"));
     ada.insert("last".into(), FirestoreValue::from_string("Lovelace"));

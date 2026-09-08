@@ -10,6 +10,7 @@ use crate::firestore::api::snapshot::{DocumentSnapshot, TypedDocumentSnapshot};
 use crate::firestore::error::{internal_error, invalid_argument, FirestoreResult};
 use std::sync::Arc;
 
+use crate::firestore::api::credentials;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::firestore::api::listener::{listen_to_document, listen_to_query, ListenerRegistration};
 use crate::firestore::remote::datastore::{Datastore, HttpDatastore, InMemoryDatastore, TokenProviderArc};
@@ -56,9 +57,32 @@ impl FirestoreClient {
         Self::new(firestore, Arc::new(InMemoryDatastore::new()))
     }
 
-    /// Builds a client that talks to Firestore over the REST endpoints using
-    /// anonymous credentials.
+    /// Builds a client that talks to Firestore over the REST endpoints, using the credentials the
+    /// app already has.
+    ///
+    /// The signed-in user's ID token and the App Check token are resolved from the app's component
+    /// container per request, so signing in (or initialising App Check) is enough for them to
+    /// travel with every call — the same wiring Storage, Functions and the Realtime Database use.
+    /// Nothing is sent while there is no user and no App Check.
+    ///
+    /// Use [`with_http_datastore_unauthenticated`](Self::with_http_datastore_unauthenticated) for
+    /// requests that must stay anonymous, or
+    /// [`with_http_datastore_authenticated`](Self::with_http_datastore_authenticated) to supply
+    /// your own providers.
     pub fn with_http_datastore(firestore: Firestore) -> FirestoreResult<Self> {
+        let app = firestore.app().clone();
+        Self::with_http_datastore_authenticated(
+            firestore,
+            credentials::auth_provider_for_app(&app),
+            Some(credentials::app_check_provider_for_app(&app)),
+        )
+    }
+
+    /// Builds a client that sends no credentials at all.
+    ///
+    /// Only useful for data whose rules deliberately distinguish anonymous callers; ordinary code
+    /// wants [`with_http_datastore`](Self::with_http_datastore).
+    pub fn with_http_datastore_unauthenticated(firestore: Firestore) -> FirestoreResult<Self> {
         let datastore = HttpDatastore::from_database_id(firestore.database_id().clone())?;
         #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut client = Self::new(firestore, Arc::new(datastore));
@@ -168,6 +192,26 @@ impl FirestoreClient {
                  (FirestoreClient::with_http_datastore / with_http_datastore_authenticated)",
             )
         })
+    }
+
+    /// Resolves the Firestore service for `app` and returns a client wired to its credentials.
+    ///
+    /// This is the one-call equivalent of `getFirestore(app)` in the JS SDK: the returned client
+    /// sends the signed-in user's ID token and the App Check token with every request.
+    ///
+    /// ```no_run
+    /// # use firebase_rs_sdk::app::FirebaseApp;
+    /// # use firebase_rs_sdk::firestore::FirestoreClient;
+    /// # async fn demo(app: FirebaseApp) -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = FirestoreClient::for_app(app).await?;
+    /// let snapshot = client.get_doc("cities/LA").await?;
+    /// # let _ = snapshot;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn for_app(app: crate::app::FirebaseApp) -> FirestoreResult<Self> {
+        let firestore = Firestore::from_arc(crate::firestore::get_firestore(Some(app)).await?);
+        Self::with_http_datastore(firestore)
     }
 
     /// Creates a new write batch that targets the same Firestore instance as this client.

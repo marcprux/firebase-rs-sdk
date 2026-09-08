@@ -1,5 +1,6 @@
 pub mod aggregate;
 pub mod converter;
+pub mod credentials;
 pub mod database;
 pub mod document;
 #[cfg(not(target_arch = "wasm32"))]
