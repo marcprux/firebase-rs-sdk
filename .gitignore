@@ -24,6 +24,9 @@ target
 # scripts and tools
 publish.bat
 
+# scripts/api_parity.py --format json
+api-parity.json
+
 
 
 # Live-test credentials (see tests/live_endpoints.rs). Never commit these.

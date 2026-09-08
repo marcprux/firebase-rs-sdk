@@ -7,6 +7,7 @@ name: ci
 #   wasm      compiles for wasm32 and runs the browser-side smoke tests
 #   emulator  the endpoint tests against the Firebase Local Emulator Suite (no secrets)
 #   live      the endpoint tests that need a real project (Installations, Remote Config)
+#   parity    how much of the JavaScript SDK's public API this crate covers, reported per run
 #
 # Everything except `live` runs for pull requests from forks; `live` needs secrets, which forks
 # cannot read.
@@ -188,6 +189,43 @@ jobs:
 
       - name: Run endpoint tests against the emulators
         run: scripts/emulator_test.sh
+
+  parity:
+    name: js sdk api parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # The JS SDK publishes an API Extractor report per package under common/api-review; those
+      # reports are all this job reads, so a shallow checkout of the default branch is enough.
+      # Tracking `main` rather than a pinned tag is deliberate: parity should move when the
+      # reference SDK adds APIs, not only when this crate changes.
+      #
+      # `packages/` is where a local checkout goes too (it is gitignored for that), so the command
+      # below is the same one a contributor runs.
+      - name: Check out firebase-js-sdk
+        uses: actions/checkout@v7
+        with:
+          repository: firebase/firebase-js-sdk
+          path: packages/firebase-js-sdk
+          fetch-depth: 1
+
+      # The table lands on the run's summary page, so each run records where parity stood and two
+      # runs can be compared by eye. The JSON is the machine-readable form of the same numbers,
+      # kept as an artifact for anything that wants to plot the trend.
+      - name: Report API parity
+        run: |
+          python3 scripts/api_parity.py packages/firebase-js-sdk --format markdown >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/api_parity.py packages/firebase-js-sdk --format json > api-parity.json
+          python3 scripts/api_parity.py packages/firebase-js-sdk
+
+      - name: Upload the parity numbers
+        uses: actions/upload-artifact@v7
+        with:
+          name: api-parity
+          path: api-parity.json
 
   live:
     name: online endpoints

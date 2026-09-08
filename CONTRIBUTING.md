@@ -193,13 +193,22 @@ trail back to the original. Three rules keep that trail:
 To measure where the port stands:
 
 ```bash
-git clone --depth 1 https://github.com/firebase/firebase-js-sdk
-scripts/api_parity.py ../firebase-js-sdk --missing
+git clone --depth 1 https://github.com/firebase/firebase-js-sdk packages/firebase-js-sdk
+scripts/api_parity.py packages/firebase-js-sdk --missing
 ```
+
+`packages/` is gitignored for exactly this: it is where a reference copy of the JS SDK lives while
+you work.
 
 It reads the JS SDK's own API Extractor reports and looks for a counterpart to each public entity
 in the matching crate. The match is by name, so treat it as an estimate — but it is an estimate
 that moves when the port does.
+
+CI runs this on every push and pull request (the `js sdk api parity` job) against the JS SDK's
+current `main`, and writes the table to the run's summary page, so each run records where parity
+stood; the same numbers are attached as an `api-parity.json` artifact. The number moving down is
+not necessarily a regression — the reference SDK adds APIs too — but it should always have an
+explanation.
 
 ## Coverage table
 

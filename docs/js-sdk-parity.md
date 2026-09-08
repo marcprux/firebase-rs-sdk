@@ -9,10 +9,12 @@ bugs waiting to be fixed.
 Measured against **firebase-js-sdk v12.18.0** (`b70f27b`, 2026-09-08).
 
 ```bash
-git clone --depth 1 https://github.com/firebase/firebase-js-sdk
-scripts/api_parity.py ../firebase-js-sdk            # the table below
-scripts/api_parity.py ../firebase-js-sdk --missing  # every entity with no counterpart
+git clone --depth 1 https://github.com/firebase/firebase-js-sdk packages/firebase-js-sdk
+scripts/api_parity.py packages/firebase-js-sdk            # the table below
+scripts/api_parity.py packages/firebase-js-sdk --missing  # every entity with no counterpart
 ```
+
+`packages/` is gitignored so the reference checkout can sit beside the code it is compared with.
 
 ## The shape of the thing being ported
 
@@ -230,3 +232,7 @@ Ported from the JS SDK and worth keeping in sync. Where the value differs, the r
   reader would want to check.
 - Re-run `scripts/api_parity.py` against a fresh checkout when updating `docs/coverage.toml`; the
   numbers here are from v12.18.0 and the JS SDK moves.
+- CI does that on every run: the `js sdk api parity` job checks out firebase-js-sdk `main`, writes
+  this table to the run summary, and attaches `api-parity.json`. Two runs side by side show which
+  way the port is moving — and whether a drop came from this crate or from the reference SDK
+  growing.
