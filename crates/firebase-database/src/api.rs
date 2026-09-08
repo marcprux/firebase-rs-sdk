@@ -1272,6 +1272,14 @@ impl DatabaseReference {
 
     /// Runs a transaction on this reference. The closure receives the current value and may
     /// return `Some(next)` to commit or `None` to abort, mirroring the JS SDK contract.
+    ///
+    /// The mechanism underneath differs from the JS SDK's, deliberately. `Repo.ts` applies the
+    /// closure's result to its local tree straight away, sends the write over the realtime
+    /// connection and re-runs the closure when the server's hash of the old value disagrees.
+    /// Here the read carries `X-Firebase-ETag` and the write carries `if-match`, so a conflict is
+    /// a 412 and the retry re-reads: the same 25 attempts and the same final guarantee, without an
+    /// optimistic local tree. What a caller does not get is the local echo of the pending value
+    /// before the server accepts it.
     pub async fn run_transaction<F>(&self, mut update: F) -> DatabaseResult<TransactionResult>
     where
         F: FnMut(Value) -> Option<Value>,

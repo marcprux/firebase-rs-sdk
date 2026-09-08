@@ -11,6 +11,24 @@ Snapshot listeners (`on_snapshot`) are available on native targets: they run on 
 It includes error handling, configuration options, and integration with
 Firebase apps.
 
+## What this is, in the JS SDK's terms
+
+The JavaScript SDK ships two Firestore clients from one package, and this module is the first of
+them plus listeners:
+
+- `firebase/firestore/lite` — one-shot reads and writes, transactions, batches, aggregates. No
+  cache, no offline. **This module implements that surface** (66% of it), over REST.
+- `firebase/firestore` — the same surface backed by a sync engine: a local document cache, a
+  mutation queue that shows a write to your listeners before the server acknowledges it, a query
+  engine that runs queries against the cache, limbo-document resolution, index management, LRU
+  garbage collection, multi-tab coordination. **None of that is here**, and `on_snapshot` is added
+  on top of the lite client instead, reading the real `Listen` stream.
+
+The consequences worth knowing: `SnapshotMetadata::has_pending_writes()` is always `false`, a
+disconnected listener reports nothing rather than serving cached documents, and there is no
+`getDocFromCache`, `waitForPendingWrites` or bundle loading. See
+[`docs/js-sdk-parity.md`](https://github.com/marcprux/firebase-rs-sdk/blob/main/docs/js-sdk-parity.md).
+
 Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`.
 
 ## Quick Start Example

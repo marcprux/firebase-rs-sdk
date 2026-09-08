@@ -113,6 +113,13 @@ pub struct Auth {
     listeners: AuthStateListeners,
     id_token_listeners: AuthStateListeners,
     rest_client: Client,
+    /// How long before expiry a token is refreshed, both proactively and when one is asked for.
+    ///
+    /// The JS SDK uses two values: five minutes for the background refresh
+    /// (`Duration.OFFSET` in `core/user/proactive_refresh.ts`) and thirty seconds for an on-demand
+    /// `getIdToken` (`Buffer.TOKEN_REFRESH` in `core/user/token_manager.ts`). One value covers
+    /// both here, at the wider margin: a few more refresh calls in exchange for never handing a
+    /// product a token that expires while its request is in flight.
     token_refresh_tolerance: Duration,
     /// Swappable so `set_persistence` can move a live session to another store.
     persistence: RwLock<Arc<dyn AuthPersistence + Send + Sync>>,

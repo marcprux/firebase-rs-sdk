@@ -46,10 +46,32 @@ Products can also be depended on directly (`firebase-auth = "1"`) when the faça
 
 Note that this library is provided _as is_. Even the more mature modules have not been exhaustively tested. All the code published passes `cargo test`. There is an effort to port the tests of the official JavaScript SDK, but there is no guarantee that the test coverage is complete.
 
+## Relationship to the JavaScript SDK
+
+This is a port of the modular Firebase JavaScript SDK, and every module cites the `packages/**`
+file it was ported from. [`docs/js-sdk-parity.md`](docs/js-sdk-parity.md) is the study behind that
+claim, measured against firebase-js-sdk v12.18.0: what the JS SDK contains, how much of each
+product exists here, which differences are deliberate, and which behavioural constants are shared.
+Three things from it are worth knowing before you read the coverage numbers:
+
+- **Firestore here is `firestore/lite` plus listeners.** The JS SDK ships two Firestore clients from
+  one package: a thin one (`firebase/firestore/lite`, one-shot reads and writes) and an offline
+  engine (`firebase/firestore`, with a local document cache, a mutation queue and a sync engine —
+  three subsystems, 37k lines, that this crate does not have). This crate implements the thin one,
+  and adds `on_snapshot` over the real gRPC `Listen` stream. So `has_pending_writes` is always
+  `false` here, and there is no `getDocFromCache`.
+- **Analytics is not the same product.** The JS SDK wraps `gtag.js` in the browser; outside a
+  browser there is nothing to wrap, so this crate posts to the GA4 Measurement Protocol, which
+  needs an `api_secret` and behaves differently.
+- **A few things are better.** Services are registered and resolved by type rather than by string
+  and `any`; App Check returns typed errors instead of the JS SDK's placeholder "dummy tokens";
+  credentials, HTTP and the canonical error statuses are one shared layer rather than one per
+  product.
+
 ## Coverage
 
 The tables below record how much of the official Firebase API surface each module covers, based on
-a September 2026 audit that compared the Rust code against the modular JavaScript SDK (v9+) and, for
+a September 2026 audit that compared the Rust code against the modular JavaScript SDK (v12) and, for
 the mobile-relevant services, the Firebase C++ SDK. "Coverage" is the share of the public JS API for
 that product that is implemented and actually reaches the real backend; the "Backend" column says
 whether the module talks to the production endpoints or only to an in-memory simulation.
@@ -57,7 +79,8 @@ whether the module talks to the production endpoints or only to an in-memory sim
 The summary table below is generated from `docs/coverage.toml`, which is the only place these
 numbers live; edit that file and run `scripts/coverage_table.py`. `tests/live_endpoints.rs` is what
 backs the "Verified" column: those tests run against the Firebase Local Emulator Suite, and against
-a real project for the services that have no emulator.
+a real project for the services that have no emulator. `scripts/api_parity.py` measures the API
+surface independently, against a checkout of the JS SDK.
 
 ### Summary
 
@@ -71,13 +94,13 @@ a real project for the services that have no emulator.
 | data_connect | 65% | real (`firebasedataconnect.googleapis.com/v1`) | no | executeQuery / executeMutation, emulator, subscriptions |
 | auth | 80% | real (Identity Toolkit v1/v2 + securetoken) | emulator + online | email, phone, custom-token, IdP credential and MFA flows verified end to end; sessions survive a restart through a pluggable persistence backend; typed error codes; listeners; OAuth popup/redirect UI flows still delegated to the host |
 | functions | 75% | real (`cloudfunctions.net` / custom domain / emulator) | emulator + online | callable protocol with auth, App Check and FID headers, streaming callables, URL callables, timeouts |
-| remote_config | 50% | real (`firebaseremoteconfig.googleapis.com/v1`) | yes | fetch, ETag-based activate, defaults with correct value sources, custom signals, typed getters |
-| app_check | 60% | real exchange endpoint (`content-firebaseappcheck.googleapis.com/v1`) | emulator (token delivery) + online (debug-token exchange) | debug-token provider, custom provider and refresher on native; reCAPTCHA is wasm-only |
-| firestore | 63% | real REST for one-shot ops, real gRPC `Listen` for snapshots | emulator + online | CRUD, composite queries, snapshot cursors, batches, aggregates, optimistic transactions, serde structs, `on_snapshot` for documents and queries over gRPC; no offline cache and no local write queue (the unreachable sync prototype was deleted in 2026-09) |
-| database | 55% | real REST + realtime WebSocket | emulator | reads/writes/queries, server-resolved `.sv` values, compare-and-set transactions, value/child listeners over the wire protocol; query listeners re-query instead of subscribing to a filtered view |
+| remote_config | 50% | real (`firebaseremoteconfig.googleapis.com/v1`) | yes | fetch, ETag-based activate, defaults with correct value sources, custom signals, minimum fetch interval, typed getters; no persisted throttle after a 429 and no realtime config updates |
+| app_check | 60% | real exchange endpoint (`content-firebaseappcheck.googleapis.com/v1`) | emulator (token delivery) + online (debug-token exchange) | debug-token provider, custom provider, refresher and the JS throttling policy (403/404 for a day, else backoff); typed errors instead of the JS dummy tokens; reCAPTCHA is wasm-only |
+| firestore | 63% | real REST for one-shot ops, real gRPC `Listen` for snapshots | emulator + online | the `firestore/lite` surface (CRUD, composite queries, snapshot cursors, batches, aggregates, transactions, serde structs) plus `on_snapshot` over gRPC: 66% of the JS lite API, 44% of the full one. No offline cache, no local write queue, so `has_pending_writes` is always false |
+| database | 55% | real REST + realtime WebSocket | emulator | reads/writes/queries, server-resolved `.sv` values, compare-and-set transactions, value/child listeners over the wire protocol; no sync tree, so query listeners re-query instead of subscribing to a filtered view, and there is no `.info/connected` or reconnect backoff |
 | messaging | 0% native / 40% wasm | real on wasm only | no | native path returns placeholder tokens; no message delivery anywhere |
-| performance | 15% | trace API local; upload body not accepted by backend | no | traces and metrics are recorded but never ingested |
-| analytics | 15% | GA4 Measurement Protocol, not gtag | no | needs an `api_secret`; not equivalent to the JS SDK |
+| performance | 15% | trace API local; upload body not accepted by backend | no | traces and metrics are recorded correctly but never ingested: the payload needs Firelog's `log_event[].source_extension_json_proto3` envelope, see docs/js-sdk-parity.md |
+| analytics | 15% | GA4 Measurement Protocol, not gtag | no | a deliberate divergence: the JS SDK wraps `gtag.js`, which does not exist off-browser. Needs an `api_secret` and is not the same product |
 | ai | 10% | real `generateContent` for one helper | no | request factory is correct; model, chat, streaming and Imagen missing |
 
 <!-- coverage:end -->

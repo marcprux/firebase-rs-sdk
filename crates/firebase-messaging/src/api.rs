@@ -117,6 +117,20 @@ impl Messaging {
         request_permission_impl().await
     }
 
+    /// The FCM registration token for this app.
+    ///
+    /// # This token is real only in the browser
+    ///
+    /// On wasm with `wasm-web`, this registers a push subscription through the service worker and
+    /// exchanges it with FCM, as `packages/messaging/src/api/getToken.ts` does — the token can
+    /// receive messages.
+    ///
+    /// **On every other target it returns a locally generated placeholder.** FCM delivers to a push
+    /// channel (a browser's Push API, or APNs/Android transport in the mobile SDKs) and there is no
+    /// such channel in a plain Rust process, so there is nothing to register. Sending a placeholder
+    /// to a server that will push to it means messages that silently go nowhere. Treat a native
+    /// token as a stub for wiring code up, never as an address, and see
+    /// [`docs/js-sdk-parity.md`](https://github.com/marcprux/firebase-rs-sdk/blob/main/docs/js-sdk-parity.md).
     pub async fn get_token(&self, vapid_key: Option<&str>) -> MessagingResult<String> {
         get_token_impl(self, vapid_key).await
     }

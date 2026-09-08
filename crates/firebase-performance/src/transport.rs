@@ -202,6 +202,22 @@ impl HttpTransportClient {
     }
 }
 
+/// The body posted to the logging endpoint.
+///
+/// This is *not* the shape Firelog accepts, which is why recorded traces are not ingested today.
+/// The JS SDK posts (`performance/src/services/transport_service.ts`):
+///
+/// ```json
+/// { "request_time_ms": "...",
+///   "client_info": { "client_type": 1, "js_client_info": {} },
+///   "log_source": 462,
+///   "log_event": [ { "source_extension_json_proto3": "<JSON-encoded PerfMetric>" } ] }
+/// ```
+///
+/// where each `PerfMetric` is `{ application_info, trace_metric | network_request_metric }`
+/// (`perf_logger.ts`), batches hold at most 1000 events, and 40 are flushed at a time. Moving to
+/// that envelope is the whole distance between "records traces" and "reports traces"; the
+/// recording layer above needs no changes. See docs/js-sdk-parity.md.
 #[derive(Serialize)]
 struct TransportPayload {
     request_time_ms: String,

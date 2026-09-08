@@ -27,7 +27,11 @@ use crate::remote::watch_change::{TargetChangeState, WatchChange, WatchDocument}
 use crate::remote::watch_change_aggregator::WatchChangeAggregator;
 use firebase_core::platform::runtime;
 
-/// Backoff bounds for reconnecting a dropped stream, mirroring the JS SDK's stream backoff.
+/// Backoff bounds for reconnecting a dropped stream.
+///
+/// The JS SDK waits 1s and grows by 1.5 to a 60s ceiling (`remote/backoff.ts`); this reconnects
+/// sooner and caps lower, because a listener here has no local cache to serve from while it is
+/// disconnected — the caller sees nothing at all until the stream is back.
 const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
 const BACKOFF_FACTOR: u32 = 2;
@@ -264,6 +268,12 @@ struct ViewDocument {
 }
 
 impl ViewDocument {
+    /// A snapshot of this document.
+    ///
+    /// `has_pending_writes` is always false: the JS SDK sets it from its local mutation queue, and
+    /// there is no queue here — a write is visible to a listener only once the server echoes it
+    /// back. `from_cache` means "the stream has not reached CURRENT yet" rather than the JS SDK's
+    /// wider "these documents came from the local cache".
     fn snapshot(&self, from_cache: bool) -> DocumentSnapshot {
         DocumentSnapshot::new(
             self.document.key.clone(),

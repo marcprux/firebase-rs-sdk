@@ -4,6 +4,14 @@ The Analytics module ports the modular `@firebase/analytics` SDK to Rust. It wir
 system so other services can obtain an `Analytics` instance that records events and optionally forwards them to Google
 Analytics using the GA4 Measurement Protocol.
 
+**This is not the same product as the JavaScript SDK's Analytics, on purpose.** `@firebase/analytics` is a wrapper
+around Google's browser tag: `logEvent` injects and calls `gtag.js`, and the tag decides what is sent, when, and with
+which identifiers. There is no tag outside a browser, so this module posts events to the [GA4 Measurement
+Protocol](https://developers.google.com/analytics/devguides/collection/protocol/ga4) instead. That means an
+`api_secret` is required, the event set is the Measurement Protocol's, and none of the tag's automatic collection
+(page views, sessions, campaign attribution, consent-mode defaults) happens. See
+[`docs/js-sdk-parity.md`](https://github.com/marcprux/firebase-rs-sdk/blob/main/docs/js-sdk-parity.md).
+
 Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`.
 
 

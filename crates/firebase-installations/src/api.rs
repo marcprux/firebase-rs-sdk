@@ -703,7 +703,7 @@ mod tests {
                 .json_body(json!({
                     "fid": "fid-from-server",
                     "refreshToken": "refresh",
-                    "authToken": { "token": "token", "expiresIn": "3600s" }
+                    "authToken": { "token": "token", "expiresIn": "604800s" }
                 }));
         });
 
@@ -741,7 +741,7 @@ mod tests {
                 .json_body(json!({
                     "fid": "fid-from-server",
                     "refreshToken": "refresh",
-                    "authToken": { "token": "token", "expiresIn": "3600s" }
+                    "authToken": { "token": "token", "expiresIn": "604800s" }
                 }));
         });
 
@@ -784,7 +784,7 @@ mod tests {
                 .json_body(json!({
                     "fid": "fid-from-server",
                     "refreshToken": "refresh",
-                    "authToken": { "token": "token1", "expiresIn": "3600s" }
+                    "authToken": { "token": "token1", "expiresIn": "604800s" }
                 }));
         });
 
@@ -795,7 +795,7 @@ mod tests {
                 .header("content-type", "application/json")
                 .json_body(json!({
                     "token": "token2",
-                    "expiresIn": "3600s"
+                    "expiresIn": "604800s"
                 }));
         });
 
@@ -845,7 +845,7 @@ mod tests {
                 .json_body(json!({
                     "fid": "fresh-fid",
                     "refreshToken": "fresh-refresh",
-                    "authToken": { "token": "fresh-token", "expiresIn": "3600s" }
+                    "authToken": { "token": "fresh-token", "expiresIn": "604800s" }
                 }));
         });
 
@@ -911,7 +911,7 @@ mod tests {
                 .json_body(json!({
                     "fid": "unexpected",
                     "refreshToken": "unexpected",
-                    "authToken": { "token": "unexpected", "expiresIn": "3600s" }
+                    "authToken": { "token": "unexpected", "expiresIn": "604800s" }
                 }));
         });
 
@@ -1020,7 +1020,7 @@ mod tests {
                 .json_body(json!({
                     "fid": "fid-after-delete",
                     "refreshToken": "refresh2",
-                    "authToken": { "token": "token2", "expiresIn": "3600s" }
+                    "authToken": { "token": "token2", "expiresIn": "604800s" }
                 }));
         });
 
@@ -1049,7 +1049,7 @@ mod tests {
                 .json_body(json!({
                     "fid": "fid-from-server",
                     "refreshToken": "refresh",
-                    "authToken": { "token": "token", "expiresIn": "3600s" }
+                    "authToken": { "token": "token", "expiresIn": "604800s" }
                 }));
         });
 
@@ -1060,7 +1060,7 @@ mod tests {
                 .header("content-type", "application/json")
                 .json_body(json!({
                     "token": "token-internal",
-                    "expiresIn": "3600s"
+                    "expiresIn": "604800s"
                 }));
         });
 

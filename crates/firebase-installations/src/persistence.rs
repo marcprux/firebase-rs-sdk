@@ -162,7 +162,12 @@ mod wasm_persistence {
     const STORE_NAME: &str = "firebase-installations-store";
     const BROADCAST_CHANNEL: &str = "firebase-installations-updates";
     const PENDING_PREFIX: &str = "pending::";
-    const PENDING_TIMEOUT_MS: u64 = 60_000;
+    /// How long another tab's in-flight registration is respected before this one takes over.
+    ///
+    /// `PENDING_TIMEOUT_MS` in `packages/installations/src/util/constants.ts`: the JS SDK waits ten
+    /// seconds, on the reasoning that a registration request that has not finished by then is not
+    /// coming back, and a second attempt costs less than a browser tab stuck without an id.
+    const PENDING_TIMEOUT_MS: u64 = 10_000;
 
     #[derive(Clone, Debug, Default)]
     pub struct IndexedDbPersistence;

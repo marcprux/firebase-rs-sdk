@@ -175,6 +175,32 @@ rather than write its own:
   (including the array wrapper Firestore's streaming RPCs use). Products keep their own public
   error types and map the status onto them.
 
+## Porting from the JavaScript SDK
+
+Every module here is a port of a `packages/**` module in
+[firebase-js-sdk](https://github.com/firebase/firebase-js-sdk), and the port is only as good as its
+trail back to the original. Three rules keep that trail:
+
+- **Cite the file you read.** A doc comment that says which TypeScript file a behaviour came from
+  is what lets the next person check it. `packages/app-check/src/providers.ts`, not "the JS SDK".
+- **Copy constants with their reasoning.** A retry budget or a refresh margin is a decision someone
+  made with data we do not have. When a value differs from the JS SDK's on purpose, say why in the
+  comment and add a row to the table in [`docs/js-sdk-parity.md`](docs/js-sdk-parity.md).
+- **Say when you are diverging.** Some things should not be ported — the JS container's `any`
+  lookups, App Check's dummy tokens, `gtag.js`. Those belong in the "Deliberate divergences"
+  section of the parity document, not in a code comment nobody finds.
+
+To measure where the port stands:
+
+```bash
+git clone --depth 1 https://github.com/firebase/firebase-js-sdk
+scripts/api_parity.py ../firebase-js-sdk --missing
+```
+
+It reads the JS SDK's own API Extractor reports and looks for a counterpart to each public entity
+in the matching crate. The match is by name, so treat it as an estimate — but it is an estimate
+that moves when the port does.
+
 ## Coverage table
 
 Per-module coverage lives in `docs/coverage.toml` and nothing else. README.md's table is generated

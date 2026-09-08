@@ -51,25 +51,25 @@ notes = "callable protocol with auth, App Check and FID headers, streaming calla
 coverage = "50%"
 backend = "real (`firebaseremoteconfig.googleapis.com/v1`)"
 verified = "yes"
-notes = "fetch, ETag-based activate, defaults with correct value sources, custom signals, typed getters"
+notes = "fetch, ETag-based activate, defaults with correct value sources, custom signals, minimum fetch interval, typed getters; no persisted throttle after a 429 and no realtime config updates"
 
 [app_check]
 coverage = "60%"
 backend = "real exchange endpoint (`content-firebaseappcheck.googleapis.com/v1`)"
 verified = "emulator (token delivery) + online (debug-token exchange)"
-notes = "debug-token provider, custom provider and refresher on native; reCAPTCHA is wasm-only"
+notes = "debug-token provider, custom provider, refresher and the JS throttling policy (403/404 for a day, else backoff); typed errors instead of the JS dummy tokens; reCAPTCHA is wasm-only"
 
 [firestore]
 coverage = "63%"
 backend = "real REST for one-shot ops, real gRPC `Listen` for snapshots"
 verified = "emulator + online"
-notes = "CRUD, composite queries, snapshot cursors, batches, aggregates, optimistic transactions, serde structs, `on_snapshot` for documents and queries over gRPC; no offline cache and no local write queue (the unreachable sync prototype was deleted in 2026-09)"
+notes = "the `firestore/lite` surface (CRUD, composite queries, snapshot cursors, batches, aggregates, transactions, serde structs) plus `on_snapshot` over gRPC: 66% of the JS lite API, 44% of the full one. No offline cache, no local write queue, so `has_pending_writes` is always false"
 
 [database]
 coverage = "55%"
 backend = "real REST + realtime WebSocket"
 verified = "emulator"
-notes = "reads/writes/queries, server-resolved `.sv` values, compare-and-set transactions, value/child listeners over the wire protocol; query listeners re-query instead of subscribing to a filtered view"
+notes = "reads/writes/queries, server-resolved `.sv` values, compare-and-set transactions, value/child listeners over the wire protocol; no sync tree, so query listeners re-query instead of subscribing to a filtered view, and there is no `.info/connected` or reconnect backoff"
 
 [messaging]
 coverage = "0% native / 40% wasm"
@@ -81,13 +81,13 @@ notes = "native path returns placeholder tokens; no message delivery anywhere"
 coverage = "15%"
 backend = "trace API local; upload body not accepted by backend"
 verified = "no"
-notes = "traces and metrics are recorded but never ingested"
+notes = "traces and metrics are recorded correctly but never ingested: the payload needs Firelog's `log_event[].source_extension_json_proto3` envelope, see docs/js-sdk-parity.md"
 
 [analytics]
 coverage = "15%"
 backend = "GA4 Measurement Protocol, not gtag"
 verified = "no"
-notes = "needs an `api_secret`; not equivalent to the JS SDK"
+notes = "a deliberate divergence: the JS SDK wraps `gtag.js`, which does not exist off-browser. Needs an `api_secret` and is not the same product"
 
 [ai]
 coverage = "10%"

@@ -20,7 +20,9 @@ fn defaults_from_env() -> Option<Value> {
 }
 
 fn defaults_from_path() -> Option<Value> {
-    let path = env::var("__FIREBASE_DEFAULTS_PATH").ok()?;
+    // The name has trailing underscores, as `packages/util/src/defaults.ts` spells it; the
+    // Firebase tooling that writes this variable uses that exact name.
+    let path = env::var("__FIREBASE_DEFAULTS_PATH__").ok()?;
     let content = fs::read_to_string(path).ok()?;
     parse_json_value(content)
 }
