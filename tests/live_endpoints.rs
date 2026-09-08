@@ -1854,6 +1854,278 @@ async fn cleanup_auth(auth: &std::sync::Arc<firebase_rs_sdk::auth::Auth>) {
     }
 }
 
+/// Watches a query over the Firestore `Listen` gRPC stream and checks that writes made through the
+/// REST path come back as document changes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Firebase credentials"]
+async fn firestore_query_on_snapshot_streams_changes() {
+    let test = "firestore_query_on_snapshot_streams_changes";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    let live = LiveFirestore::connect(&config, "fs-listen").await;
+    let client = &live.client;
+    let marker = format!("listen-{}", nonce());
+    let field = |name: &str| FieldPath::from_dot_separated(name).expect("field path");
+
+    let query = live
+        .firestore
+        .collection(LIVE_COLLECTION)
+        .expect("collection")
+        .query()
+        .where_field(
+            field("marker"),
+            FilterOperator::Equal,
+            FirestoreValue::from_string(marker.clone()),
+        )
+        .expect("marker filter")
+        .order_by(field("index"), OrderDirection::Ascending)
+        .expect("order by index");
+
+    // Every snapshot is recorded as (document ids, doc changes, from_cache).
+    type Snapshots = Arc<std::sync::Mutex<Vec<(Vec<String>, Vec<(String, String)>, bool)>>>;
+    let snapshots: Snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let errors: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let snapshot_recorder = Arc::clone(&snapshots);
+    let error_recorder = Arc::clone(&errors);
+
+    let registration = client
+        .on_snapshot(&query, move |result| match result {
+            Ok(snapshot) => {
+                let ids = snapshot
+                    .documents()
+                    .iter()
+                    .map(|doc| doc.id().to_string())
+                    .collect::<Vec<_>>();
+                let changes = snapshot
+                    .doc_changes()
+                    .iter()
+                    .map(|change| (format!("{:?}", change.change_type()), change.doc().id().to_string()))
+                    .collect::<Vec<_>>();
+                snapshot_recorder
+                    .lock()
+                    .expect("lock")
+                    .push((ids, changes, snapshot.from_cache()));
+            }
+            Err(error) => error_recorder.lock().expect("lock").push(error.to_string()),
+        })
+        .expect("attach listener");
+
+    let snapshot_count = || snapshots.lock().expect("lock").len();
+    let fail_on_error = || {
+        let errors = errors.lock().expect("lock");
+        assert!(errors.is_empty(), "listener reported errors: {errors:?}");
+    };
+
+    // The first snapshot arrives once the target is in sync, even though nothing matches yet.
+    // A backend that needs a composite index for this query rejects the target instead; that is a
+    // provisioning gap, not an SDK bug, so report it the way the other query tests do.
+    wait_for(
+        || snapshot_count() >= 1 || !errors.lock().expect("lock").is_empty(),
+        "the initial snapshot must arrive",
+    )
+    .await;
+    if let Some(error) = errors.lock().expect("lock").first().cloned() {
+        if let Some(reason) = provisioning_skip_reason(&error) {
+            skip(test, &reason, &error);
+            registration.remove();
+            live.teardown().await;
+            return;
+        }
+        panic!("listener failed: {error}");
+    }
+    fail_on_error();
+    {
+        let recorded = snapshots.lock().expect("lock");
+        let (ids, changes, from_cache) = &recorded[0];
+        assert!(ids.is_empty(), "the query matches nothing yet, got {ids:?}");
+        assert!(changes.is_empty());
+        assert!(!from_cache, "a synced listener is not serving from cache");
+    }
+
+    let write = |suffix: &str, index: i64| {
+        let mut data = BTreeMap::new();
+        data.insert("marker".to_string(), FirestoreValue::from_string(marker.clone()));
+        data.insert("index".to_string(), FirestoreValue::from_integer(index));
+        let path = format!("{LIVE_COLLECTION}/{marker}-{suffix}");
+        async move { client.set_doc(&path, data, None).await }
+    };
+
+    if let Err(err) = write("a", 1).await {
+        if live.skip_if_unprovisioned(test, &err) {
+            registration.remove();
+            live.teardown().await;
+            return;
+        }
+        panic!("write failed: {err}");
+    }
+    wait_for(|| snapshot_count() >= 2, "a new document must reach the listener").await;
+    {
+        let recorded = snapshots.lock().expect("lock");
+        let (ids, changes, _) = recorded.last().expect("snapshot");
+        assert_eq!(ids, &vec![format!("{marker}-a")]);
+        assert_eq!(changes, &vec![("Added".to_string(), format!("{marker}-a"))]);
+    }
+
+    write("b", 2).await.expect("write b");
+    wait_for(|| snapshot_count() >= 3, "the second document must reach the listener").await;
+    {
+        let recorded = snapshots.lock().expect("lock");
+        let (ids, changes, _) = recorded.last().expect("snapshot");
+        assert_eq!(
+            ids,
+            &vec![format!("{marker}-a"), format!("{marker}-b")],
+            "documents are ordered by the query's orderBy"
+        );
+        assert_eq!(changes, &vec![("Added".to_string(), format!("{marker}-b"))]);
+    }
+
+    // Reordering: `a` moves behind `b`, which the JS SDK reports as a modification.
+    write("a", 3).await.expect("rewrite a");
+    wait_for(|| snapshot_count() >= 4, "an update must reach the listener").await;
+    {
+        let recorded = snapshots.lock().expect("lock");
+        let (ids, changes, _) = recorded.last().expect("snapshot");
+        assert_eq!(ids, &vec![format!("{marker}-b"), format!("{marker}-a")]);
+        assert!(
+            changes
+                .iter()
+                .any(|(kind, id)| kind == "Modified" && id == &format!("{marker}-a")),
+            "expected a Modified change, got {changes:?}"
+        );
+    }
+
+    client
+        .delete_doc(&format!("{LIVE_COLLECTION}/{marker}-b"))
+        .await
+        .expect("delete b");
+    wait_for(|| snapshot_count() >= 5, "a delete must reach the listener").await;
+    {
+        let recorded = snapshots.lock().expect("lock");
+        let (ids, changes, _) = recorded.last().expect("snapshot");
+        assert_eq!(ids, &vec![format!("{marker}-a")]);
+        assert_eq!(changes, &vec![("Removed".to_string(), format!("{marker}-b"))]);
+    }
+
+    // Documents that do not match the query never reach this listener.
+    let mut unrelated = BTreeMap::new();
+    unrelated.insert("marker".to_string(), FirestoreValue::from_string(format!("{marker}-other")));
+    unrelated.insert("index".to_string(), FirestoreValue::from_integer(9));
+    client
+        .set_doc(&format!("{LIVE_COLLECTION}/{marker}-unrelated"), unrelated, None)
+        .await
+        .expect("unrelated write");
+
+    // Detaching stops the stream.
+    registration.remove();
+    let seen_before_detach = snapshot_count();
+    write("c", 4).await.expect("write after detach");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        snapshot_count(),
+        seen_before_detach,
+        "a removed listener must not receive further snapshots"
+    );
+    fail_on_error();
+
+    cleanup_marker(client, &query).await;
+    let _ = client
+        .delete_doc(&format!("{LIVE_COLLECTION}/{marker}-unrelated"))
+        .await;
+    let _ = client.delete_doc(&format!("{LIVE_COLLECTION}/{marker}-c")).await;
+    live.teardown().await;
+}
+
+/// Watches a single document and a location the rules deny.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Firebase credentials"]
+async fn firestore_document_on_snapshot_and_permission_errors() {
+    let test = "firestore_document_on_snapshot_and_permission_errors";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    let live = LiveFirestore::connect(&config, "fs-doc-listen").await;
+    let client = &live.client;
+    let marker = format!("doc-listen-{}", nonce());
+    let path = format!("{LIVE_COLLECTION}/{marker}");
+    let reference = live.firestore.doc(&path).expect("document reference");
+
+    type DocSnapshots = Arc<std::sync::Mutex<Vec<(bool, Option<i64>)>>>;
+    let snapshots: DocSnapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&snapshots);
+    let registration = client
+        .on_document_snapshot(&reference, move |result| {
+            if let Ok(snapshot) = result {
+                let value = snapshot.data().and_then(|data| field_integer(data, "index"));
+                recorder.lock().expect("lock").push((snapshot.exists(), value));
+            }
+        })
+        .expect("attach document listener");
+
+    let count = || snapshots.lock().expect("lock").len();
+    wait_for(|| count() >= 1, "the initial document snapshot must arrive").await;
+    assert_eq!(
+        snapshots.lock().expect("lock")[0],
+        (false, None),
+        "a missing document is reported as not existing"
+    );
+
+    let mut data = BTreeMap::new();
+    data.insert("marker".to_string(), FirestoreValue::from_string(marker.clone()));
+    data.insert("index".to_string(), FirestoreValue::from_integer(1));
+    if let Err(err) = client.set_doc(&path, data.clone(), None).await {
+        if live.skip_if_unprovisioned(test, &err) {
+            registration.remove();
+            live.teardown().await;
+            return;
+        }
+        panic!("write failed: {err}");
+    }
+    wait_for(|| count() >= 2, "the created document must reach the listener").await;
+    assert_eq!(snapshots.lock().expect("lock")[1], (true, Some(1)));
+
+    data.insert("index".to_string(), FirestoreValue::from_integer(2));
+    client.set_doc(&path, data, None).await.expect("update");
+    wait_for(|| count() >= 3, "the updated document must reach the listener").await;
+    assert_eq!(snapshots.lock().expect("lock")[2], (true, Some(2)));
+
+    client.delete_doc(&path).await.expect("delete");
+    wait_for(|| count() >= 4, "the delete must reach the listener").await;
+    assert_eq!(snapshots.lock().expect("lock")[3], (false, None));
+    registration.remove();
+
+    // A listener the rules reject fails instead of hanging: the backend removes the target and
+    // reports the cause, which the SDK surfaces on the callback.
+    let denied = live
+        .firestore
+        .collection("forbidden_for_rust_sdk_tests")
+        .expect("collection")
+        .query();
+    let errors: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let error_recorder = Arc::clone(&errors);
+    let _denied_registration = client
+        .on_snapshot(&denied, move |result| {
+            if let Err(error) = result {
+                error_recorder
+                    .lock()
+                    .expect("lock")
+                    .push(error.code.as_str().to_string());
+            }
+        })
+        .expect("attach denied listener");
+    wait_for(
+        || !errors.lock().expect("lock").is_empty(),
+        "a listener the rules deny must report an error",
+    )
+    .await;
+    assert_eq!(
+        errors.lock().expect("lock").first().map(String::as_str),
+        Some("firestore/permission-denied")
+    );
+
+    live.teardown().await;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Realtime Database
 // ---------------------------------------------------------------------------------------------

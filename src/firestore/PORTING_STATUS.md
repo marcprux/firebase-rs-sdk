@@ -1,6 +1,6 @@
 ## Porting status
 
-- firestore 85% `[######### ]`
+- firestore 85% `[######### ]` (self-reported; the README's stricter estimate is 60%)
 
 ==As of April 12th, 2026==
 
@@ -15,6 +15,36 @@ Roughly 83 % of the Firestore JS SDK now has a Rust counterpart.
 - REST and in-memory datastores can execute aggregation queries (`count`, `sum`, `average`), matching `getAggregate()`/`getCount()` from the JS SDK.
 - Remaining gaps focus on the sync engine: RemoteSyncer integration, transactions, offline persistence, cross-platform transports, and advanced bundle/listener plumbing.
 
+
+## 2026-09-07 update: snapshot listeners over gRPC
+
+`on_snapshot` is real. Firestore's `Listen` RPC (`google.firestore.v1.Firestore/Listen`) has no
+REST equivalent, so listeners now speak binary protobuf over gRPC ([`tonic`]) while one-shot reads
+and writes stay on REST:
+
+- Vendored protos under `proto/` (from googleapis, Apache-2.0) and generated bindings checked in at
+  `src/firestore/remote/proto/`, so building the crate needs no `protoc`. Regenerate with
+  `scripts/generate_firestore_protos.sh`.
+- `FirestoreClient::on_snapshot(&query, cb)` and `FirestoreClient::on_document_snapshot(&doc, cb)`
+  return a `ListenerRegistration` that detaches on drop.
+- The stream is decoded into the existing `WatchChange` model and folded by
+  `WatchChangeAggregator` into `RemoteEvent`s (the same path the JS SDK uses), then applied to a
+  per-listener view that sorts with the query's comparator and reports `added`/`modified`/`removed`
+  changes with old and new indexes. Documents that merely shift position because a neighbour
+  disappeared are not reported as modified.
+- Reconnects use the last resume token with exponential backoff; a target the backend rejects
+  (rules, missing index) is reported to the callback with its status code and ends the listener.
+- Two aggregator bugs surfaced while wiring this up and were fixed: a rejected target flattened the
+  server's status into `internal`, and any document update cleared the target's `current` flag (the
+  JS `TargetState` only clears it on a reset).
+- Emulator coverage: `firestore_query_on_snapshot_streams_changes` and
+  `firestore_document_on_snapshot_and_permission_errors` in `tests/live_endpoints.rs`.
+
+Not covered: wasm targets (the browser SDK uses WebChannel), `includeMetadataChanges`,
+`onSnapshotsInSync`, limbo document resolution, and `has_pending_writes` (there is no local
+mutation queue, so snapshots reflect only what the backend has). The prototype sync stack under
+`remote/stream*`, `remote/network`, `remote/remote_store.rs` and `local/` is still there and is
+still not reachable from the public API.
 
 ## Development status as of 5th April 2026
 
@@ -122,7 +152,8 @@ DISCLAIMER: This is not an official Firebase product, nor it is guaranteed that 
 - Query builder completion (composite/OR filters, nested orderings, cursor helpers, limit-to-last validation) wired
   through structured query generation and watch responses.
 - Complete sync engine parity by finishing existence-filter mismatch recovery, limbo orchestration, and overlay diff
-  reconciliation across persistence-backed targets.
+  reconciliation across persistence-backed targets. (Snapshot listeners themselves landed on
+  2026-09-07 over gRPC; what remains is the local-store side of the sync engine.)
 - Offline persistence layers (memory + IndexedDB), LRU pruning, multi-tab coordination, and platform-specific feature
   gating for wasm/web targets.
 - Bundle loading, named queries, and enhanced aggregation coverage (min/max, percentile).
@@ -142,8 +173,9 @@ DISCLAIMER: This is not an official Firebase product, nor it is guaranteed that 
      cursor helpers such as `startAfter`/`endBefore`, limit-to-last validation) so it mirrors `packages/firestore/src/core/query.ts`.
      - Implement target serialization and comparator logic shared by the local store and the remote watch layer so
        listen responses can be applied to views.
-     - Connect the normalised query definitions to the remote listen stream once gRPC/WebChannel support lands, ensuring
-       resume tokens, ordering, and backfill handling behave identically to the JS SDK.
+     - ~~Connect the normalised query definitions to the remote listen stream once gRPC/WebChannel support lands~~
+       (done 2026-09-07 for native targets: `src/firestore/remote/listen/`, resume tokens and ordering included).
+       WebChannel for wasm is still open.
 4. **Local persistence**
    - Introduce the local cache layers (memory, IndexedDB-like, LRU pruning) and multi-tab coordination, matching the JS
      architecture.

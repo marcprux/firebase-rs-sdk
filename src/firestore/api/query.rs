@@ -1261,7 +1261,7 @@ pub struct QueryDocumentChange {
 }
 
 impl QueryDocumentChange {
-    fn added(doc: DocumentSnapshot, new_index: usize) -> Self {
+    pub(crate) fn added(doc: DocumentSnapshot, new_index: usize) -> Self {
         Self {
             change_type: DocumentChangeType::Added,
             doc,
@@ -1270,7 +1270,7 @@ impl QueryDocumentChange {
         }
     }
 
-    fn modified(doc: DocumentSnapshot, old_index: usize, new_index: usize) -> Self {
+    pub(crate) fn modified(doc: DocumentSnapshot, old_index: usize, new_index: usize) -> Self {
         Self {
             change_type: DocumentChangeType::Modified,
             doc,
@@ -1279,7 +1279,7 @@ impl QueryDocumentChange {
         }
     }
 
-    fn removed(doc: DocumentSnapshot, old_index: usize) -> Self {
+    pub(crate) fn removed(doc: DocumentSnapshot, old_index: usize) -> Self {
         Self {
             change_type: DocumentChangeType::Removed,
             doc,

@@ -132,7 +132,7 @@ fn find_in_map<'a>(map: &'a MapValue, segments: &'a [String]) -> Option<&'a Fire
     }
 }
 
-fn compare_snapshots(left: &DocumentSnapshot, right: &DocumentSnapshot, order_by: &[OrderBy]) -> Ordering {
+pub(crate) fn compare_snapshots(left: &DocumentSnapshot, right: &DocumentSnapshot, order_by: &[OrderBy]) -> Ordering {
     for order in order_by {
         let left_value = get_field_value(left, order.field()).unwrap_or_else(FirestoreValue::null);
         let right_value = get_field_value(right, order.field()).unwrap_or_else(FirestoreValue::null);

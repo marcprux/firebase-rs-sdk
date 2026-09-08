@@ -125,6 +125,22 @@ The code you contribute MUST be licensed under Apache 2.0.
 
 In the analytics module a unit test that exercises the dispatcher is skipped by default unless `FIREBASE_NETWORK_TESTS=1` is set.
 
+## Generated Firestore protobufs
+
+Firestore's `Listen` RPC (which powers `on_snapshot`) is gRPC-only, so the crate carries generated
+bindings for `google.firestore.v1`:
+
+- `proto/` holds the `.proto` sources, vendored from
+  [googleapis](https://github.com/googleapis/googleapis) (Apache-2.0).
+- `src/firestore/remote/proto/` holds the generated Rust, committed so that building the crate
+  needs no `protoc`.
+
+After changing anything under `proto/`, regenerate with:
+
+```bash
+scripts/generate_firestore_protos.sh   # needs protoc (brew install protobuf)
+```
+
 ## Live endpoint tests
 
 `tests/live_endpoints.rs` exercises real Firebase backends through the public API. The tests are

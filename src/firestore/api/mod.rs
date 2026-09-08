@@ -2,6 +2,8 @@ pub mod aggregate;
 pub mod converter;
 pub mod database;
 pub mod document;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod listener;
 pub mod operations;
 pub mod query;
 pub mod reference;

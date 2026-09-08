@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use crate::firestore::error::{internal_error, FirestoreResult};
+use crate::firestore::error::FirestoreResult;
 use crate::firestore::model::{DocumentKey, Timestamp};
 use crate::firestore::remote::remote_event::{RemoteEvent, TargetChange};
 use crate::firestore::remote::watch_change::{
@@ -65,11 +65,9 @@ where
 
     fn handle_target_change(&mut self, change: WatchTargetChange) -> FirestoreResult<()> {
         if let Some(error) = change.cause.as_ref() {
-            return Err(internal_error(format!(
-                "watch target error (code {}): {}",
-                error.code.as_str(),
-                error
-            )));
+            // Keep the server's code (permission-denied, failed-precondition for a missing index,
+            // ...) instead of flattening every rejected target into an internal error.
+            return Err(error.clone());
         }
 
         let affected: Vec<i32> = if change.target_ids.is_empty() {
@@ -154,7 +152,24 @@ where
     }
 
     fn handle_existence_filter(&mut self, change: ExistenceFilterChange) -> FirestoreResult<()> {
-        self.pending_target_resets.insert(change.target_id);
+        // The server periodically states how many documents a target should hold. Only a mismatch
+        // means the local view drifted and has to be rebuilt; resetting on every filter would throw
+        // away a perfectly good view (and the JS SDK's `handleExistenceFilter` compares the counts
+        // for the same reason).
+        let current = self
+            .target_documents
+            .get(&change.target_id)
+            .map(|documents| documents.len())
+            .unwrap_or(0);
+
+        if current != change.count.max(0) as usize {
+            self.pending_target_resets.insert(change.target_id);
+            if let Some(state) = self.target_states.get_mut(&change.target_id) {
+                state.reset();
+            }
+            self.target_documents.remove(&change.target_id);
+        }
+
         Ok(())
     }
 
@@ -174,7 +189,8 @@ where
                 } else {
                     state.added.insert(key.clone());
                 }
-                state.current = false;
+                // A document update does not desynchronise the target; only a RESET does. The JS
+                // SDK's TargetState.addDocumentChange leaves `current` alone for the same reason.
                 state.mark_dirty();
             }
             None => {

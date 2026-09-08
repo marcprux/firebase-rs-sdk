@@ -52,7 +52,7 @@ percentages are estimates and deliberately stricter than the ones in each module
 | functions | 75% | real (`cloudfunctions.net` / custom domain / emulator) | emulator + online | callable protocol with auth, App Check and FID headers, streaming callables, URL callables, timeouts |
 | remote_config | 50% | real (`firebaseremoteconfig.googleapis.com/v1`) | yes | fetch, ETag-based activate, defaults with correct value sources, custom signals, typed getters |
 | app_check | 45% | real exchange endpoint, untested | no | custom provider and refresher only on native; reCAPTCHA is wasm-only |
-| firestore | 50% | real REST for one-shot ops; realtime is simulated | emulator + online | CRUD, composite queries, snapshot cursors, batches, aggregates, optimistic transactions, serde structs; no `onSnapshot` or offline |
+| firestore | 60% | real REST for one-shot ops, real gRPC `Listen` for snapshots | emulator + online | CRUD, composite queries, snapshot cursors, batches, aggregates, optimistic transactions, serde structs, `on_snapshot` for documents and queries; no offline cache or local write queue |
 | database | 55% | real REST + realtime WebSocket | emulator | reads/writes/queries, server-resolved `.sv` values, compare-and-set transactions, value/child listeners over the wire protocol; query listeners re-query instead of subscribing to a filtered view |
 | messaging | 0% native / 40% wasm | real on wasm only | no | native path returns placeholder tokens; no message delivery anywhere |
 | performance | 15% | trace API local; upload body not accepted by backend | no | traces and metrics are recorded but never ingested |
@@ -104,7 +104,9 @@ percentages are estimates and deliberately stricter than the ones in each module
 | Auth / App Check headers, emulator host | implemented |
 | `connectFirestoreEmulator` (`FIRESTORE_EMULATOR_HOST` / builder), `documentId` | partial |
 | `FieldPath` quoting (fields containing `.` or backticks are addressed literally via `FieldPath::new`) | implemented |
-| `onSnapshot`, `onSnapshotsInSync` | missing, the internal sync engine is not reachable and its transport is simulated |
+| `onSnapshot` (documents and queries) | implemented on native targets over the `Listen` gRPC stream: document changes with `added`/`modified`/`removed` and both indexes, query ordering, `from_cache`, resume tokens, reconnect with backoff, and rejected targets surfaced as typed errors. Verified against the Firestore emulator |
+| `onSnapshot` on wasm | missing; the browser SDK uses WebChannel, which is not ported |
+| `onSnapshot(..., { includeMetadataChanges })`, `onSnapshotsInSync`, `has_pending_writes` | missing; there is no local mutation queue, so snapshots only reflect what the backend has |
 | `runTransaction` / `Transaction` (`get`, `get_all`, `set`, `update`, `delete`, converters) | implemented like the JS SDK: optimistic, `updateTime` preconditions, `verify` entries for read-only documents, retry on `failed-precondition` / `aborted` (5 attempts) |
 | Write preconditions (`Precondition`, `ConditionalWrite`) | implemented for transactions; not yet exposed on `WriteBatch` |
 | `and`, `or` composite filters (`where_filter`, `and`, `or`), `deleteField` (`FirestoreValue::delete_field`) | implemented, verified against the emulator |

@@ -27,6 +27,10 @@ pub use api::database::{get_firestore, register_firestore_component, Firestore};
 #[doc(inline)]
 pub use api::document::FirestoreClient;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(inline)]
+pub use api::listener::ListenerRegistration;
+
 #[doc(inline)]
 pub use api::operations::{
     encode_document_data, encode_set_data, encode_update_document_data, validate_document_path, EncodedSetData,

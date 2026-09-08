@@ -1,7 +1,11 @@
 pub mod connection;
 pub mod datastore;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod listen;
 pub mod mutation;
 pub mod network;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod proto;
 pub mod remote_event;
 pub mod remote_store;
 pub mod remote_syncer;

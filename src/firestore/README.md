@@ -5,6 +5,9 @@ discover collections and create, update, retrieve, and delete documents. It
 provides functionality to interact with Firestore, including retrieving and
 querying documents, working with collections, and managing real-time updates.
 
+Snapshot listeners (`on_snapshot`) are available on native targets: they run on Firestore's
+`Listen` gRPC stream, so a query or document keeps reporting changes made by other clients.
+
 It includes error handling, configuration options, and integration with
 Firebase apps.
 

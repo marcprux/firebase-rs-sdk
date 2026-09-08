@@ -15,6 +15,7 @@ rust-version = "1.75"
 include = [
   "examples/**",
   "src/**",
+  "proto/**",
   "Cargo.toml",
   "LICENSE*",
   "./RUSTDOC.md",
@@ -124,6 +125,11 @@ webbrowser = "0.8"
 reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 tokio = { version = "1", features = ["rt", "time", "net", "sync"] }
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["rustls-tls-native-roots", "connect"] }
+# Firestore `Listen` (onSnapshot) speaks gRPC; one-shot reads and writes stay on REST.
+tonic = { version = "0.11", default-features = false, features = ["codegen", "prost", "transport", "tls", "tls-roots"] }
+prost = "0.12"
+prost-types = "0.12"
+tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

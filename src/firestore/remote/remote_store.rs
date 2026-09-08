@@ -734,10 +734,13 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&payload).unwrap();
         assert!(json.get("addTarget").is_some());
 
+        // The server says the target should hold one document while this client has none, so the
+        // view has drifted and must be rebuilt. A filter whose count matches is not a mismatch and
+        // deliberately changes nothing.
         let existence_filter = serde_json::json!({
             "filter": {
                 "targetId": 1,
-                "count": 0
+                "count": 1
             }
         });
         server_stream
@@ -801,7 +804,8 @@ mod tests {
             serde_json::json!({
                 "filter": {
                     "targetId": target_id,
-                    "count": 0
+                    // A count the client cannot match, i.e. a real existence filter mismatch.
+                    "count": 1
                 }
             })
         };

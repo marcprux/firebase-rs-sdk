@@ -10,7 +10,11 @@ use crate::firestore::api::snapshot::{DocumentSnapshot, TypedDocumentSnapshot};
 use crate::firestore::error::{internal_error, invalid_argument, FirestoreResult};
 use std::sync::Arc;
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::firestore::api::listener::{listen_to_document, listen_to_query, ListenerRegistration};
 use crate::firestore::remote::datastore::{Datastore, HttpDatastore, InMemoryDatastore, TokenProviderArc};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::firestore::remote::listen::ListenTransport;
 use crate::firestore::value::FirestoreValue;
 
 use super::transaction::{self, Transaction, TransactionOptions};
@@ -27,12 +31,21 @@ const COUNT_ALIAS: &str = "count";
 pub struct FirestoreClient {
     firestore: Firestore,
     datastore: Arc<dyn Datastore>,
+    /// Opens `Listen` streams for `on_snapshot`. Only clients built against a real backend have
+    /// one; an in-memory client has nothing to listen to.
+    #[cfg(not(target_arch = "wasm32"))]
+    listen: Option<Arc<ListenTransport>>,
 }
 
 impl FirestoreClient {
     /// Creates a client backed by the supplied datastore implementation.
     pub fn new(firestore: Firestore, datastore: Arc<dyn Datastore>) -> Self {
-        Self { firestore, datastore }
+        Self {
+            firestore,
+            datastore,
+            #[cfg(not(target_arch = "wasm32"))]
+            listen: None,
+        }
     }
 
     /// Returns a client that stores documents in memory only.
@@ -47,7 +60,18 @@ impl FirestoreClient {
     /// anonymous credentials.
     pub fn with_http_datastore(firestore: Firestore) -> FirestoreResult<Self> {
         let datastore = HttpDatastore::from_database_id(firestore.database_id().clone())?;
-        Ok(Self::new(firestore, Arc::new(datastore)))
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut client = Self::new(firestore, Arc::new(datastore));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            client.listen = Some(Arc::new(ListenTransport::new(
+                client.firestore.database_id().clone(),
+                ListenTransport::emulator_host_from_env(),
+                None,
+                None,
+            )));
+        }
+        Ok(client)
     }
 
     /// Builds an HTTP-backed client that attaches the provided Auth/App Check
@@ -59,6 +83,10 @@ impl FirestoreClient {
         auth_provider: TokenProviderArc,
         app_check_provider: Option<TokenProviderArc>,
     ) -> FirestoreResult<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let listen_auth_provider = Arc::clone(&auth_provider);
+        #[cfg(not(target_arch = "wasm32"))]
+        let listen_app_check_provider = app_check_provider.as_ref().map(Arc::clone);
         let mut builder = HttpDatastore::builder(firestore.database_id().clone()).with_auth_provider(auth_provider);
 
         if let Some(provider) = app_check_provider {
@@ -66,7 +94,80 @@ impl FirestoreClient {
         }
 
         let datastore = builder.build()?;
-        Ok(Self::new(firestore, Arc::new(datastore)))
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut client = Self::new(firestore, Arc::new(datastore));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            client.listen = Some(Arc::new(ListenTransport::new(
+                client.firestore.database_id().clone(),
+                ListenTransport::emulator_host_from_env(),
+                Some(listen_auth_provider),
+                listen_app_check_provider,
+            )));
+        }
+        Ok(client)
+    }
+
+    /// Watches `query` and calls `callback` with a fresh [`QuerySnapshot`] whenever the result set
+    /// changes, mirroring `onSnapshot(query, cb)` in the JS SDK.
+    ///
+    /// The listener runs on the Firestore `Listen` streaming RPC (gRPC) and lives until the
+    /// returned registration is dropped. The first snapshot arrives once the backend reports the
+    /// query as in sync, even when it matches nothing. Callbacks run on the runtime's executor, so
+    /// they must not block.
+    ///
+    /// A dropped connection is retried with backoff, resuming from the last resume token; an error
+    /// the backend calls permanent (denied by the rules, missing index, ...) is reported to the
+    /// callback and ends the listener.
+    ///
+    /// ```no_run
+    /// # use firebase_rs_sdk::firestore::{FirestoreClient, Query};
+    /// # fn demo(client: &FirestoreClient, query: &Query) -> Result<(), Box<dyn std::error::Error>> {
+    /// let registration = client.on_snapshot(query, |result| match result {
+    ///     Ok(snapshot) => println!("{} documents", snapshot.len()),
+    ///     Err(error) => eprintln!("listener failed: {error}"),
+    /// })?;
+    /// // ... later
+    /// registration.remove();
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn on_snapshot<F>(&self, query: &Query, callback: F) -> FirestoreResult<ListenerRegistration>
+    where
+        F: Fn(FirestoreResult<QuerySnapshot>) + Send + Sync + 'static,
+    {
+        let transport = self.listen_transport()?;
+        Ok(listen_to_query(transport, query.clone(), Arc::new(callback)))
+    }
+
+    /// Watches a single document, mirroring `onSnapshot(docRef, cb)`.
+    ///
+    /// The snapshot reports `exists() == false` while the document is missing, and a new snapshot
+    /// arrives whenever it is written or deleted. See [`on_snapshot`](Self::on_snapshot) for the
+    /// lifetime and error semantics.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn on_document_snapshot<F>(
+        &self,
+        reference: &crate::firestore::api::reference::DocumentReference,
+        callback: F,
+    ) -> FirestoreResult<ListenerRegistration>
+    where
+        F: Fn(FirestoreResult<DocumentSnapshot>) + Send + Sync + 'static,
+    {
+        let transport = self.listen_transport()?;
+        let key = crate::firestore::model::DocumentKey::from_path(reference.path().clone())?;
+        Ok(listen_to_document(transport, key, Arc::new(callback)))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn listen_transport(&self) -> FirestoreResult<Arc<ListenTransport>> {
+        self.listen.clone().ok_or_else(|| {
+            invalid_argument(
+                "snapshot listeners need a client built against a real backend \
+                 (FirestoreClient::with_http_datastore / with_http_datastore_authenticated)",
+            )
+        })
     }
 
     /// Creates a new write batch that targets the same Firestore instance as this client.
