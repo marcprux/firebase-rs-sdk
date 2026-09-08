@@ -11,16 +11,13 @@ use crate::reference::StorageReference;
 use crate::request::StreamingResponse;
 use crate::request::{BackoffConfig, HttpClient, RequestInfo};
 use crate::util::is_url;
-use firebase_app_check::FirebaseAppCheckInternal;
-use firebase_auth::Auth;
 use firebase_core::app::FirebaseApp;
-use firebase_core::component::Provider;
+use firebase_core::platform::credentials::{AppCredentials, AuthHeaderScheme, CredentialHeaders};
 
 #[derive(Clone)]
 pub struct FirebaseStorageImpl {
     app: FirebaseApp,
-    auth_provider: Provider,
-    app_check_provider: Provider,
+    credentials: AppCredentials,
     firebase_version: Option<String>,
     url_override: Option<String>,
     state: Arc<Mutex<FirebaseStorageState>>,
@@ -37,11 +34,8 @@ struct FirebaseStorageState {
 }
 
 impl FirebaseStorageImpl {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         app: FirebaseApp,
-        auth_provider: Provider,
-        app_check_provider: Provider,
         url_override: Option<String>,
         firebase_version: Option<String>,
     ) -> StorageResult<Self> {
@@ -62,10 +56,10 @@ impl FirebaseStorageImpl {
             is_using_emulator: false,
         };
 
+        let credentials = AppCredentials::for_app(&app);
         Ok(Self {
             app,
-            auth_provider,
-            app_check_provider,
+            credentials,
             firebase_version,
             url_override,
             state: Arc::new(Mutex::new(state)),
@@ -82,14 +76,6 @@ impl FirebaseStorageImpl {
 
     pub fn protocol(&self) -> String {
         self.state.lock().unwrap().protocol.clone()
-    }
-
-    pub fn auth_provider(&self) -> Provider {
-        self.auth_provider.clone()
-    }
-
-    pub fn app_check_provider(&self) -> Provider {
-        self.app_check_provider.clone()
     }
 
     pub fn firebase_version(&self) -> Option<&str> {
@@ -203,23 +189,9 @@ impl FirebaseStorageImpl {
     }
 
     async fn prepare_request<O>(&self, mut info: RequestInfo<O>) -> StorageResult<RequestInfo<O>> {
-        if let Some(token) = self.auth_token().await? {
-            if !token.is_empty() {
-                info.headers
-                    .insert("Authorization".to_string(), format!("Firebase {token}"));
-            }
-        }
-
-        if let Some(headers) = self.app_check_headers().await? {
-            if !headers.token.is_empty() {
-                info.headers.insert("X-Firebase-AppCheck".to_string(), headers.token);
-            }
-            if let Some(heartbeat) = headers.heartbeat {
-                if !heartbeat.is_empty() {
-                    info.headers.insert("X-Firebase-Client".to_string(), heartbeat);
-                }
-            }
-        }
+        self.credential_headers()
+            .await?
+            .apply(AuthHeaderScheme::Firebase, &mut info.headers);
 
         if !info.headers.contains_key("X-Firebase-Storage-Version") {
             let version = format!("webjs/{}", self.firebase_version.as_deref().unwrap_or("AppManager"));
@@ -235,65 +207,24 @@ impl FirebaseStorageImpl {
         Ok(info)
     }
 
-    async fn auth_token(&self) -> StorageResult<Option<String>> {
+    /// The credentials for one request: whatever the app has, plus the token
+    /// [`connect_storage_emulator`](crate::connect_storage_emulator) installed, which wins.
+    async fn credential_headers(&self) -> StorageResult<CredentialHeaders> {
+        let mut headers = self
+            .credentials
+            .headers()
+            .await
+            .map_err(|err| internal_error(format!("failed to obtain credentials: {err}")))?;
+
         if let Some(token) = {
             let state = self.state.lock().unwrap();
             state.override_auth_token.clone()
         } {
-            return Ok(Some(token));
+            headers.auth_token = Some(token);
         }
 
-        let auth = match self.auth_provider.get_immediate_with_options::<Auth>(None, true) {
-            Ok(Some(auth)) => auth,
-            Ok(None) => return Ok(None),
-            Err(err) => return Err(internal_error(format!("failed to resolve auth provider: {err}"))),
-        };
-
-        match auth.get_token(false).await {
-            Ok(Some(token)) if token.is_empty() => Ok(None),
-            Ok(Some(token)) => Ok(Some(token)),
-            Ok(None) => Ok(None),
-            Err(err) => Err(internal_error(format!("failed to obtain auth token: {err}"))),
-        }
+        Ok(headers)
     }
-
-    async fn app_check_headers(&self) -> StorageResult<Option<AppCheckHeaders>> {
-        let app_check = match self
-            .app_check_provider
-            .get_immediate_with_options::<FirebaseAppCheckInternal>(None, true)
-        {
-            Ok(Some(app_check)) => app_check,
-            Ok(None) => return Ok(None),
-            Err(err) => return Err(internal_error(format!("failed to resolve app check provider: {err}"))),
-        };
-
-        let token = match app_check.get_token(false).await {
-            Ok(result) => result.token,
-            Err(err) => {
-                if let Some(cached) = err.cached_token() {
-                    cached.token.clone()
-                } else {
-                    return Err(internal_error(format!("failed to obtain App Check token: {err}")));
-                }
-            }
-        };
-
-        if token.is_empty() {
-            Ok(None)
-        } else {
-            let heartbeat = app_check
-                .heartbeat_header()
-                .await
-                .map_err(|err| internal_error(format!("failed to obtain App Check heartbeat header: {err}")))?;
-
-            Ok(Some(AppCheckHeaders { token, heartbeat }))
-        }
-    }
-}
-
-struct AppCheckHeaders {
-    token: String,
-    heartbeat: Option<String>,
 }
 
 fn extract_bucket(host: &str, app: &FirebaseApp) -> StorageResult<Option<Location>> {
@@ -313,10 +244,9 @@ mod tests {
     };
     use firebase_app_check::{clear_registry, clear_state_for_tests, initialize_app_check, test_guard, token_with_ttl};
     use firebase_core::app::initialize_app;
+    use firebase_core::app::FirebaseApp;
     use firebase_core::app::{FirebaseAppSettings, FirebaseOptions};
-    use firebase_core::component::types::{ComponentError, DynService, InstanceFactoryOptions};
-    use firebase_core::component::{Component, ComponentType};
-    use reqwest::Method;
+    use firebase_core::platform::http::HttpMethod as Method;
     use std::future::Future;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -340,7 +270,7 @@ mod tests {
 
     fn test_request() -> RequestInfo<()> {
         let handler: ResponseHandler<()> = Arc::new(|_| Ok(()));
-        RequestInfo::new("https://example.com", Method::GET, Duration::from_secs(5), handler)
+        RequestInfo::new("https://example.com", Method::Get, Duration::from_secs(5), handler)
     }
 
     async fn build_storage_with<F, Fut>(configure: F) -> FirebaseStorageImpl
@@ -353,11 +283,7 @@ mod tests {
             .expect("failed to initialize app");
         configure(&app).await;
 
-        let container = app.container();
-        let auth_provider = container.get_provider("auth-internal");
-        let app_check_provider = container.get_provider("app-check-internal");
-        FirebaseStorageImpl::new(app, auth_provider, app_check_provider, None, Some("test-sdk".into()))
-            .expect("storage construction should succeed")
+        FirebaseStorageImpl::new(app, None, Some("test-sdk".into())).expect("storage construction should succeed")
     }
 
     #[tokio::test]
@@ -388,25 +314,13 @@ mod tests {
         }
     }
 
+    /// Initialising App Check is all it takes: it publishes the token source the storage service
+    /// reads through the container.
     async fn register_app_check(app: &FirebaseApp) {
-        let provider = Arc::new(StaticAppCheckProvider);
-        let options = AppCheckOptions::new(provider);
-        let app_check = initialize_app_check(Some(app.clone()), options)
+        let options = AppCheckOptions::new(Arc::new(StaticAppCheckProvider));
+        initialize_app_check(Some(app.clone()), options)
             .await
             .expect("initialize app check");
-        let internal = Arc::new(FirebaseAppCheckInternal::new(app_check));
-
-        let factory = {
-            let internal = internal.clone();
-            Arc::new(
-                move |_: &firebase_core::component::ComponentContainer,
-                      _: InstanceFactoryOptions|
-                      -> Result<DynService, ComponentError> { Ok(internal.clone() as DynService) },
-            )
-        };
-
-        let component = Component::new("app-check-internal", factory, ComponentType::Private);
-        app.container().add_or_overwrite_component(component);
     }
 
     #[tokio::test]

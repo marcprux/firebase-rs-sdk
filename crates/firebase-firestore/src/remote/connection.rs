@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use reqwest::{Client, Method, RequestBuilder, StatusCode};
+use firebase_core::platform::http::{HttpClient, HttpMethod, HttpRequest};
 use serde_json::Value as JsonValue;
 
 use crate::error::{internal_error, FirestoreResult};
@@ -13,14 +13,14 @@ const FIRESTORE_API_VERSION: &str = "v1";
 
 #[derive(Clone, Debug)]
 pub struct Connection {
-    client: Client,
+    client: HttpClient,
     base_url: String,
 }
 
 #[derive(Clone, Debug)]
 pub struct ConnectionBuilder {
     database_id: DatabaseId,
-    client: Option<Client>,
+    client: Option<HttpClient>,
     emulator_host: Option<String>,
 }
 
@@ -41,7 +41,7 @@ impl ConnectionBuilder {
         }
     }
 
-    pub fn with_client(mut self, client: Client) -> Self {
+    pub fn with_client(mut self, client: HttpClient) -> Self {
         self.client = Some(client);
         self
     }
@@ -52,12 +52,7 @@ impl ConnectionBuilder {
     }
 
     pub fn build(self) -> FirestoreResult<Connection> {
-        let client = match self.client {
-            Some(client) => client,
-            None => Client::builder()
-                .build()
-                .map_err(|err| internal_error(err.to_string()))?,
-        };
+        let client = self.client.unwrap_or_default();
         let base_url = build_base_url(&self.database_id, self.emulator_host.as_deref());
         Ok(Connection { client, base_url })
     }
@@ -74,7 +69,7 @@ impl Connection {
 
     pub async fn invoke_json(
         &self,
-        method: Method,
+        method: HttpMethod,
         path: &str,
         body: Option<JsonValue>,
         context: &RequestContext,
@@ -85,7 +80,7 @@ impl Connection {
 
     pub async fn invoke_json_optional(
         &self,
-        method: Method,
+        method: HttpMethod,
         path: &str,
         body: Option<JsonValue>,
         context: &RequestContext,
@@ -96,19 +91,13 @@ impl Connection {
 
     async fn invoke_json_owned(
         &self,
-        method: Method,
+        method: HttpMethod,
         path: String,
         body: Option<JsonValue>,
         context: RequestContext,
     ) -> FirestoreResult<JsonValue> {
-        let mut request = self.build_request(method, &path, &context);
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        let response = request.send().await.map_err(|err| internal_error(err.to_string()))?;
-        let status = response.status();
-        let text = response.text().await.map_err(|err| internal_error(err.to_string()))?;
-        if status.is_success() {
+        let (status, text) = self.invoke(method, &path, body, &context).await?;
+        if (200..300).contains(&status) {
             if text.is_empty() {
                 Ok(JsonValue::Null)
             } else {
@@ -121,19 +110,13 @@ impl Connection {
 
     async fn invoke_json_optional_owned(
         &self,
-        method: Method,
+        method: HttpMethod,
         path: String,
         body: Option<JsonValue>,
         context: RequestContext,
     ) -> FirestoreResult<Option<JsonValue>> {
-        let mut request = self.build_request(method, &path, &context);
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        let response = request.send().await.map_err(|err| internal_error(err.to_string()))?;
-        let status = response.status();
-        let text = response.text().await.map_err(|err| internal_error(err.to_string()))?;
-        if status.is_success() {
+        let (status, text) = self.invoke(method, &path, body, &context).await?;
+        if (200..300).contains(&status) {
             if text.is_empty() {
                 Ok(Some(JsonValue::Null))
             } else {
@@ -141,33 +124,57 @@ impl Connection {
                     .map(Some)
                     .map_err(|err| internal_error(err.to_string()))
             }
-        } else if status == StatusCode::NOT_FOUND {
+        } else if status == 404 {
             Ok(None)
         } else {
             Err(map_http_error(status, &text))
         }
     }
 
-    fn build_request(&self, method: Method, path: &str, context: &RequestContext) -> RequestBuilder {
+    /// Sends one request and reads its body, leaving the status for the caller to interpret:
+    /// `getDocument` treats a 404 as "no such document", everything else as an error.
+    async fn invoke(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        body: Option<JsonValue>,
+        context: &RequestContext,
+    ) -> FirestoreResult<(u16, String)> {
+        let request = self.build_request(method, path, body, context)?;
+        let response = self
+            .client
+            .send(request)
+            .await
+            .map_err(|err| internal_error(err.to_string()))?;
+        Ok((response.status(), response.text()))
+    }
+
+    fn build_request(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        body: Option<JsonValue>,
+        context: &RequestContext,
+    ) -> FirestoreResult<HttpRequest> {
         let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
-        let mut builder = self.client.request(method, url);
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if let Some(timeout) = context.request_timeout {
-                builder = builder.timeout(timeout);
-            }
+        let mut request = HttpRequest::new(method, url).header("Content-Type", "application/json");
+
+        if let Some(body) = body {
+            request = request.json(&body).map_err(|err| internal_error(err.to_string()))?;
+        }
+        if let Some(timeout) = context.request_timeout {
+            request = request.timeout(timeout);
         }
         if let Some(token) = context.auth_token.as_deref() {
-            builder = builder.bearer_auth(token);
+            request = request.header("Authorization", format!("Bearer {token}"));
         }
         if let Some(app_check) = context.app_check_token.as_deref() {
-            builder = builder.header("X-Firebase-AppCheck", app_check);
+            request = request.header("X-Firebase-AppCheck", app_check);
         }
         if let Some(header) = context.heartbeat_header.as_deref() {
-            builder = builder.header("X-Firebase-Client", header);
+            request = request.header("X-Firebase-Client", header);
         }
-        builder = builder.header("Content-Type", "application/json");
-        builder
+        Ok(request)
     }
 }
 

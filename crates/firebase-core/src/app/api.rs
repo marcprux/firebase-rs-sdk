@@ -12,7 +12,7 @@ use crate::app::types::{
     FirebaseOptions, FirebaseServerApp, FirebaseServerAppSettings, VersionService,
 };
 use crate::app::types::{is_browser, is_web_worker};
-use crate::component::types::{DynService, InstanceFactory, InstantiationMode};
+use crate::component::types::InstantiationMode;
 use sha2::{Digest, Sha256};
 
 pub static SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -186,9 +186,9 @@ pub async fn initialize_app(options: FirebaseOptions, settings: Option<FirebaseA
     };
 
     let app_for_factory = app.clone();
-    let app_factory: InstanceFactory =
-        Arc::new(move |_container, _options| Ok(Arc::new(app_for_factory.clone()) as DynService));
-    let _ = container.add_component(Component::new("app", app_factory, ComponentType::Public));
+    let _ = container.add_component(Component::for_service::<FirebaseApp, _>(move |_container, _options| {
+        Ok(Arc::new(app_for_factory.clone()))
+    }));
     for component in components {
         let _ = container.add_component(component);
     }
@@ -309,9 +309,9 @@ pub async fn initialize_server_app(
     );
 
     let base_for_factory = base_app.clone();
-    let app_factory: InstanceFactory =
-        Arc::new(move |_container, _| Ok(Arc::new(base_for_factory.clone()) as DynService));
-    let _ = container.add_component(Component::new("app", app_factory, ComponentType::Public));
+    let _ = container.add_component(Component::for_service::<FirebaseApp, _>(move |_container, _options| {
+        Ok(Arc::new(base_for_factory.clone()))
+    }));
 
     let server_app = FirebaseServerApp::new(base_app, server_settings.clone());
 
@@ -361,16 +361,20 @@ pub fn register_version(library: &str, version: &str, variant: Option<&str>) {
     let component_name = format!("{library_key}-version");
     let version_string = version.to_string();
     let library_string = library_key.clone();
-    let factory: InstanceFactory = Arc::new(move |_, _| {
-        let service = VersionService {
-            library: library_string.clone(),
-            version: version_string.clone(),
-        };
-        Ok(Arc::new(service) as DynService)
-    });
 
-    let component = Component::new(component_name, factory, ComponentType::Version)
-        .with_instantiation_mode(InstantiationMode::Eager);
+    // The one component whose name is only known at runtime: there is one per registered library,
+    // all of them holding a `VersionService`.
+    let component = Component::typed::<VersionService, _>(
+        component_name,
+        move |_, _| {
+            Ok(Arc::new(VersionService {
+                library: library_string.clone(),
+                version: version_string.clone(),
+            }))
+        },
+        ComponentType::Version,
+    )
+    .with_instantiation_mode(InstantiationMode::Eager);
     let _ = registry::register_component(component);
 }
 
@@ -398,7 +402,7 @@ mod tests {
     use super::*;
     use crate::app::heartbeat::clear_heartbeat_store_for_tests;
     use crate::app::registry;
-    use crate::component::types::{ComponentType, DynService, InstanceFactory, InstantiationMode};
+    use crate::component::types::{ComponentType, InstantiationMode};
     use crate::component::Component;
     use crate::platform::runtime;
     use std::future::Future;
@@ -453,8 +457,7 @@ mod tests {
     }
 
     fn make_test_component(name: &str) -> Component {
-        let factory: InstanceFactory = Arc::new(|_, _| Ok(Arc::new(()) as DynService));
-        Component::new(name.to_string(), factory, ComponentType::Public)
+        Component::typed::<(), _>(name.to_string(), |_, _| Ok(Arc::new(())), ComponentType::Public)
             .with_instantiation_mode(InstantiationMode::Lazy)
     }
 

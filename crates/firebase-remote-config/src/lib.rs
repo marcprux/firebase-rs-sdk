@@ -13,13 +13,8 @@ pub use api::{get_remote_config, register_remote_config_component, RemoteConfig}
 #[doc(inline)]
 pub use fetch::{FetchRequest, FetchResponse, InstallationsTokenProvider, NoopFetchClient, RemoteConfigFetchClient};
 
-#[cfg(not(target_arch = "wasm32"))]
 #[doc(inline)]
-pub use fetch::HttpRemoteConfigFetchClient;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm-web"))]
-#[doc(inline)]
-pub use fetch::WasmRemoteConfigFetchClient;
+pub use fetch::RemoteConfigFetchHttpClient;
 
 #[doc(inline)]
 pub use error::{internal_error, invalid_argument, RemoteConfigError, RemoteConfigErrorCode, RemoteConfigResult};

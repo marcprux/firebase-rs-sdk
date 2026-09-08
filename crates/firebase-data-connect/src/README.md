@@ -58,5 +58,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## WASM Notes
 
-- The transport layer uses `reqwest`’s fetch backend when targeting `wasm32-unknown-unknown`, so no additional shims are required.
+- The transport layer is `firebase_core::platform::http`, which speaks `fetch` when targeting `wasm32-unknown-unknown`, so no additional shims are required.
 - `subscribe` and the query/mutation managers avoid `Send` bounds when compiling with the `wasm-web` feature so callbacks can capture browser-only types.

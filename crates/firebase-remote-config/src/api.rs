@@ -8,11 +8,9 @@ use crate::constants::{
     REMOTE_CONFIG_COMPONENT_NAME,
 };
 use crate::error::{internal_error, invalid_argument, RemoteConfigResult};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::fetch::HttpRemoteConfigFetchClient;
-#[cfg(all(target_arch = "wasm32", feature = "wasm-web"))]
-use crate::fetch::WasmRemoteConfigFetchClient;
-use crate::fetch::{FetchRequest, InstallationsTokenProvider, NoopFetchClient, RemoteConfigFetchClient};
+use crate::fetch::{
+    FetchRequest, InstallationsTokenProvider, NoopFetchClient, RemoteConfigFetchClient, RemoteConfigFetchHttpClient,
+};
 use crate::settings::{RemoteConfigSettings, RemoteConfigSettingsUpdate};
 pub use crate::storage::CustomSignals;
 #[cfg(all(feature = "wasm-web", target_arch = "wasm32", feature = "experimental-indexed-db"))]
@@ -22,13 +20,10 @@ use crate::value::{RemoteConfigValue, RemoteConfigValueSource};
 use async_lock::OnceCell;
 use firebase_core::app;
 use firebase_core::app::FirebaseApp;
-use firebase_core::component::types::{ComponentError, DynService, InstanceFactoryOptions, InstantiationMode};
-use firebase_core::component::{Component, ComponentType};
+use firebase_core::component::types::{ComponentError, InstanceFactoryOptions};
+use firebase_core::component::{ComponentContainer, Service};
+use firebase_core::platform::http::HttpClient;
 use firebase_installations::get_installations;
-#[cfg(not(target_arch = "wasm32"))]
-use reqwest::Client as HttpClient;
-#[cfg(all(target_arch = "wasm32", feature = "wasm-web"))]
-use reqwest::Client as WasmHttpClient;
 use serde_json::Value as JsonValue;
 
 #[derive(Clone)]
@@ -111,7 +106,7 @@ impl RemoteConfig {
     /// Replaces the underlying fetch client.
     ///
     /// Useful for tests or environments that need to supply a custom transport implementation,
-    /// such as [`HttpRemoteConfigFetchClient`](crate::fetch::HttpRemoteConfigFetchClient).
+    /// such as [`RemoteConfigFetchHttpClient`](crate::fetch::RemoteConfigFetchHttpClient).
     pub fn set_fetch_client(&self, fetch_client: Arc<dyn RemoteConfigFetchClient>) {
         *self.inner.fetch_client.lock().unwrap() = fetch_client;
     }
@@ -450,52 +445,21 @@ fn build_fetch_client(app: &FirebaseApp) -> RemoteConfigResult<Arc<dyn RemoteCon
 
     let installations = get_installations(Some(app.clone())).map_err(|err| internal_error(err.to_string()))?;
 
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let installations: Arc<dyn InstallationsTokenProvider> = installations;
-        let client = HttpClient::builder()
-            .user_agent(format!("firebase-rs-sdk/{}", firebase_core::app::SDK_VERSION))
-            .build()
-            .map_err(|err| internal_error(format!("Failed to build HTTP client: {err}")))?;
-        let fetch = HttpRemoteConfigFetchClient::new(
-            client,
-            &base_url,
-            project_id,
-            namespace,
-            api_key,
-            app_id,
-            sdk_version,
-            language_code,
-            installations,
-        );
-        return Ok(Arc::new(fetch));
-    }
+    let installations: Arc<dyn InstallationsTokenProvider> = installations;
+    let client = HttpClient::with_user_agent(&format!("firebase-rs-sdk/{}", firebase_core::app::SDK_VERSION))
+        .map_err(|err| internal_error(format!("Failed to build HTTP client: {err}")))?;
 
-    #[cfg(all(target_arch = "wasm32", feature = "wasm-web"))]
-    {
-        let installations: Arc<dyn InstallationsTokenProvider> = installations;
-        let client = WasmHttpClient::new();
-        let fetch = WasmRemoteConfigFetchClient::new(
-            client,
-            &base_url,
-            project_id,
-            namespace,
-            api_key,
-            app_id,
-            sdk_version,
-            language_code,
-            installations,
-        );
-        return Ok(Arc::new(fetch));
-    }
-
-    #[cfg(all(target_arch = "wasm32", not(feature = "wasm-web")))]
-    {
-        let _ = installations;
-        return Err(internal_error(
-            "Building Remote Config for wasm32 requires the `wasm-web` feature",
-        ));
-    }
+    Ok(Arc::new(RemoteConfigFetchHttpClient::new(
+        client,
+        &base_url,
+        project_id,
+        namespace,
+        api_key,
+        app_id,
+        sdk_version,
+        language_code,
+        installations,
+    )))
 }
 
 impl fmt::Debug for RemoteConfig {
@@ -509,28 +473,21 @@ impl fmt::Debug for RemoteConfig {
     }
 }
 
-static REMOTE_CONFIG_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
-    Component::new(
-        REMOTE_CONFIG_COMPONENT_NAME,
-        Arc::new(remote_config_factory),
-        ComponentType::Public,
-    )
-    .with_instantiation_mode(InstantiationMode::Lazy)
-});
+impl Service for RemoteConfig {
+    const NAME: &'static str = REMOTE_CONFIG_COMPONENT_NAME;
+}
 
 fn remote_config_factory(
-    container: &firebase_core::component::ComponentContainer,
+    container: &ComponentContainer,
     _options: InstanceFactoryOptions,
-) -> Result<DynService, ComponentError> {
-    let app = container
-        .root_service::<FirebaseApp>()
-        .ok_or_else(|| ComponentError::InitializationFailed {
-            name: REMOTE_CONFIG_COMPONENT_NAME.to_string(),
-            reason: "Firebase app not attached to component container".to_string(),
-        })?;
+) -> Result<Arc<RemoteConfig>, ComponentError> {
+    let app = container.app().ok_or_else(|| ComponentError::InitializationFailed {
+        name: REMOTE_CONFIG_COMPONENT_NAME.to_string(),
+        reason: "Firebase app not attached to component container".to_string(),
+    })?;
 
     let rc = RemoteConfig::new((*app).clone());
-    Ok(Arc::new(rc) as DynService)
+    Ok(Arc::new(rc))
 }
 
 fn current_timestamp_millis() -> u64 {
@@ -541,7 +498,7 @@ fn current_timestamp_millis() -> u64 {
 }
 
 fn ensure_registered() {
-    let _ = app::register_component(REMOTE_CONFIG_COMPONENT.clone());
+    app::register_service::<RemoteConfig, _>(remote_config_factory);
 }
 
 pub fn register_remote_config_component() {
@@ -561,8 +518,8 @@ pub async fn get_remote_config(app: Option<FirebaseApp>) -> RemoteConfigResult<A
         return Ok(rc);
     }
 
-    let provider = app::get_provider(&app, REMOTE_CONFIG_COMPONENT_NAME);
-    if let Some(rc) = provider.get_immediate::<RemoteConfig>() {
+    let provider = app::service_provider::<RemoteConfig>(&app);
+    if let Some(rc) = provider.get() {
         REMOTE_CONFIG_CACHE
             .lock()
             .unwrap()
@@ -570,7 +527,7 @@ pub async fn get_remote_config(app: Option<FirebaseApp>) -> RemoteConfigResult<A
         return Ok(rc);
     }
 
-    match provider.initialize::<RemoteConfig>(serde_json::Value::Null, None) {
+    match provider.initialize(serde_json::Value::Null, None) {
         Ok(rc) => {
             REMOTE_CONFIG_CACHE
                 .lock()
@@ -579,7 +536,7 @@ pub async fn get_remote_config(app: Option<FirebaseApp>) -> RemoteConfigResult<A
             Ok(rc)
         }
         Err(firebase_core::component::types::ComponentError::InstanceUnavailable { .. }) => {
-            if let Some(rc) = provider.get_immediate::<RemoteConfig>() {
+            if let Some(rc) = provider.get() {
                 REMOTE_CONFIG_CACHE
                     .lock()
                     .unwrap()

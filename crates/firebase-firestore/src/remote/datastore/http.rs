@@ -3,7 +3,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::Method;
+use firebase_core::platform::http::HttpMethod as Method;
 
 use async_trait::async_trait;
 
@@ -226,7 +226,7 @@ impl HttpDatastore {
                 let body = commit_body.clone();
                 async move {
                     self.connection
-                        .invoke_json(Method::POST, "documents:commit", Some(body.clone()), &context)
+                        .invoke_json(Method::Post, "documents:commit", Some(body.clone()), &context)
                         .await
                 }
             })
@@ -293,7 +293,7 @@ impl HttpDatastore {
                 let body = body.clone();
                 async move {
                     self.connection
-                        .invoke_json(Method::POST, &request_path, Some(body.clone()), &context)
+                        .invoke_json(Method::Post, &request_path, Some(body.clone()), &context)
                         .await
                 }
             })
@@ -313,7 +313,7 @@ impl Datastore for HttpDatastore {
                 let doc_path = doc_path.clone();
                 async move {
                     self.connection
-                        .invoke_json_optional(Method::GET, &doc_path, None, &context)
+                        .invoke_json_optional(Method::Get, &doc_path, None, &context)
                         .await
                 }
             })
@@ -395,7 +395,7 @@ impl Datastore for HttpDatastore {
                 let body = body.clone();
                 async move {
                     self.connection
-                        .invoke_json(Method::POST, "documents:batchGet", Some(body.clone()), &context)
+                        .invoke_json(Method::Post, "documents:batchGet", Some(body.clone()), &context)
                         .await
                 }
             })
@@ -464,7 +464,7 @@ impl Datastore for HttpDatastore {
                 let body = body.clone();
                 async move {
                     self.connection
-                        .invoke_json(Method::POST, &request_path, Some(body.clone()), &context)
+                        .invoke_json(Method::Post, &request_path, Some(body.clone()), &context)
                         .await
                 }
             })
@@ -861,7 +861,7 @@ mod tests {
             then.status(200).json_body(response_clone.clone());
         });
 
-        let client = reqwest::Client::builder().build().expect("reqwest client");
+        let client = firebase_core::platform::http::HttpClient::new();
 
         let connection_builder = Connection::builder(database_id.clone())
             .with_client(client)
@@ -954,7 +954,7 @@ mod tests {
             then.status(200).json_body(response_clone.clone());
         });
 
-        let client = reqwest::Client::builder().build().expect("reqwest client");
+        let client = firebase_core::platform::http::HttpClient::new();
 
         let connection_builder = Connection::builder(database_id.clone())
             .with_client(client)
@@ -1051,7 +1051,7 @@ mod tests {
             then.status(200).json_body(response_clone.clone());
         });
 
-        let client = reqwest::Client::builder().build().expect("reqwest client");
+        let client = firebase_core::platform::http::HttpClient::new();
 
         let connection_builder = Connection::builder(database_id.clone())
             .with_client(client)
@@ -1154,7 +1154,7 @@ mod tests {
             then.status(200).json_body(json!({ "commitTime": "" }));
         });
 
-        let client = reqwest::Client::builder().build().expect("reqwest client");
+        let client = firebase_core::platform::http::HttpClient::new();
         let connection_builder = Connection::builder(database_id.clone())
             .with_client(client)
             .with_emulator_host(server.address().to_string());

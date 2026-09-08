@@ -101,10 +101,7 @@ mod tests {
             ..Default::default()
         };
         let app = initialize_app(options, Some(unique_settings())).await.unwrap();
-        let container = app.container();
-        let auth_provider = container.get_provider("auth-internal");
-        let app_check_provider = container.get_provider("app-check-internal");
-        FirebaseStorageImpl::new(app, auth_provider, app_check_provider, None, None).unwrap()
+        FirebaseStorageImpl::new(app, None, None).unwrap()
     }
 
     #[tokio::test]

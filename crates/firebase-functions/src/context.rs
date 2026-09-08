@@ -1,13 +1,15 @@
 use std::fmt::{Debug, Formatter};
-use std::sync::{Arc, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
+use std::sync::Mutex;
 
 #[cfg(not(all(feature = "wasm-web", target_arch = "wasm32")))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use firebase_app_check::FirebaseAppCheckInternal;
-use firebase_auth::Auth;
 use firebase_core::app::FirebaseApp;
-use firebase_core::component::provider::Provider;
+#[cfg(not(target_arch = "wasm32"))]
+use firebase_core::component::ServiceProvider;
+use firebase_core::platform::credentials::{AppCredentials, CredentialRequest};
 #[cfg(not(target_arch = "wasm32"))]
 use firebase_messaging::Messaging;
 
@@ -21,21 +23,16 @@ pub struct CallContext {
 }
 
 pub struct ContextProvider {
-    auth_provider: Provider,
-    auth_internal_provider: Provider,
+    credentials: AppCredentials,
     #[cfg(not(target_arch = "wasm32"))]
-    messaging_provider: Provider,
-    app_check_provider: Provider,
-    cached_auth: Mutex<Option<Arc<Auth>>>,
+    messaging_provider: ServiceProvider<Messaging>,
     #[cfg(not(target_arch = "wasm32"))]
     cached_messaging: Mutex<Option<Arc<Messaging>>>,
-    cached_app_check: Mutex<Option<Arc<FirebaseAppCheckInternal>>>,
     overrides: Mutex<Option<CallContext>>,
 }
 
 impl Debug for ContextProvider {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let auth_cached = self.cached_auth.lock().unwrap().is_some();
         #[allow(unused_variables)]
         let messaging_cached = {
             #[cfg(not(target_arch = "wasm32"))]
@@ -47,31 +44,22 @@ impl Debug for ContextProvider {
                 false
             }
         };
-        let app_check_cached = self.cached_app_check.lock().unwrap().is_some();
         f.debug_struct("ContextProvider")
-            .field("auth_cached", &auth_cached)
             .field("messaging_cached", &messaging_cached)
-            .field("app_check_cached", &app_check_cached)
             .finish()
     }
 }
 
 impl ContextProvider {
     pub fn new(app: FirebaseApp) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
         let container = app.container();
-        let auth_provider = container.get_provider("auth");
-        let auth_internal_provider = container.get_provider("auth-internal");
-        let app_check_provider = container.get_provider("app-check-internal");
 
         Self {
-            auth_provider,
-            auth_internal_provider,
-            app_check_provider,
-            cached_auth: Mutex::new(None),
-            cached_app_check: Mutex::new(None),
+            credentials: AppCredentials::for_app(&app),
             overrides: Mutex::new(None),
             #[cfg(not(target_arch = "wasm32"))]
-            messaging_provider: container.get_provider("messaging"),
+            messaging_provider: container.service::<Messaging>(),
             #[cfg(not(target_arch = "wasm32"))]
             cached_messaging: Mutex::new(None),
         }
@@ -82,22 +70,21 @@ impl ContextProvider {
             return overrides;
         }
 
-        let (app_check_token, app_check_heartbeat) =
-            self.fetch_app_check_credentials(limited_use_app_check_tokens).await;
+        // A credential that cannot be minted is left out of the call rather than failing it,
+        // which is what the JS SDK does: the backend decides whether an anonymous call is allowed.
+        let credentials = self
+            .credentials
+            .headers_or_empty(CredentialRequest {
+                limited_use_app_check_token: limited_use_app_check_tokens,
+                include_heartbeat: true,
+            })
+            .await;
 
         CallContext {
-            auth_token: self.fetch_auth_token().await,
+            auth_token: credentials.auth_token,
             messaging_token: self.fetch_messaging_token().await,
-            app_check_token,
-            app_check_heartbeat,
-        }
-    }
-
-    async fn fetch_auth_token(&self) -> Option<String> {
-        let auth = self.ensure_auth()?;
-        match auth.get_token(false).await {
-            Ok(Some(token)) if !token.is_empty() => Some(token),
-            _ => None,
+            app_check_token: credentials.app_check_token,
+            app_check_heartbeat: credentials.heartbeat,
         }
     }
 
@@ -133,83 +120,15 @@ impl ContextProvider {
         }
     }
 
-    async fn fetch_app_check_credentials(&self, limited_use: bool) -> (Option<String>, Option<String>) {
-        let app_check = match self.ensure_app_check() {
-            Some(app_check) => app_check,
-            None => return (None, None),
-        };
-
-        let token_result = if limited_use {
-            app_check.get_limited_use_token().await
-        } else {
-            app_check.get_token(false).await
-        };
-
-        let token = match token_result {
-            Ok(result) => {
-                if result.token.is_empty() {
-                    None
-                } else {
-                    Some(result.token)
-                }
-            }
-            Err(err) => err.cached_token().and_then(|cached| {
-                if cached.token.is_empty() {
-                    None
-                } else {
-                    Some(cached.token.clone())
-                }
-            }),
-        };
-
-        let heartbeat = match app_check.heartbeat_header().await {
-            Ok(header) => header,
-            Err(_) => None,
-        };
-
-        (token, heartbeat)
-    }
-
-    fn ensure_auth(&self) -> Option<Arc<Auth>> {
-        if let Some(cached) = self.cached_auth.lock().unwrap().clone() {
-            return Some(cached);
-        }
-
-        let maybe_auth = self
-            .auth_internal_provider
-            .get_immediate::<Auth>()
-            .or_else(|| self.auth_provider.get_immediate::<Auth>());
-
-        if let Some(auth) = maybe_auth {
-            *self.cached_auth.lock().unwrap() = Some(auth.clone());
-            Some(auth)
-        } else {
-            None
-        }
-    }
-
     #[cfg(not(target_arch = "wasm32"))]
     fn ensure_messaging(&self) -> Option<Arc<Messaging>> {
         if let Some(cached) = self.cached_messaging.lock().unwrap().clone() {
             return Some(cached);
         }
 
-        if let Some(messaging) = self.messaging_provider.get_immediate::<Messaging>() {
+        if let Some(messaging) = self.messaging_provider.get() {
             *self.cached_messaging.lock().unwrap() = Some(messaging.clone());
             Some(messaging)
-        } else {
-            None
-        }
-    }
-
-    fn ensure_app_check(&self) -> Option<Arc<FirebaseAppCheckInternal>> {
-        if let Some(cached) = self.cached_app_check.lock().unwrap().clone() {
-            return Some(cached);
-        }
-
-        if let Some(app_check) = self.app_check_provider.get_immediate::<FirebaseAppCheckInternal>() {
-            *self.cached_app_check.lock().unwrap() = Some(app_check.clone());
-            Some(app_check)
         } else {
             None
         }

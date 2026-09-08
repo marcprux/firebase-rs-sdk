@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use firebase_core::platform::http::HttpMethod as Method;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
-use reqwest::Method;
 use serde_json::{Map, Value};
 
 use crate::error::{
@@ -28,7 +28,7 @@ pub fn shared_error_handler(location: &Location) -> ErrorHandler {
     let bucket = location.bucket().to_string();
     let path = location.path().to_string();
     Arc::new(move |payload: ResponsePayload, base: StorageError| {
-        let status = payload.status.as_u16();
+        let status = payload.status;
         let body = String::from_utf8_lossy(&payload.body).to_string();
         let mapped = match status {
             // This exact message string is the only consistent part of the server's error
@@ -49,7 +49,7 @@ pub fn object_error_handler(location: &Location) -> ErrorHandler {
     let shared = shared_error_handler(location);
     let path = location.path().to_string();
     Arc::new(move |payload: ResponsePayload, base: StorageError| {
-        if payload.status.as_u16() == 404 {
+        if payload.status == 404 {
             return object_not_found(&path)
                 .with_status(404)
                 .with_server_response(String::from_utf8_lossy(&payload.body).to_string());
@@ -64,7 +64,7 @@ pub fn bucket_error_handler(location: &Location) -> ErrorHandler {
     let shared = shared_error_handler(location);
     let bucket = location.bucket().to_string();
     Arc::new(move |payload: ResponsePayload, base: StorageError| {
-        if payload.status.as_u16() == 404 {
+        if payload.status == 404 {
             return bucket_not_found(&bucket)
                 .with_status(404)
                 .with_server_response(String::from_utf8_lossy(&payload.body).to_string());
@@ -81,7 +81,7 @@ pub fn get_metadata_request(storage: &FirebaseStorageImpl, location: &Location) 
         serde_json::from_slice(&payload.body).map_err(|err| internal_error(format!("failed to parse metadata: {err}")))
     });
 
-    RequestInfo::new(base_url, Method::GET, timeout, handler)
+    RequestInfo::new(base_url, Method::Get, timeout, handler)
         .with_query_param("alt", "json")
         .with_headers(default_json_headers())
         .with_error_handler(object_error_handler(location))
@@ -99,7 +99,7 @@ pub fn update_metadata_request(
         serde_json::from_slice(&payload.body).map_err(|err| internal_error(format!("failed to parse metadata: {err}")))
     });
 
-    RequestInfo::new(base_url, Method::PATCH, timeout, handler)
+    RequestInfo::new(base_url, Method::Patch, timeout, handler)
         .with_query_param("alt", "json")
         .with_headers(default_json_headers())
         .with_body(RequestBody::Text(
@@ -116,7 +116,7 @@ pub fn list_request(storage: &FirebaseStorageImpl, location: &Location, options:
             .map_err(|err| internal_error(format!("failed to parse list response: {err}")))
     });
 
-    let mut request = RequestInfo::new(base_url, Method::GET, timeout, handler)
+    let mut request = RequestInfo::new(base_url, Method::Get, timeout, handler)
         .with_query_param("alt", "json")
         .with_headers(default_json_headers())
         .with_error_handler(bucket_error_handler(location));
@@ -139,7 +139,7 @@ pub fn download_bytes_request(
     let handler: ResponseHandler<Vec<u8>> = Arc::new(|payload| Ok(payload.body));
 
     let mut request =
-        RequestInfo::new(base_url, Method::GET, timeout, handler).with_error_handler(object_error_handler(location));
+        RequestInfo::new(base_url, Method::Get, timeout, handler).with_error_handler(object_error_handler(location));
     request.query_params.insert("alt".to_string(), "media".to_string());
 
     if let Some(limit) = max_download_size_bytes {
@@ -176,7 +176,7 @@ pub fn download_url_request(storage: &FirebaseStorageImpl, location: &Location) 
     });
 
     let mut request =
-        RequestInfo::new(base_url, Method::GET, timeout, handler).with_error_handler(object_error_handler(location));
+        RequestInfo::new(base_url, Method::Get, timeout, handler).with_error_handler(object_error_handler(location));
     request.headers = default_json_headers();
     request
 }
@@ -188,7 +188,7 @@ pub fn delete_object_request(storage: &FirebaseStorageImpl, location: &Location)
     let handler: ResponseHandler<()> = Arc::new(|_| Ok(()));
 
     let mut request =
-        RequestInfo::new(base_url, Method::DELETE, timeout, handler).with_error_handler(object_error_handler(location));
+        RequestInfo::new(base_url, Method::Delete, timeout, handler).with_error_handler(object_error_handler(location));
     request.success_codes = vec![200, 204];
     request
 }
@@ -244,7 +244,7 @@ pub fn multipart_upload_request(
         Ok(ObjectMetadata::from_value(value))
     });
 
-    let mut request = RequestInfo::new(base_url, Method::POST, timeout, handler)
+    let mut request = RequestInfo::new(base_url, Method::Post, timeout, handler)
         .with_headers(default_json_headers())
         .with_body(RequestBody::Bytes(body))
         .with_query_param("uploadType", "multipart")
@@ -298,7 +298,7 @@ pub fn create_resumable_upload_request(
         Ok(upload_url.to_string())
     });
 
-    let mut request = RequestInfo::new(base_url, Method::POST, timeout, handler)
+    let mut request = RequestInfo::new(base_url, Method::Post, timeout, handler)
         .with_query_param("uploadType", "resumable")
         .with_query_param("name", location.path())
         .with_headers(default_json_headers())
@@ -345,7 +345,7 @@ pub fn get_resumable_upload_status_request(
     });
 
     let mut request =
-        RequestInfo::new(upload_url, Method::POST, timeout, handler).with_error_handler(shared_error_handler(location));
+        RequestInfo::new(upload_url, Method::Post, timeout, handler).with_error_handler(shared_error_handler(location));
     request
         .headers
         .insert("X-Goog-Upload-Command".to_string(), "query".to_string());
@@ -392,7 +392,7 @@ pub fn continue_resumable_upload_request(
         ))
     });
 
-    let mut request = RequestInfo::new(upload_url, Method::POST, timeout, handler)
+    let mut request = RequestInfo::new(upload_url, Method::Post, timeout, handler)
         .with_body(RequestBody::Bytes(chunk))
         .with_error_handler(shared_error_handler(location));
 
@@ -437,7 +437,7 @@ pub fn cancel_resumable_upload_request(
     let handler: ResponseHandler<()> = Arc::new(|_payload| Ok(()));
 
     let mut request =
-        RequestInfo::new(upload_url, Method::POST, timeout, handler).with_error_handler(shared_error_handler(location));
+        RequestInfo::new(upload_url, Method::Post, timeout, handler).with_error_handler(shared_error_handler(location));
     request
         .headers
         .insert("X-Goog-Upload-Command".to_string(), "cancel".to_string());
@@ -539,11 +539,10 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
 mod error_handler_tests {
     use super::*;
     use crate::error::{unknown_error, StorageErrorCode};
-    use reqwest::StatusCode;
 
     fn payload(status: u16, body: &str) -> ResponsePayload {
         ResponsePayload {
-            status: StatusCode::from_u16(status).unwrap(),
+            status,
             headers: HashMap::new(),
             body: body.as_bytes().to_vec(),
         }
@@ -620,7 +619,6 @@ mod tests {
     use crate::request::{RequestBody, ResponsePayload};
     use firebase_core::app::initialize_app;
     use firebase_core::app::{FirebaseAppSettings, FirebaseOptions};
-    use reqwest::StatusCode;
 
     fn unique_settings() -> FirebaseAppSettings {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -637,10 +635,7 @@ mod tests {
             ..Default::default()
         };
         let app = initialize_app(options, Some(unique_settings())).await.unwrap();
-        let container = app.container();
-        let auth_provider = container.get_provider("auth-internal");
-        let app_check_provider = container.get_provider("app-check-internal");
-        FirebaseStorageImpl::new(app, auth_provider, app_check_provider, None, None).unwrap()
+        FirebaseStorageImpl::new(app, None, None).unwrap()
     }
 
     #[tokio::test]
@@ -667,7 +662,7 @@ mod tests {
         let location = Location::new("my-bucket", "photos/cat.png");
         let request = cancel_resumable_upload_request(&storage, &location, "https://upload.example/session/1");
         assert_eq!(request.url, "https://upload.example/session/1");
-        assert_eq!(request.method, Method::POST);
+        assert_eq!(request.method, Method::Post);
         assert_eq!(request.headers.get("X-Goog-Upload-Command").map(String::as_str), Some("cancel"));
         assert_eq!(
             request.headers.get("X-Goog-Upload-Protocol").map(String::as_str),
@@ -685,7 +680,7 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("x-goog-upload-status".to_string(), "cancelled".to_string());
         let payload = ResponsePayload {
-            status: StatusCode::OK,
+            status: 200,
             headers,
             body: Vec::new(),
         };
@@ -703,7 +698,7 @@ mod tests {
         headers.insert("x-goog-upload-status".to_string(), "active".to_string());
         headers.insert("x-goog-upload-size-received".to_string(), "4".to_string());
         let payload = ResponsePayload {
-            status: StatusCode::OK,
+            status: 200,
             headers,
             body: Vec::new(),
         };
@@ -737,7 +732,7 @@ mod tests {
         let location = Location::new("my-bucket", "photos/cat.png");
         let request = get_metadata_request(&storage, &location);
         assert_eq!(request.url, "firebasestorage.googleapis.com/v0/b/my-bucket/o/photos%2Fcat.png");
-        assert_eq!(request.method, Method::GET);
+        assert_eq!(request.method, Method::Get);
         assert_eq!(request.query_params.get("alt"), Some(&"json".to_string()));
     }
 
@@ -748,7 +743,7 @@ mod tests {
         let mut metadata = SetMetadataRequest::default();
         metadata.content_type = Some("text/plain".into());
         let request = update_metadata_request(&storage, &location, metadata);
-        assert_eq!(request.method, Method::PATCH);
+        assert_eq!(request.method, Method::Patch);
         assert_eq!(request.url, "firebasestorage.googleapis.com/v0/b/my-bucket/o/docs%2Ffile.txt");
         assert_eq!(request.query_params.get("alt"), Some(&"json".to_string()));
         match &request.body {
@@ -767,7 +762,7 @@ mod tests {
         options.max_results = Some(25);
         options.page_token = Some("token123".into());
         let request = list_request(&storage, &location, &options);
-        assert_eq!(request.method, Method::GET);
+        assert_eq!(request.method, Method::Get);
         assert_eq!(request.query_params.get("delimiter"), Some(&"/".to_string()));
         assert_eq!(request.query_params.get("prefix"), Some(&"".to_string()));
         assert_eq!(request.query_params.get("maxResults"), Some(&"25".to_string()));
@@ -779,7 +774,7 @@ mod tests {
         let storage = build_storage().await;
         let location = Location::new("my-bucket", "docs/file.txt");
         let request = download_bytes_request(&storage, &location, Some(1024));
-        assert_eq!(request.method, Method::GET);
+        assert_eq!(request.method, Method::Get);
         assert_eq!(request.query_params.get("alt"), Some(&"media".to_string()));
         assert_eq!(request.headers.get("Range"), Some(&"bytes=0-1024".to_string()));
         assert_eq!(request.success_codes, vec![200, 206]);
@@ -792,7 +787,7 @@ mod tests {
         let request = download_url_request(&storage, &location);
 
         let payload = ResponsePayload {
-            status: StatusCode::OK,
+            status: 200,
             headers: HashMap::new(),
             body: serde_json::to_vec(&serde_json::json!({
                 "downloadTokens": "token123"
@@ -812,7 +807,7 @@ mod tests {
         let storage = build_storage().await;
         let location = Location::new("my-bucket", "docs/file.txt");
         let request = delete_object_request(&storage, &location);
-        assert_eq!(request.method, Method::DELETE);
+        assert_eq!(request.method, Method::Delete);
         assert!(request.success_codes.contains(&204));
     }
 
@@ -827,7 +822,7 @@ mod tests {
         let bytes = vec![1_u8, 2, 3, 4, 5];
 
         let request = multipart_upload_request(&storage, &location, bytes.clone(), Some(metadata));
-        assert_eq!(request.method, Method::POST);
+        assert_eq!(request.method, Method::Post);
         assert_eq!(request.query_params.get("uploadType"), Some(&"multipart".to_string()));
         assert_eq!(request.query_params.get("name"), Some(&"photos/dog.jpg".to_string()));
         let content_type = request.headers.get("Content-Type").unwrap();
@@ -860,7 +855,7 @@ mod tests {
             "https://example.com/upload/session".to_string(),
         );
         let payload = ResponsePayload {
-            status: StatusCode::OK,
+            status: 200,
             headers,
             body: Vec::new(),
         };
@@ -881,7 +876,7 @@ mod tests {
         headers.insert("X-Goog-Upload-Status".to_string(), "active".to_string());
         headers.insert("X-Goog-Upload-Size-Received".to_string(), "1024".to_string());
         let payload = ResponsePayload {
-            status: StatusCode::OK,
+            status: 200,
             headers,
             body: Vec::new(),
         };
@@ -911,7 +906,7 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("X-Goog-Upload-Status".to_string(), "final".to_string());
         let payload = ResponsePayload {
-            status: StatusCode::OK,
+            status: 200,
             headers,
             body: serde_json::to_vec(&serde_json::json!({
                 "name": "videos/clip.mp4",

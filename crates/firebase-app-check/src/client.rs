@@ -2,7 +2,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -10,6 +9,7 @@ use crate::errors::{AppCheckError, AppCheckResult};
 use crate::types::AppCheckToken;
 use crate::util::parse_protobuf_duration;
 use firebase_core::app::{FirebaseApp, HeartbeatService};
+use firebase_core::platform::http::{HttpClient, HttpRequest};
 
 const BASE_ENDPOINT: &str = "https://content-firebaseappcheck.googleapis.com/v1";
 const EXCHANGE_RECAPTCHA_V3_METHOD: &str = "exchangeRecaptchaV3Token";
@@ -54,8 +54,12 @@ pub async fn exchange_token(
         return handler(request, heartbeat).await;
     }
 
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let mut http_request =
+        HttpRequest::post(&request.url)
+            .json(&request.body)
+            .map_err(|err| AppCheckError::FetchNetworkError {
+                message: err.to_string(),
+            })?;
 
     if let Some(service) = heartbeat {
         if let Some(header) = service
@@ -65,34 +69,24 @@ pub async fn exchange_token(
                 message: err.to_string(),
             })?
         {
-            headers.insert(
-                "X-Firebase-Client",
-                HeaderValue::from_str(&header).map_err(|err| AppCheckError::FetchNetworkError {
-                    message: format!("invalid heartbeat header: {err}"),
-                })?,
-            );
+            http_request = http_request.header("X-Firebase-Client", header);
         }
     }
 
-    let client = reqwest::Client::new();
-    let response = client
-        .post(&request.url)
-        .headers(headers)
-        .json(&request.body)
-        .send()
+    let response = HttpClient::new()
+        .send(http_request)
         .await
         .map_err(|err| AppCheckError::FetchNetworkError {
             message: err.to_string(),
         })?;
 
-    let status = response.status();
-    if !status.is_success() {
+    if !response.is_success() {
         return Err(AppCheckError::FetchStatusError {
-            http_status: status.as_u16(),
+            http_status: response.status(),
         });
     }
 
-    let body: AppCheckResponse = response.json().await.map_err(|err| AppCheckError::FetchParseError {
+    let body: AppCheckResponse = response.json().map_err(|err| AppCheckError::FetchParseError {
         message: err.to_string(),
     })?;
 

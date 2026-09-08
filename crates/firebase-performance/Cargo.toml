@@ -12,13 +12,11 @@ categories = ["api-bindings", "web-programming"]
 
 [features]
 default = []
-wasm-web = ["firebase-core/wasm-web", "firebase-auth/wasm-web", "firebase-app-check/wasm-web", "firebase-installations/wasm-web", "dep:js-sys", "dep:wasm-bindgen", "dep:web-sys"]
-experimental-indexed-db = ["firebase-core/experimental-indexed-db", "firebase-auth/experimental-indexed-db", "firebase-app-check/experimental-indexed-db", "firebase-installations/experimental-indexed-db"]
+wasm-web = ["firebase-core/wasm-web", "firebase-installations/wasm-web", "dep:js-sys", "dep:wasm-bindgen", "dep:web-sys"]
+experimental-indexed-db = ["firebase-core/experimental-indexed-db", "firebase-installations/experimental-indexed-db"]
 
 [dependencies]
 firebase-core.workspace = true
-firebase-auth = { path = "../firebase-auth", version = "1.34.1" }
-firebase-app-check = { path = "../firebase-app-check", version = "1.34.1" }
 firebase-installations = { path = "../firebase-installations", version = "1.34.1" }
 async-lock.workspace = true
 async-trait.workspace = true
@@ -31,13 +29,12 @@ wasm-bindgen = { workspace = true, optional = true }
 web-sys = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-reqwest.workspace = true
 tokio.workspace = true
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-reqwest = { version = "0.11", default-features = false, features = ["json"] }
-
 [dev-dependencies]
+# Credentials arrive through the component container, so the producers are needed only to
+# prove that end of the wiring in tests.
+firebase-app-check = { path = "../firebase-app-check", version = "1.34.1", features = ["test-support"] }
 firebase-core = { workspace = true, features = ["test-support"] }
 
 # httpmock and the multi-threaded runtime are native-only; the wasm test runner needs neither, and

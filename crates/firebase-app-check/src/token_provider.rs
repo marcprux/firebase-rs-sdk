@@ -66,12 +66,30 @@ impl TokenProvider for AppCheckTokenProvider {
         }
     }
 
+    async fn get_limited_use_token(&self) -> Result<Option<String>, TokenError> {
+        match self.app_check.get_limited_use_token().await {
+            Ok(result) => Ok(non_empty(result.token)),
+            Err(err) => match err.cached_token() {
+                Some(cached) => Ok(non_empty(cached.token.clone())),
+                None => Err(map_app_check_error(err.cause)),
+            },
+        }
+    }
+
     fn invalidate_token(&self) {
         self.force_refresh.store(true, Ordering::SeqCst);
     }
 
     async fn heartbeat_header(&self) -> Result<Option<String>, TokenError> {
         self.app_check.heartbeat_header().await.map_err(map_app_check_error)
+    }
+}
+
+fn non_empty(token: String) -> Option<String> {
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
     }
 }
 

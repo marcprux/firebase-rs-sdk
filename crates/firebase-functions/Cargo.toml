@@ -12,13 +12,11 @@ categories = ["api-bindings", "web-programming"]
 
 [features]
 default = []
-wasm-web = ["firebase-core/wasm-web", "firebase-auth/wasm-web", "firebase-app-check/wasm-web", "firebase-messaging/wasm-web", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys"]
-experimental-indexed-db = ["firebase-core/experimental-indexed-db", "firebase-auth/experimental-indexed-db", "firebase-app-check/experimental-indexed-db", "firebase-messaging/experimental-indexed-db"]
+wasm-web = ["firebase-core/wasm-web", "firebase-messaging/wasm-web", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys"]
+experimental-indexed-db = ["firebase-core/experimental-indexed-db", "firebase-messaging/experimental-indexed-db"]
 
 [dependencies]
 firebase-core.workspace = true
-firebase-auth = { path = "../firebase-auth", version = "1.34.1" }
-firebase-app-check = { path = "../firebase-app-check", version = "1.34.1" }
 firebase-messaging = { path = "../firebase-messaging", version = "1.34.1" }
 async-trait.workspace = true
 bytes.workspace = true

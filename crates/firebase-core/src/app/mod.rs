@@ -54,6 +54,13 @@ pub use platform_logger::PlatformLoggerServiceImpl;
 // The registration API the product crates use to attach themselves to an app. The JS SDK calls
 // these `_registerComponent`, `_getProvider` and `_addComponent`: public so the products can reach
 // them, but not part of the surface an application is expected to touch.
+// How a product attaches itself to an app: it declares a `Service`, registers a factory for it,
+// and resolves it back by type. No product needs the untyped container underneath.
+pub use registry::{attach_service, register_service, service, service_provider};
+
+// The untyped plumbing the typed API is built on. Public for the one component whose name is
+// only known at runtime (the per-library version services) and for tests; a product should not
+// need it.
 #[doc(hidden)]
 pub use registry::{add_component, get_provider, register_component};
 

@@ -1,11 +1,12 @@
 use std::collections::HashMap;
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
-use crate::error::FunctionsResult;
+use firebase_core::platform::http::{HttpClient, HttpError, HttpErrorKind, HttpRequest};
+
+use crate::error::{error_for_http_response, internal_error, FunctionsError, FunctionsErrorCode, FunctionsResult};
 
 #[derive(Clone, Debug)]
 pub struct CallableRequest {
@@ -36,6 +37,14 @@ pub async fn invoke_callable_async(request: CallableRequest) -> FunctionsResult<
     callable_transport().invoke(request).await
 }
 
+/// The client a callable request goes out on.
+///
+/// Built per request rather than kept in a static: a pooled client belongs to the runtime it was
+/// first used on, and callables are reached from whichever runtime the application is running.
+fn client() -> HttpClient {
+    HttpClient::new()
+}
+
 /// Raw response body of a streaming callable.
 #[cfg(not(target_arch = "wasm32"))]
 pub type StreamingBody =
@@ -48,43 +57,84 @@ pub async fn open_callable_stream(request: CallableRequest) -> FunctionsResult<S
     native::open_stream(request).await
 }
 
+/// Sends a callable request through the shared HTTP client.
+///
+/// The unary path is the same code on both targets: `firebase_core::platform::http` speaks
+/// `fetch` in the browser and `reqwest` natively, including the request timeout. Only streaming
+/// stays native-specific, because it needs the response body before the request completes.
 pub fn callable_transport() -> &'static dyn CallableTransport {
-    &*TRANSPORT
+    &SharedCallableTransport
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-static TRANSPORT: LazyLock<NativeCallableTransport> = LazyLock::new(NativeCallableTransport::new);
+struct SharedCallableTransport;
 
-#[cfg(target_arch = "wasm32")]
-static TRANSPORT: LazyLock<WasmCallableTransport> = LazyLock::new(WasmCallableTransport::new);
-
-#[cfg(not(target_arch = "wasm32"))]
-struct NativeCallableTransport;
-
-#[cfg(not(target_arch = "wasm32"))]
-impl NativeCallableTransport {
-    fn new() -> Self {
-        Self
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[async_trait]
-impl CallableTransport for NativeCallableTransport {
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl CallableTransport for SharedCallableTransport {
     async fn invoke(&self, request: CallableRequest) -> FunctionsResult<JsonValue> {
-        native::invoke(request).await
+        let CallableRequest {
+            url,
+            payload,
+            timeout,
+            headers,
+        } = request;
+
+        let http_request = HttpRequest::post(url)
+            .headers(headers)
+            .json(&payload)
+            .map_err(map_http_error)?
+            .timeout(timeout);
+
+        let response = client().send(http_request).await.map_err(map_http_error)?;
+
+        let status = response.status();
+        let body = response.body();
+        let (payload, parse_error) = if body.is_empty() {
+            (None, None)
+        } else {
+            match serde_json::from_slice::<JsonValue>(body) {
+                Ok(value) => (Some(value), None),
+                Err(err) => (None, Some(err)),
+            }
+        };
+
+        if let Some(error) = error_for_http_response(status, payload.as_ref()) {
+            return Err(error);
+        }
+
+        if let Some(err) = parse_error {
+            return Err(internal_error(format!("Response is not valid JSON object: {err}")));
+        }
+
+        if status == 204 {
+            return Err(internal_error("Callable response is missing data payload (HTTP 204)"));
+        }
+
+        Ok(payload.unwrap_or(JsonValue::Null))
     }
+}
+
+/// Maps a transport failure onto the callable error taxonomy, which is what a caller catches.
+fn map_http_error(err: HttpError) -> FunctionsError {
+    let code = match err.kind() {
+        HttpErrorKind::Timeout => FunctionsErrorCode::DeadlineExceeded,
+        HttpErrorKind::Network => FunctionsErrorCode::Unavailable,
+        HttpErrorKind::InvalidRequest => FunctionsErrorCode::InvalidArgument,
+        HttpErrorKind::Decode => FunctionsErrorCode::Internal,
+    };
+    FunctionsError::new(code, format!("callable request failed: {err}"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
+    //! Streaming callables, the one path the shared HTTP client cannot serve: it reads a response
+    //! in full, and a stream has to be consumed while the request is still open.
     use super::{CallableRequest, JsonValue};
     use crate::error::{
         error_for_http_response, internal_error, invalid_argument, FunctionsError, FunctionsErrorCode, FunctionsResult,
     };
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-    use reqwest::StatusCode;
-    use reqwest::{Client, Response};
+    use reqwest::Client;
     use std::collections::HashMap;
     use std::sync::LazyLock;
 
@@ -106,52 +156,17 @@ mod native {
         Ok(map)
     }
 
-    fn map_reqwest_error(err: reqwest::Error) -> FunctionsError {
-        if err.is_timeout() {
-            return FunctionsError::new(
-                FunctionsErrorCode::DeadlineExceeded,
-                format!("callable request timed out: {err}"),
-            );
-        }
-        if err.is_connect() {
-            return FunctionsError::new(
-                FunctionsErrorCode::Unavailable,
-                format!("failed to connect to callable endpoint: {err}"),
-            );
-        }
-        if err.is_decode() {
-            return internal_error(format!("unable to decode callable response: {err}"));
-        }
-        if err.is_request() {
-            return FunctionsError::new(
-                FunctionsErrorCode::InvalidArgument,
-                format!("malformed callable request: {err}"),
-            );
-        }
-        FunctionsError::new(FunctionsErrorCode::Unknown, format!("callable request failed: {err}"))
-    }
-
-    pub(super) async fn invoke(request: CallableRequest) -> FunctionsResult<JsonValue> {
-        let CallableRequest {
-            url,
-            payload,
-            timeout,
-            headers,
-        } = request;
-
-        let header_map = build_headers(&headers)?;
-        let client = client().clone();
-
-        let response = client
-            .post(url)
-            .timeout(timeout)
-            .headers(header_map)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
-
-        handle_response(response).await
+    fn map_stream_error(err: reqwest::Error) -> FunctionsError {
+        let code = if err.is_timeout() {
+            FunctionsErrorCode::DeadlineExceeded
+        } else if err.is_connect() {
+            FunctionsErrorCode::Unavailable
+        } else if err.is_decode() {
+            FunctionsErrorCode::Internal
+        } else {
+            FunctionsErrorCode::Unknown
+        };
+        FunctionsError::new(code, format!("callable stream request failed: {err}"))
     }
 
     pub(super) async fn open_stream(request: CallableRequest) -> FunctionsResult<super::StreamingBody> {
@@ -173,7 +188,7 @@ mod native {
                     "callable stream request timed out before the response started",
                 )
             })?
-            .map_err(map_reqwest_error)?;
+            .map_err(map_stream_error)?;
         if !response.status().is_success() {
             let status = response.status();
             let bytes = response.bytes().await.unwrap_or_default();
@@ -182,196 +197,5 @@ mod native {
                 .unwrap_or_else(|| internal_error(format!("callable stream failed with status {status}"))));
         }
         Ok(Box::pin(response.bytes_stream()))
-    }
-
-    async fn handle_response(response: Response) -> FunctionsResult<JsonValue> {
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|err| internal_error(format!("failed to read callable response body: {err}")))?;
-
-        let (body, parse_error) = if bytes.is_empty() {
-            (None, None)
-        } else {
-            match serde_json::from_slice::<JsonValue>(&bytes) {
-                Ok(value) => (Some(value), None),
-                Err(err) => (None, Some(err)),
-            }
-        };
-
-        if let Some(error) = error_for_http_response(status.as_u16(), body.as_ref()) {
-            return Err(error);
-        }
-
-        if let Some(err) = parse_error {
-            return Err(internal_error(format!("Response is not valid JSON object: {err}")));
-        }
-
-        if status == StatusCode::NO_CONTENT {
-            return Err(internal_error("Callable response is missing data payload (HTTP 204)"));
-        }
-
-        Ok(body.unwrap_or(JsonValue::Null))
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-struct WasmCallableTransport;
-
-#[cfg(target_arch = "wasm32")]
-impl WasmCallableTransport {
-    fn new() -> Self {
-        Self
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-#[async_trait(?Send)]
-impl CallableTransport for WasmCallableTransport {
-    async fn invoke(&self, _request: CallableRequest) -> FunctionsResult<JsonValue> {
-        wasm::invoke(_request).await
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-mod wasm {
-    use super::{CallableRequest, JsonValue};
-    use crate::error::{
-        error_for_http_response, internal_error, invalid_argument, FunctionsError, FunctionsErrorCode, FunctionsResult,
-    };
-    use wasm_bindgen::closure::Closure;
-    use wasm_bindgen::JsCast;
-    use wasm_bindgen::JsValue;
-    use wasm_bindgen_futures::JsFuture;
-    use web_sys::{AbortController, DomException, Request, RequestInit, RequestMode, Response};
-
-    const TIMEOUT_CONTEXT: &str = "callable request timed out";
-
-    pub(super) async fn invoke(request: CallableRequest) -> FunctionsResult<JsonValue> {
-        let CallableRequest {
-            url,
-            payload,
-            timeout,
-            headers,
-        } = request;
-
-        let window = web_sys::window().ok_or_else(|| internal_error("window is not available in this environment"))?;
-
-        let abort_controller =
-            AbortController::new().map_err(|err| internal_error(format_js_error("create AbortController", err)))?;
-        let signal = abort_controller.signal();
-
-        let init = RequestInit::new();
-        init.set_method("POST");
-        init.set_mode(RequestMode::Cors);
-        init.set_signal(Some(&signal));
-
-        let body = serde_json::to_string(&payload)
-            .map_err(|err| internal_error(format!("Failed to serialize callable payload: {err}")))?;
-        let body_js = JsValue::from_str(&body);
-        init.set_body(&body_js);
-
-        let request = Request::new_with_str_and_init(&url, &init)
-            .map_err(|err| internal_error(format_js_error("build callable request", err)))?;
-
-        let request_headers = request.headers();
-        for (key, value) in headers {
-            request_headers.set(&key, &value).map_err(|err| {
-                invalid_argument(format!("invalid header `{key}`: {}", format_js_error("set header", err)))
-            })?;
-        }
-
-        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-
-        let mut timeout_guard = if timeout_ms > 0 {
-            let controller = abort_controller.clone();
-            let closure = Closure::wrap(Box::new(move || {
-                controller.abort();
-            }) as Box<dyn FnMut()>);
-            let handle = window
-                .set_timeout_with_callback_and_timeout_and_arguments_0(closure.as_ref().unchecked_ref(), timeout_ms)
-                .map_err(|err| internal_error(format_js_error("schedule callable timeout", err)))?;
-            Some((handle, closure))
-        } else {
-            None
-        };
-
-        let response_value = match JsFuture::from(window.fetch_with_request(&request)).await {
-            Ok(value) => value,
-            Err(err) => {
-                cancel_timeout(&window, &mut timeout_guard);
-                if is_abort_error(&err) {
-                    return Err(FunctionsError::new(FunctionsErrorCode::DeadlineExceeded, TIMEOUT_CONTEXT));
-                }
-                return Err(internal_error(format_js_error("callable fetch", err)));
-            }
-        };
-
-        cancel_timeout(&window, &mut timeout_guard);
-
-        let response: Response = response_value
-            .dyn_into()
-            .map_err(|_| internal_error("callable fetch did not return a Response"))?;
-
-        let status = response.status();
-        let text_promise = response
-            .text()
-            .map_err(|err| internal_error(format_js_error("read callable response", err)))?;
-        let text_value = JsFuture::from(text_promise)
-            .await
-            .map_err(|err| internal_error(format_js_error("resolve callable response", err)))?;
-
-        let text = text_value.as_string().unwrap_or_default();
-        let (body, parse_error) = if text.trim().is_empty() {
-            (None, None)
-        } else {
-            match serde_json::from_str::<JsonValue>(&text) {
-                Ok(value) => (Some(value), None),
-                Err(err) => (None, Some(err)),
-            }
-        };
-
-        if let Some(error) = error_for_http_response(status, body.as_ref()) {
-            return Err(error);
-        }
-
-        if let Some(err) = parse_error {
-            return Err(internal_error(format!("Response is not valid JSON object: {err}")));
-        }
-
-        if status == 204 {
-            return Err(internal_error("Callable response is missing data payload (HTTP 204)"));
-        }
-
-        Ok(body.unwrap_or(JsonValue::Null))
-    }
-
-    fn is_abort_error(err: &JsValue) -> bool {
-        if let Some(dom_error) = err.dyn_ref::<DomException>() {
-            return dom_error.name() == "AbortError";
-        }
-        if let Some(string) = err.as_string() {
-            return string.contains("AbortError");
-        }
-        false
-    }
-
-    fn cancel_timeout(window: &web_sys::Window, guard: &mut Option<(i32, Closure<dyn FnMut()>)>) {
-        if let Some((handle, _)) = guard {
-            window.clear_timeout_with_handle(*handle);
-        }
-        guard.take();
-    }
-
-    fn format_js_error(context: &str, err: JsValue) -> String {
-        let description = if let Some(string) = err.as_string() {
-            string
-        } else if let Some(dom_error) = err.dyn_ref::<DomException>() {
-            format!("{}: {}", dom_error.name(), dom_error.message())
-        } else {
-            format!("{:?}", err)
-        };
-        format!("{context}: {description}")
     }
 }

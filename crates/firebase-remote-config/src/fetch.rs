@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 use crate::error::{internal_error, RemoteConfigResult};
@@ -15,12 +14,7 @@ use firebase_installations::InstallationsResult;
 use serde::Deserialize;
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
 
-#[cfg(not(target_arch = "wasm32"))]
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, IF_NONE_MATCH};
-#[cfg(not(target_arch = "wasm32"))]
-use reqwest::{Client, StatusCode};
-#[cfg(all(target_arch = "wasm32", feature = "wasm-web"))]
-use reqwest::{Client, StatusCode};
+use firebase_core::platform::http::{HttpClient, HttpRequest};
 
 /// Parameters describing a fetch attempt.
 #[derive(Clone, Debug, PartialEq)]
@@ -114,10 +108,14 @@ struct RestFetchResponse {
     template_version: Option<u64>,
 }
 
-/// Blocking HTTP implementation for the Remote Config REST API.
-#[cfg(not(target_arch = "wasm32"))]
-pub struct HttpRemoteConfigFetchClient {
-    client: Client,
+/// Fetches a Remote Config template over REST.
+///
+/// One client for both targets: the transport underneath is
+/// [`firebase_core::platform::http`], which speaks `fetch` in the browser and `reqwest` natively,
+/// and applies the caller's timeout on both. This crate used to carry a copy of this client per
+/// target, identical but for that timeout.
+pub struct RemoteConfigFetchHttpClient {
+    client: HttpClient,
     base_url: String,
     project_id: String,
     namespace: String,
@@ -128,162 +126,10 @@ pub struct HttpRemoteConfigFetchClient {
     installations: Arc<dyn InstallationsTokenProvider>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-impl HttpRemoteConfigFetchClient {
+impl RemoteConfigFetchHttpClient {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        client: Client,
-        base_url: impl Into<String>,
-        project_id: impl Into<String>,
-        namespace: impl Into<String>,
-        api_key: impl Into<String>,
-        app_id: impl Into<String>,
-        sdk_version: impl Into<String>,
-        language_code: impl Into<String>,
-        installations: Arc<dyn InstallationsTokenProvider>,
-    ) -> Self {
-        Self {
-            client,
-            base_url: base_url.into(),
-            project_id: project_id.into(),
-            namespace: namespace.into(),
-            api_key: api_key.into(),
-            app_id: app_id.into(),
-            sdk_version: sdk_version.into(),
-            language_code: language_code.into(),
-            installations,
-        }
-    }
-
-    fn build_headers(&self, e_tag: Option<&str>) -> RemoteConfigResult<HeaderMap> {
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            IF_NONE_MATCH,
-            HeaderValue::from_str(e_tag.unwrap_or("*"))
-                .map_err(|err| internal_error(format!("invalid ETag: {err}")))?,
-        );
-        Ok(headers)
-    }
-
-    fn request_body(
-        &self,
-        installation_id: String,
-        installation_token: String,
-        custom_signals: Option<HashMap<String, JsonValue>>,
-    ) -> JsonValue {
-        let mut payload = json!({
-            "sdk_version": self.sdk_version,
-            "app_instance_id": installation_id,
-            "app_instance_id_token": installation_token,
-            "app_id": self.app_id,
-            "language_code": self.language_code,
-        });
-
-        if let Some(signals) = custom_signals {
-            if let Some(obj) = payload.as_object_mut() {
-                let mut map = JsonMap::with_capacity(signals.len());
-                for (key, value) in signals {
-                    map.insert(key, value);
-                }
-                obj.insert("custom_signals".to_string(), JsonValue::Object(map));
-            }
-        }
-
-        payload
-    }
-
-    fn build_url(&self) -> String {
-        format!(
-            "{}/v1/projects/{}/namespaces/{}:fetch?key={}",
-            self.base_url, self.project_id, self.namespace, self.api_key
-        )
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[async_trait::async_trait]
-impl RemoteConfigFetchClient for HttpRemoteConfigFetchClient {
-    async fn fetch(&self, request: FetchRequest) -> RemoteConfigResult<FetchResponse> {
-        let installation_id = map_installations_error(self.installations.installation_id().await)?;
-        let installation_token = map_installations_error(self.installations.installation_token().await)?;
-        let url = self.build_url();
-
-        let headers = self.build_headers(request.e_tag.as_deref())?;
-        let body = self.request_body(installation_id, installation_token, request.custom_signals);
-
-        let mut builder = self.client.post(url).headers(headers).json(&body);
-
-        builder = builder.timeout(Duration::from_millis(request.timeout_millis));
-
-        let response = builder
-            .send()
-            .await
-            .map_err(|err| internal_error(format!("remote config fetch failed: {err}")))?;
-
-        let mut status = response.status();
-        let e_tag = response
-            .headers()
-            .get("ETag")
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.to_string());
-
-        let response_body = if status == StatusCode::OK {
-            Some(
-                response
-                    .json::<RestFetchResponse>()
-                    .await
-                    .map_err(|err| internal_error(format!("failed to parse Remote Config response: {err}")))?,
-            )
-        } else if status == StatusCode::NOT_MODIFIED {
-            None
-        } else {
-            return Err(internal_error(format!("fetch returned unexpected status {}", status.as_u16())));
-        };
-
-        let mut config = response_body.as_ref().and_then(|body| body.entries.clone());
-        let state = response_body.as_ref().and_then(|body| body.state.clone());
-        let template_version = response_body.as_ref().and_then(|body| body.template_version);
-
-        match state.as_deref() {
-            Some("INSTANCE_STATE_UNSPECIFIED") => status = StatusCode::INTERNAL_SERVER_ERROR,
-            Some("NO_CHANGE") => status = StatusCode::NOT_MODIFIED,
-            Some("NO_TEMPLATE") | Some("EMPTY_CONFIG") => {
-                config = Some(HashMap::new());
-            }
-            _ => {}
-        }
-
-        match status {
-            StatusCode::OK | StatusCode::NOT_MODIFIED => Ok(FetchResponse {
-                status: status.as_u16(),
-                etag: e_tag,
-                config,
-                template_version,
-            }),
-            other => Err(internal_error(format!("fetch returned unexpected status {}", other.as_u16()))),
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm-web"))]
-pub struct WasmRemoteConfigFetchClient {
-    client: Client,
-    base_url: String,
-    project_id: String,
-    namespace: String,
-    api_key: String,
-    app_id: String,
-    sdk_version: String,
-    language_code: String,
-    installations: Arc<dyn InstallationsTokenProvider>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm-web"))]
-impl WasmRemoteConfigFetchClient {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        client: Client,
+        client: HttpClient,
         base_url: impl Into<String>,
         project_id: impl Into<String>,
         namespace: impl Into<String>,
@@ -341,51 +187,55 @@ impl WasmRemoteConfigFetchClient {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm-web"))]
-#[async_trait::async_trait(?Send)]
-impl RemoteConfigFetchClient for WasmRemoteConfigFetchClient {
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl RemoteConfigFetchClient for RemoteConfigFetchHttpClient {
     async fn fetch(&self, request: FetchRequest) -> RemoteConfigResult<FetchResponse> {
+        const OK: u16 = 200;
+        const NOT_MODIFIED: u16 = 304;
+        const INTERNAL_SERVER_ERROR: u16 = 500;
+
         let installation_id = map_installations_error(self.installations.installation_id().await)?;
         let installation_token = map_installations_error(self.installations.installation_token().await)?;
-        let url = self.build_url();
-
         let body = self.request_body(installation_id, installation_token, request.custom_signals);
+
+        // `If-None-Match: *` is what the backend expects for a first fetch; a stored ETag turns
+        // the next one into a cheap "nothing changed".
+        let http_request = HttpRequest::post(self.build_url())
+            .header("If-None-Match", request.e_tag.as_deref().unwrap_or("*"))
+            .json(&body)
+            .map_err(|err| internal_error(format!("failed to encode Remote Config request: {err}")))?
+            .timeout(Duration::from_millis(request.timeout_millis));
 
         let response = self
             .client
-            .post(url)
-            .json(&body)
-            .send()
+            .send(http_request)
             .await
             .map_err(|err| internal_error(format!("remote config fetch failed: {err}")))?;
 
         let mut status = response.status();
-        let e_tag = response
-            .headers()
-            .get("ETag")
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.to_string());
+        let e_tag = response.header("etag").map(|value| value.to_string());
 
-        let response_body = if status == StatusCode::OK {
+        let response_body = if status == OK {
             Some(
                 response
                     .json::<RestFetchResponse>()
-                    .await
                     .map_err(|err| internal_error(format!("failed to parse Remote Config response: {err}")))?,
             )
-        } else if status == StatusCode::NOT_MODIFIED {
+        } else if status == NOT_MODIFIED {
             None
         } else {
-            return Err(internal_error(format!("fetch returned unexpected status {}", status.as_u16())));
+            return Err(internal_error(format!("fetch returned unexpected status {status}")));
         };
 
         let mut config = response_body.as_ref().and_then(|body| body.entries.clone());
         let state = response_body.as_ref().and_then(|body| body.state.clone());
         let template_version = response_body.as_ref().and_then(|body| body.template_version);
 
+        // The backend reports "nothing to send" in the body rather than in the status.
         match state.as_deref() {
-            Some("INSTANCE_STATE_UNSPECIFIED") => status = StatusCode::INTERNAL_SERVER_ERROR,
-            Some("NO_CHANGE") => status = StatusCode::NOT_MODIFIED,
+            Some("INSTANCE_STATE_UNSPECIFIED") => status = INTERNAL_SERVER_ERROR,
+            Some("NO_CHANGE") => status = NOT_MODIFIED,
             Some("NO_TEMPLATE") | Some("EMPTY_CONFIG") => {
                 config = Some(HashMap::new());
             }
@@ -393,13 +243,13 @@ impl RemoteConfigFetchClient for WasmRemoteConfigFetchClient {
         }
 
         match status {
-            StatusCode::OK | StatusCode::NOT_MODIFIED => Ok(FetchResponse {
-                status: status.as_u16(),
+            OK | NOT_MODIFIED => Ok(FetchResponse {
+                status,
                 etag: e_tag,
                 config,
                 template_version,
             }),
-            other => Err(internal_error(format!("fetch returned unexpected status {}", other.as_u16()))),
+            other => Err(internal_error(format!("fetch returned unexpected status {other}"))),
         }
     }
 }
@@ -495,8 +345,8 @@ mod tests {
             });
 
             let provider = Arc::new(TestInstallations::new("test-installation", "test-token"));
-            let client = HttpRemoteConfigFetchClient::new(
-                Client::builder().build().unwrap(),
+            let client = RemoteConfigFetchHttpClient::new(
+                HttpClient::new(),
                 server.base_url(),
                 "test-project",
                 "test-namespace",
@@ -530,8 +380,8 @@ mod tests {
             });
 
             let provider = Arc::new(TestInstallations::new("test-installation", "test-token"));
-            let client = HttpRemoteConfigFetchClient::new(
-                Client::builder().build().unwrap(),
+            let client = RemoteConfigFetchHttpClient::new(
+                HttpClient::new(),
                 server.base_url(),
                 "test-project",
                 "test-namespace",
@@ -563,8 +413,8 @@ mod tests {
             });
 
             let provider = Arc::new(TestInstallations::new("test-installation", "test-token"));
-            let client = HttpRemoteConfigFetchClient::new(
-                Client::builder().build().unwrap(),
+            let client = RemoteConfigFetchHttpClient::new(
+                HttpClient::new(),
                 server.base_url(),
                 "test-project",
                 "test-namespace",
@@ -594,8 +444,8 @@ mod tests {
         #[wasm_bindgen_test]
         fn request_body_includes_custom_signals() {
             let provider = Arc::new(TestInstallations::new("id", "token"));
-            let client = WasmRemoteConfigFetchClient::new(
-                Client::new(),
+            let client = RemoteConfigFetchHttpClient::new(
+                HttpClient::new(),
                 "https://example.com",
                 "test-project",
                 "test-namespace",

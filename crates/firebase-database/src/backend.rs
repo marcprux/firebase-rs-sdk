@@ -3,13 +3,11 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
 #[cfg(not(target_arch = "wasm32"))]
+use firebase_core::platform::http::{HttpClient, HttpMethod, HttpRequest, HttpResponse};
+#[cfg(not(target_arch = "wasm32"))]
 use futures::future::BoxFuture;
 #[cfg(not(target_arch = "wasm32"))]
 use futures::FutureExt;
-#[cfg(not(target_arch = "wasm32"))]
-use reqwest::{Client, Response};
-#[cfg(not(target_arch = "wasm32"))]
-use reqwest::{Method, StatusCode};
 #[cfg(not(target_arch = "wasm32"))]
 use serde_json::Map;
 use serde_json::Value;
@@ -20,13 +18,11 @@ use crate::error::DatabaseResult;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::error::{internal_error, invalid_argument, permission_denied, DatabaseError};
 use crate::server_value::{contains_server_value, extract_data_ref, resolve_server_values};
-#[cfg(not(target_arch = "wasm32"))]
-use firebase_app_check::{FirebaseAppCheckInternal, APP_CHECK_INTERNAL_COMPONENT_NAME};
-#[cfg(not(target_arch = "wasm32"))]
-use firebase_auth::Auth;
 use firebase_core::app::FirebaseApp;
 #[cfg(not(target_arch = "wasm32"))]
 use firebase_core::logger::Logger;
+#[cfg(not(target_arch = "wasm32"))]
+use firebase_core::platform::credentials::AppCredentials;
 #[cfg(not(target_arch = "wasm32"))]
 type TokenFetcher = Arc<dyn Fn() -> BoxFuture<'static, DatabaseResult<Option<String>>> + Send + Sync>;
 
@@ -104,60 +100,27 @@ pub(crate) fn database_url_for(app: &FirebaseApp) -> Option<String> {
 pub(crate) fn select_backend(app: &FirebaseApp) -> Arc<dyn DatabaseBackend> {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(url) = database_url_for(app) {
-        let app_for_auth = app.clone();
+        let credentials = AppCredentials::for_app(app);
+        let auth_credentials = credentials.clone();
         let auth_fetcher: TokenFetcher = Arc::new(move || {
-            let container = app_for_auth.container();
+            let credentials = auth_credentials.clone();
             async move {
-                let auth_or_none = container
-                    .get_provider("auth-internal")
-                    .get_immediate_with_options::<Auth>(None, true)
-                    .map_err(|err| internal_error(format!("failed to resolve auth provider: {err}")))?;
-                let auth = match auth_or_none {
-                    Some(auth) => Some(auth),
-                    None => container
-                        .get_provider("auth")
-                        .get_immediate_with_options::<Auth>(None, true)
-                        .map_err(|err| internal_error(format!("failed to resolve auth provider: {err}")))?,
-                };
-                let Some(auth) = auth else {
-                    return Ok(None);
-                };
-                match auth.get_token(false).await {
-                    Ok(Some(token)) if token.is_empty() => Ok(None),
-                    Ok(Some(token)) => Ok(Some(token)),
-                    Ok(None) => Ok(None),
-                    Err(err) => Err(internal_error(format!("failed to obtain auth token: {err}"))),
-                }
+                credentials
+                    .auth_token()
+                    .await
+                    .map_err(|err| internal_error(format!("failed to obtain auth token: {err}")))
             }
             .boxed()
         });
 
-        let app_for_app_check = app.clone();
+        let app_check_credentials = credentials;
         let app_check_fetcher: TokenFetcher = Arc::new(move || {
-            let container = app_for_app_check.container();
+            let credentials = app_check_credentials.clone();
             async move {
-                let app_check = container
-                    .get_provider(APP_CHECK_INTERNAL_COMPONENT_NAME)
-                    .get_immediate_with_options::<FirebaseAppCheckInternal>(None, true)
-                    .map_err(|err| internal_error(format!("failed to resolve app check provider: {err}")))?;
-                let Some(app_check) = app_check else {
-                    return Ok(None);
-                };
-                let token = match app_check.get_token(false).await {
-                    Ok(result) => result.token,
-                    Err(err) => {
-                        if let Some(cached) = err.cached_token() {
-                            cached.token.clone()
-                        } else {
-                            return Err(internal_error(format!("failed to obtain App Check token: {err}")));
-                        }
-                    }
-                };
-                if token.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(token))
-                }
+                credentials
+                    .app_check_token()
+                    .await
+                    .map_err(|err| internal_error(format!("failed to obtain App Check token: {err}")))
             }
             .boxed()
         });
@@ -283,7 +246,7 @@ fn version_tag(value: &Value) -> String {
 
 #[cfg(not(target_arch = "wasm32"))]
 struct RestBackend {
-    client: Client,
+    client: HttpClient,
     base_url: Url,
     base_query: Vec<(String, String)>,
     auth_token_fetcher: TokenFetcher,
@@ -313,9 +276,7 @@ impl RestBackend {
             .collect();
         url.set_query(None);
 
-        let client = Client::builder()
-            .build()
-            .map_err(|err| internal_error(format!("Failed to build HTTP client: {err}")))?;
+        let client = HttpClient::new();
 
         Ok(Self {
             client,
@@ -348,55 +309,51 @@ impl RestBackend {
         Ok(url)
     }
 
-    fn handle_reqwest_error(&self, err: reqwest::Error) -> DatabaseError {
-        if let Some(status) = err.status() {
-            return self.handle_http_error(status, None);
-        }
-        internal_error(format!("Database request failed: {err}"))
-    }
-
-    fn handle_http_error(&self, status: StatusCode, body: Option<String>) -> DatabaseError {
+    fn handle_http_error(&self, status: u16, body: Option<String>) -> DatabaseError {
         let message = body.as_deref().and_then(extract_error_message);
 
         match status {
-            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
-                invalid_argument(message.clone().unwrap_or_else(|| "Invalid data payload".to_string()))
-            }
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                permission_denied(message.clone().unwrap_or_else(|| "Permission denied".to_string()))
-            }
+            400 | 422 => invalid_argument(message.clone().unwrap_or_else(|| "Invalid data payload".to_string())),
+            401 | 403 => permission_denied(message.clone().unwrap_or_else(|| "Permission denied".to_string())),
             _ => internal_error(format!(
                 "Database request failed with status {}{}",
-                status.as_str(),
+                status,
                 message.map(|b| format!(": {b}")).unwrap_or_else(String::new)
             )),
         }
     }
 
+    async fn send(&self, request: HttpRequest) -> DatabaseResult<HttpResponse> {
+        self.client
+            .send(request)
+            .await
+            .map_err(|err| internal_error(format!("Database request failed: {err}")))
+    }
+
     async fn send_request(
         &self,
-        method: Method,
+        method: HttpMethod,
         path: &[String],
         query: &[(String, String)],
         body: Option<&Value>,
-    ) -> DatabaseResult<Response> {
+    ) -> DatabaseResult<HttpResponse> {
         let augmented_query = self.query_with_tokens(query).await?;
         let url = self.url_for_path(path, &augmented_query)?;
-        let mut request = self.client.request(method, url);
+        let mut request = HttpRequest::new(method, url);
         if let Some(payload) = body {
-            request = request.json(payload);
+            request = request
+                .json(payload)
+                .map_err(|err| internal_error(format!("Failed to encode database payload: {err}")))?;
         }
 
-        request.send().await.map_err(|err| self.handle_reqwest_error(err))
+        self.send(request).await
     }
 
-    async fn ensure_success(&self, response: Response) -> DatabaseResult<Response> {
-        if response.status().is_success() {
+    fn ensure_success(&self, response: HttpResponse) -> DatabaseResult<HttpResponse> {
+        if response.is_success() {
             Ok(response)
         } else {
-            let status = response.status();
-            let body = response.text().await.ok();
-            Err(self.handle_http_error(status, body))
+            Err(self.handle_http_error(response.status(), Some(response.text())))
         }
     }
 
@@ -439,14 +396,13 @@ impl DatabaseBackend for RestBackend {
         if !resolves_server_values {
             params.push(("print".to_string(), "silent".to_string()));
         }
-        let response = self.send_request(Method::PUT, path, &params, Some(&value)).await?;
-        let response = self.ensure_success(response).await?;
+        let response = self.send_request(HttpMethod::Put, path, &params, Some(&value)).await?;
+        let response = self.ensure_success(response)?;
         if !resolves_server_values {
             return Ok(value);
         }
         response
             .json()
-            .await
             .map_err(|err| internal_error(format!("Failed to decode database response: {err}")))
     }
 
@@ -484,12 +440,12 @@ impl DatabaseBackend for RestBackend {
             params.push(("print".to_string(), "silent".to_string()));
         }
         let response = self
-            .send_request(Method::PATCH, base_path, &params, Some(&body))
+            .send_request(HttpMethod::Patch, base_path, &params, Some(&body))
             .await?;
-        let response = self.ensure_success(response).await?;
+        let response = self.ensure_success(response)?;
 
         let stored: Option<Map<String, Value>> = if resolves_server_values {
-            response.json().await.ok()
+            response.json().ok()
         } else {
             None
         };
@@ -506,11 +462,11 @@ impl DatabaseBackend for RestBackend {
     async fn delete(&self, path: &[String]) -> DatabaseResult<()> {
         let mut params = Vec::with_capacity(1);
         params.push(("print".to_string(), "silent".to_string()));
-        let response = self.send_request(Method::DELETE, path, &params, None).await?;
-        if response.status() == StatusCode::NOT_FOUND {
+        let response = self.send_request(HttpMethod::Delete, path, &params, None).await?;
+        if response.status() == 404 {
             return Ok(());
         }
-        self.ensure_success(response).await.map(|_| ())
+        self.ensure_success(response).map(|_| ())
     }
 
     async fn get(&self, path: &[String], query: &[(String, String)]) -> DatabaseResult<Value> {
@@ -520,17 +476,16 @@ impl DatabaseBackend for RestBackend {
         }
         params.extend_from_slice(query);
 
-        let response = self.send_request(Method::GET, path, &params, None).await?;
+        let response = self.send_request(HttpMethod::Get, path, &params, None).await?;
 
-        if response.status() == StatusCode::NOT_FOUND {
+        if response.status() == 404 {
             return Ok(Value::Null);
         }
 
-        let response = self.ensure_success(response).await?;
+        let response = self.ensure_success(response)?;
 
         response
             .json()
-            .await
             .map_err(|err| internal_error(format!("Failed to decode database response: {err}")))
     }
 
@@ -539,14 +494,10 @@ impl DatabaseBackend for RestBackend {
         let augmented_query = self.query_with_tokens(&params).await?;
         let url = self.url_for_path(path, &augmented_query)?;
         let response = self
-            .client
-            .get(url)
-            .header(FIREBASE_ETAG_HEADER, "true")
-            .send()
-            .await
-            .map_err(|err| self.handle_reqwest_error(err))?;
+            .send(HttpRequest::get(url).header(FIREBASE_ETAG_HEADER, "true"))
+            .await?;
 
-        if response.status() == StatusCode::NOT_FOUND {
+        if response.status() == 404 {
             return Ok(VersionedValue {
                 value: Value::Null,
                 version: None,
@@ -554,10 +505,9 @@ impl DatabaseBackend for RestBackend {
         }
 
         let version = etag_of(&response);
-        let response = self.ensure_success(response).await?;
+        let response = self.ensure_success(response)?;
         let value = response
             .json()
-            .await
             .map_err(|err| internal_error(format!("Failed to decode database response: {err}")))?;
         Ok(VersionedValue { value, version })
     }
@@ -570,21 +520,23 @@ impl DatabaseBackend for RestBackend {
     ) -> DatabaseResult<CasOutcome> {
         let augmented_query = self.query_with_tokens(&[]).await?;
         let url = self.url_for_path(path, &augmented_query)?;
-        let mut request = self.client.put(url).json(&value);
+        let mut request = HttpRequest::put(url)
+            .json(&value)
+            .map_err(|err| internal_error(format!("Failed to encode database payload: {err}")))?;
         if let Some(version) = version.as_deref() {
             request = request.header(IF_MATCH_HEADER, version);
         }
-        let response = request.send().await.map_err(|err| self.handle_reqwest_error(err))?;
+        let response = self.send(request).await?;
 
-        if response.status() == StatusCode::PRECONDITION_FAILED {
+        if response.status() == 412 {
             // The body carries the data as it is now, so a retry needs no extra read.
             let version = etag_of(&response);
-            let value = response.json().await.unwrap_or(Value::Null);
+            let value = response.json().unwrap_or(Value::Null);
             return Ok(CasOutcome::Conflict(VersionedValue { value, version }));
         }
 
-        let response = self.ensure_success(response).await?;
-        let stored = response.json().await.unwrap_or(value);
+        let response = self.ensure_success(response)?;
+        let stored = response.json().unwrap_or(value);
         Ok(CasOutcome::Committed(stored))
     }
 }
@@ -596,12 +548,8 @@ const FIREBASE_ETAG_HEADER: &str = "X-Firebase-ETag";
 const IF_MATCH_HEADER: &str = "if-match";
 
 #[cfg(not(target_arch = "wasm32"))]
-fn etag_of(response: &Response) -> Option<String> {
-    response
-        .headers()
-        .get(reqwest::header::ETAG)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_string())
+fn etag_of(response: &HttpResponse) -> Option<String> {
+    response.header("etag").map(|value| value.to_string())
 }
 
 fn set_at_path(root: &mut Value, path: &[String], value: Value) {

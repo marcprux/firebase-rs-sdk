@@ -1,5 +1,6 @@
 use std::fmt::{Display, Formatter};
 
+use firebase_core::util::status::StatusCode;
 use serde_json::Value as JsonValue;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,6 +25,29 @@ pub enum FunctionsErrorCode {
 }
 
 impl FunctionsErrorCode {
+    /// The callable code for a canonical status.
+    pub fn from_status(status: StatusCode) -> Self {
+        match status {
+            StatusCode::Ok => FunctionsErrorCode::Ok,
+            StatusCode::Cancelled => FunctionsErrorCode::Cancelled,
+            StatusCode::Unknown => FunctionsErrorCode::Unknown,
+            StatusCode::InvalidArgument => FunctionsErrorCode::InvalidArgument,
+            StatusCode::DeadlineExceeded => FunctionsErrorCode::DeadlineExceeded,
+            StatusCode::NotFound => FunctionsErrorCode::NotFound,
+            StatusCode::AlreadyExists => FunctionsErrorCode::AlreadyExists,
+            StatusCode::PermissionDenied => FunctionsErrorCode::PermissionDenied,
+            StatusCode::ResourceExhausted => FunctionsErrorCode::ResourceExhausted,
+            StatusCode::FailedPrecondition => FunctionsErrorCode::FailedPrecondition,
+            StatusCode::Aborted => FunctionsErrorCode::Aborted,
+            StatusCode::OutOfRange => FunctionsErrorCode::OutOfRange,
+            StatusCode::Unimplemented => FunctionsErrorCode::Unimplemented,
+            StatusCode::Internal => FunctionsErrorCode::Internal,
+            StatusCode::Unavailable => FunctionsErrorCode::Unavailable,
+            StatusCode::DataLoss => FunctionsErrorCode::DataLoss,
+            StatusCode::Unauthenticated => FunctionsErrorCode::Unauthenticated,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             FunctionsErrorCode::Ok => "functions/ok",
@@ -193,6 +217,9 @@ fn code_message_default(code: FunctionsErrorCode) -> Option<String> {
     }
 }
 
+/// The callable protocol's own HTTP mapping, kept exactly as `codeForHTTPStatus` in the JS SDK:
+/// it is narrower than the Google API guidelines (a 408 is `unknown` here, not `deadline-exceeded`)
+/// and a callable client has to agree with its server about that.
 fn code_for_http_status(status: u16) -> FunctionsErrorCode {
     use FunctionsErrorCode as Code;
 
@@ -217,27 +244,8 @@ fn code_for_http_status(status: u16) -> FunctionsErrorCode {
     }
 }
 
+/// The `status` a callable backend puts in its error body is the canonical taxonomy, shared with
+/// every other product.
 fn code_for_backend_status(status: &str) -> Option<FunctionsErrorCode> {
-    use FunctionsErrorCode as Code;
-
-    match status {
-        "OK" => Some(Code::Ok),
-        "CANCELLED" => Some(Code::Cancelled),
-        "UNKNOWN" => Some(Code::Unknown),
-        "INVALID_ARGUMENT" => Some(Code::InvalidArgument),
-        "DEADLINE_EXCEEDED" => Some(Code::DeadlineExceeded),
-        "NOT_FOUND" => Some(Code::NotFound),
-        "ALREADY_EXISTS" => Some(Code::AlreadyExists),
-        "PERMISSION_DENIED" => Some(Code::PermissionDenied),
-        "UNAUTHENTICATED" => Some(Code::Unauthenticated),
-        "RESOURCE_EXHAUSTED" => Some(Code::ResourceExhausted),
-        "FAILED_PRECONDITION" => Some(Code::FailedPrecondition),
-        "ABORTED" => Some(Code::Aborted),
-        "OUT_OF_RANGE" => Some(Code::OutOfRange),
-        "UNIMPLEMENTED" => Some(Code::Unimplemented),
-        "INTERNAL" => Some(Code::Internal),
-        "UNAVAILABLE" => Some(Code::Unavailable),
-        "DATA_LOSS" => Some(Code::DataLoss),
-        _ => None,
-    }
+    StatusCode::from_wire_name(status).map(FunctionsErrorCode::from_status)
 }

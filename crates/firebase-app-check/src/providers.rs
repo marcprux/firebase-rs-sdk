@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use firebase_core::app::{get_provider, FirebaseApp, HeartbeatService, HeartbeatServiceImpl};
+use firebase_core::app::{FirebaseApp, HeartbeatService, HeartbeatServiceImpl};
 use firebase_core::util::calculate_backoff_millis;
 
 use super::errors::{AppCheckError, AppCheckResult};
@@ -112,8 +112,7 @@ impl RecaptchaProviderCore {
     }
 
     fn initialize(&self, app: &FirebaseApp) {
-        let heartbeat = get_provider(app, "heartbeat")
-            .get_immediate::<HeartbeatServiceImpl>()
+        let heartbeat = firebase_core::app::service::<HeartbeatServiceImpl>(app)
             .map(|service| -> Arc<dyn HeartbeatService> { service });
 
         {
@@ -234,8 +233,7 @@ impl DebugTokenProvider {
 
 impl AppCheckProvider for DebugTokenProvider {
     fn initialize(&self, app: &FirebaseApp) {
-        let heartbeat = get_provider(app, "heartbeat")
-            .get_immediate::<HeartbeatServiceImpl>()
+        let heartbeat = firebase_core::app::service::<HeartbeatServiceImpl>(app)
             .map(|service| -> Arc<dyn HeartbeatService> { service });
 
         let mut guard = self.state.lock().unwrap();

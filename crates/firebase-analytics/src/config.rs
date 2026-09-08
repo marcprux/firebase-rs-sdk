@@ -1,10 +1,9 @@
-#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
-use reqwest::Client;
+use firebase_core::platform::http::{HttpClient, HttpRequest};
 use serde::Deserialize;
 
-use crate::error::{config_fetch_failed, internal_error, missing_measurement_id, AnalyticsResult};
+use crate::error::{config_fetch_failed, missing_measurement_id, AnalyticsResult};
 use firebase_core::app::FirebaseApp;
 
 /// Minimal dynamic configuration returned by the Firebase Analytics config endpoint.
@@ -54,39 +53,26 @@ pub(crate) async fn fetch_dynamic_config(app: &FirebaseApp) -> AnalyticsResult<D
 
     let url = dynamic_config_url(&app_id);
 
-    #[cfg(not(target_arch = "wasm32"))]
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|err| internal_error(format!("failed to build HTTP client: {err}")))?;
-
-    #[cfg(target_arch = "wasm32")]
-    let client = Client::builder()
-        .build()
-        .map_err(|err| internal_error(format!("failed to build HTTP client: {err}")))?;
-
-    let response = client
-        .get(url)
+    let request = HttpRequest::get(url)
         .header("x-goog-api-key", api_key)
         .header("Accept", "application/json")
-        .send()
+        .timeout(Duration::from_secs(10));
+
+    let response = HttpClient::new()
+        .send(request)
         .await
         .map_err(|err| config_fetch_failed(format!("failed to fetch analytics config: {err}")))?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unavailable response body>".to_string());
+    if !response.is_success() {
         return Err(config_fetch_failed(format!(
-            "analytics config request failed with status {status}: {body}"
+            "analytics config request failed with status {}: {}",
+            response.status(),
+            response.text()
         )));
     }
 
     let parsed: RemoteConfigResponse = response
         .json()
-        .await
         .map_err(|err| config_fetch_failed(format!("invalid analytics config response: {err}")))?;
 
     let measurement_id = match parsed.measurement_id {

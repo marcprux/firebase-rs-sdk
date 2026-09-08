@@ -77,6 +77,14 @@ impl ComponentContainer {
         *self.inner.root_service.lock().unwrap() = Some(service);
     }
 
+    /// The app this container belongs to.
+    ///
+    /// Every service factory needs it, and it is attached to the container before any component
+    /// is, so this is infallible in practice — the `Option` is for containers built by hand.
+    pub fn app(&self) -> Option<Arc<crate::app::FirebaseApp>> {
+        self.root_service::<crate::app::FirebaseApp>()
+    }
+
     pub fn root_service<T: 'static + Send + Sync>(&self) -> Option<Arc<T>> {
         self.inner
             .root_service

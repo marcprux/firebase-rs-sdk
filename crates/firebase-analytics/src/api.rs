@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
@@ -12,8 +12,8 @@ use crate::gtag::{GlobalGtagRegistry, GtagState};
 use crate::transport::{MeasurementProtocolConfig, MeasurementProtocolDispatcher, MeasurementProtocolEndpoint};
 use firebase_core::app;
 use firebase_core::app::FirebaseApp;
-use firebase_core::component::types::{ComponentError, DynService, InstanceFactoryOptions, InstantiationMode};
-use firebase_core::component::{Component, ComponentType};
+use firebase_core::component::types::{ComponentError, InstanceFactoryOptions};
+use firebase_core::component::{ComponentContainer, Service};
 
 #[derive(Clone)]
 pub struct Analytics {
@@ -296,28 +296,23 @@ fn validate_event_name(name: &str) -> AnalyticsResult<()> {
     Ok(())
 }
 
-static ANALYTICS_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
-    Component::new(ANALYTICS_COMPONENT_NAME, Arc::new(analytics_factory), ComponentType::Public)
-        .with_instantiation_mode(InstantiationMode::Lazy)
-});
+impl Service for Analytics {
+    const NAME: &'static str = ANALYTICS_COMPONENT_NAME;
+}
 
 fn analytics_factory(
-    container: &firebase_core::component::ComponentContainer,
+    container: &ComponentContainer,
     _options: InstanceFactoryOptions,
-) -> Result<DynService, ComponentError> {
-    let app = container
-        .root_service::<FirebaseApp>()
-        .ok_or_else(|| ComponentError::InitializationFailed {
-            name: ANALYTICS_COMPONENT_NAME.to_string(),
-            reason: "Firebase app not attached to component container".to_string(),
-        })?;
-    let analytics = Analytics::new((*app).clone());
-    Ok(Arc::new(analytics) as DynService)
+) -> Result<Arc<Analytics>, ComponentError> {
+    let app = container.app().ok_or_else(|| ComponentError::InitializationFailed {
+        name: ANALYTICS_COMPONENT_NAME.to_string(),
+        reason: "Firebase app not attached to component container".to_string(),
+    })?;
+    Ok(Arc::new(Analytics::new((*app).clone())))
 }
 
 fn ensure_registered() {
-    let component = LazyLock::force(&ANALYTICS_COMPONENT).clone();
-    let _ = app::register_component(component);
+    app::register_service::<Analytics, _>(analytics_factory);
 }
 
 fn generate_client_id() -> String {
@@ -344,17 +339,15 @@ pub async fn get_analytics(app: Option<FirebaseApp>) -> AnalyticsResult<Arc<Anal
             .map_err(|err| internal_error(err.to_string()))?,
     };
 
-    let provider = app::get_provider(&app, ANALYTICS_COMPONENT_NAME);
+    let provider = app::service_provider::<Analytics>(&app);
     // Tests in other modules reset the global app/component registry; when that happens, an
     // existing app instance may lose the analytics component attachment even though we still
     // hold the app handle. Re-attach the component locally if needed to avoid races.
-    if !provider.is_component_set() {
-        provider
-            .set_component(LazyLock::force(&ANALYTICS_COMPONENT).clone())
-            .map_err(|err| internal_error(err.to_string()))?;
+    if !provider.is_registered() {
+        app::attach_service::<Analytics>(&app);
     }
     provider
-        .get_immediate::<Analytics>()
+        .get()
         .ok_or_else(|| internal_error("Analytics component not available"))
 }
 

@@ -1,9 +1,9 @@
+use std::sync::Arc;
 #[cfg(all(feature = "wasm-web", target_arch = "wasm32"))]
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Mutex,
 };
-use std::sync::{Arc, LazyLock};
 
 #[cfg(not(all(feature = "wasm-web", target_arch = "wasm32")))]
 use rand::distributions::Alphanumeric;
@@ -27,8 +27,8 @@ use crate::types::MessagePayload;
 use crate::types::{MessageHandler, Unsubscribe};
 use firebase_core::app;
 use firebase_core::app::FirebaseApp;
-use firebase_core::component::types::{ComponentError, DynService, InstanceFactoryOptions, InstantiationMode};
-use firebase_core::component::{Component, ComponentType};
+use firebase_core::component::types::{ComponentError, InstanceFactoryOptions};
+use firebase_core::component::{ComponentContainer, Service};
 #[cfg(all(feature = "wasm-web", target_arch = "wasm32", feature = "experimental-indexed-db"))]
 use firebase_installations::extract_app_config;
 #[cfg(all(feature = "wasm-web", target_arch = "wasm32", feature = "experimental-indexed-db"))]
@@ -255,27 +255,24 @@ async fn request_permission_impl() -> MessagingResult<PermissionState> {
     Ok(PermissionState::Granted)
 }
 
-static MESSAGING_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
-    Component::new(MESSAGING_COMPONENT_NAME, Arc::new(messaging_factory), ComponentType::Public)
-        .with_instantiation_mode(InstantiationMode::Lazy)
-});
+impl Service for Messaging {
+    const NAME: &'static str = MESSAGING_COMPONENT_NAME;
+}
 
 fn messaging_factory(
-    container: &firebase_core::component::ComponentContainer,
+    container: &ComponentContainer,
     _options: InstanceFactoryOptions,
-) -> Result<DynService, ComponentError> {
-    let app = container
-        .root_service::<FirebaseApp>()
-        .ok_or_else(|| ComponentError::InitializationFailed {
-            name: MESSAGING_COMPONENT_NAME.to_string(),
-            reason: "Firebase app not attached to component container".to_string(),
-        })?;
+) -> Result<Arc<Messaging>, ComponentError> {
+    let app = container.app().ok_or_else(|| ComponentError::InitializationFailed {
+        name: MESSAGING_COMPONENT_NAME.to_string(),
+        reason: "Firebase app not attached to component container".to_string(),
+    })?;
     let messaging = Messaging::new((*app).clone());
-    Ok(Arc::new(messaging) as DynService)
+    Ok(Arc::new(messaging))
 }
 
 fn ensure_registered() {
-    let _ = app::register_component(MESSAGING_COMPONENT.clone());
+    app::register_service::<Messaging, _>(messaging_factory);
 }
 
 pub fn register_messaging_component() {
@@ -291,12 +288,12 @@ pub async fn get_messaging(app: Option<FirebaseApp>) -> MessagingResult<Arc<Mess
             .map_err(|err| internal_error(err.to_string()))?,
     };
 
-    let provider = app::get_provider(&app, MESSAGING_COMPONENT_NAME);
-    if let Some(messaging) = provider.get_immediate::<Messaging>() {
+    let provider = app::service_provider::<Messaging>(&app);
+    if let Some(messaging) = provider.get() {
         Ok(messaging)
     } else {
         provider
-            .initialize::<Messaging>(serde_json::Value::Null, None)
+            .initialize(serde_json::Value::Null, None)
             .map_err(|err| internal_error(err.to_string()))
     }
 }

@@ -6,6 +6,8 @@ use crate::app::heartbeat::HeartbeatServiceImpl;
 use crate::app::logger::LOGGER;
 use crate::app::types::{FirebaseApp, FirebaseServerApp, HeartbeatService};
 use crate::component::constants::DEFAULT_ENTRY_NAME;
+use crate::component::types::{ComponentError, InstanceFactoryOptions};
+use crate::component::{ComponentContainer, Service, ServiceProvider};
 use crate::platform::runtime;
 
 pub static APPS: LazyLock<Mutex<HashMap<String, FirebaseApp>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -94,6 +96,46 @@ pub fn register_component(component: Component) -> bool {
     newly_registered
 }
 
+/// Registers a product's service, so every app — existing and future — can resolve it.
+///
+/// The name, instantiation mode and multiplicity come from the [`Service`] impl, and the factory
+/// returns the service's own type, so a registration cannot disagree with the lookups.
+pub fn register_service<S, F>(factory: F) -> bool
+where
+    S: Service,
+    F: Fn(&ComponentContainer, InstanceFactoryOptions) -> Result<Arc<S>, ComponentError> + Send + Sync + 'static,
+{
+    register_component(Component::for_service::<S, _>(factory))
+}
+
+/// Attaches the registered component for `S` to one app.
+///
+/// Global registration reaches every app the registry knows about, but an app built directly (as
+/// tests do) or created before the product was first used has to be given the component; every
+/// product's accessor does this before resolving. Returns false when nothing is registered for
+/// `S` yet.
+pub fn attach_service<S: Service>(app: &FirebaseApp) -> bool {
+    let component = registered_components_guard().get(S::NAME).cloned();
+    match component {
+        Some(component) => {
+            add_component(app, &component);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The app's handle on a service, triggering the heartbeat the way `_getProvider` does in the JS
+/// SDK.
+pub fn service_provider<S: Service>(app: &FirebaseApp) -> ServiceProvider<S> {
+    ServiceProvider::new(get_provider(app, S::NAME))
+}
+
+/// The service itself, when this app has it.
+pub fn service<S: Service>(app: &FirebaseApp) -> Option<Arc<S>> {
+    service_provider::<S>(app).get()
+}
+
 /// Fetches the provider for the named component, triggering heartbeat side-effects.
 /// Mirrors the JS `_getProvider` helper.
 pub fn get_provider(app: &FirebaseApp, name: &str) -> Provider {
@@ -133,7 +175,7 @@ mod tests {
     use crate::app::api;
     use crate::app::heartbeat::clear_heartbeat_store_for_tests;
     use crate::app::types::{FirebaseAppSettings, FirebaseOptions, FirebaseServerAppSettings};
-    use crate::component::types::{ComponentType, DynService, InstanceFactory, InstantiationMode};
+    use crate::component::types::{ComponentType, InstantiationMode};
     use crate::component::Component;
     use crate::platform::runtime;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -176,8 +218,18 @@ mod tests {
         }
     }
 
-    fn make_component(name: &str, factory: InstanceFactory) -> Component {
-        Component::new(name.to_string(), factory, ComponentType::Public)
+    fn make_component<S, F>(name: &str, factory: F) -> Component
+    where
+        S: std::any::Any + Send + Sync + 'static,
+        F: Fn(
+                &crate::component::ComponentContainer,
+                crate::component::InstanceFactoryOptions,
+            ) -> Result<Arc<S>, crate::component::ComponentError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Component::typed::<S, _>(name.to_string(), factory, ComponentType::Public)
             .with_instantiation_mode(InstantiationMode::Lazy)
     }
 
@@ -185,8 +237,7 @@ mod tests {
     async fn add_component_attaches_to_app() {
         with_serialized_test(|| async {
             let app = api::initialize_app(test_options(), None).await.expect("app init");
-            let factory: InstanceFactory = Arc::new(|_, _| Ok(Arc::new(()) as DynService));
-            let c = make_component("internal-comp", factory);
+            let c = make_component("internal-comp", |_, _| Ok(Arc::new(())));
             add_component(&app, &c);
 
             assert!(app.container().get_provider("internal-comp").is_component_set());
@@ -201,11 +252,12 @@ mod tests {
 
             let counter = Arc::new(AtomicUsize::new(0));
             let base_counter = counter.clone();
-            let base_factory: InstanceFactory = Arc::new(move |_, _| {
-                let value = base_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                Ok(Arc::new(value) as DynService)
-            });
-            add_component(&app, &make_component("overwrite", base_factory));
+            add_component(
+                &app,
+                &make_component("overwrite", move |_, _| {
+                    Ok(Arc::new(base_counter.fetch_add(1, Ordering::SeqCst) + 1))
+                }),
+            );
 
             let first_provider = app.container().get_provider("overwrite");
             let first = first_provider
@@ -217,11 +269,12 @@ mod tests {
 
             let counter_two = counter.clone();
             counter_two.store(40, Ordering::SeqCst);
-            let replacement_factory: InstanceFactory = Arc::new(move |_, _| {
-                let value = counter_two.fetch_add(1, Ordering::SeqCst) + 1;
-                Ok(Arc::new(value) as DynService)
-            });
-            add_or_overwrite_component(&app, make_component("overwrite", replacement_factory));
+            add_or_overwrite_component(
+                &app,
+                make_component("overwrite", move |_, _| {
+                    Ok(Arc::new(counter_two.fetch_add(1, Ordering::SeqCst) + 1))
+                }),
+            );
 
             remove_service_instance(&app, "overwrite", None);
             let provider_after = app.container().get_provider("overwrite");
@@ -239,8 +292,7 @@ mod tests {
     async fn clear_components_drops_registry_entries() {
         with_serialized_test(|| async {
             let app = api::initialize_app(test_options(), None).await.expect("app init");
-            let factory: InstanceFactory = Arc::new(|_, _| Ok(Arc::new(()) as DynService));
-            register_component(make_component("clearable", factory));
+            register_component(make_component("clearable", |_, _| Ok(Arc::new(()))));
 
             // The registry is global: clearing it and putting it back happens under one guard so
             // no other test can observe the gap. Holding the lock means calling `clear_components`
@@ -270,9 +322,7 @@ mod tests {
     async fn register_component_propagates_to_existing_apps() {
         with_serialized_test(|| async {
             let app = api::initialize_app(test_options(), None).await.expect("app init");
-            let factory: InstanceFactory = Arc::new(|_, _| Ok(Arc::new("shared") as DynService));
-
-            register_component(make_component("late", factory));
+            register_component(make_component("late", |_, _| Ok(Arc::new("shared"))));
 
             let provider = app.container().get_provider("late");
             assert!(provider.is_component_set());
@@ -284,8 +334,7 @@ mod tests {
     async fn register_component_attaches_when_already_registered() {
         with_serialized_test(|| async {
             let app = api::initialize_app(test_options(), None).await.expect("app init");
-            let factory: InstanceFactory = Arc::new(|_, _| Ok(Arc::new("shared") as DynService));
-            let component = make_component("late", factory);
+            let component = make_component("late", |_, _| Ok(Arc::new("shared")));
 
             // Simulate a pre-registered component that was not propagated to this app yet.
             assert!(component::register_component(component.clone()));
@@ -306,11 +355,12 @@ mod tests {
             let app = api::initialize_app(test_options(), None).await.expect("app init");
             let counter = Arc::new(AtomicUsize::new(0));
             let counter_clone = counter.clone();
-            let factory: InstanceFactory = Arc::new(move |_, _| {
-                let value = counter_clone.fetch_add(1, Ordering::SeqCst) + 1;
-                Ok(Arc::new(value) as DynService)
-            });
-            add_component(&app, &make_component("provider", factory));
+            add_component(
+                &app,
+                &make_component("provider", move |_, _| {
+                    Ok(Arc::new(counter_clone.fetch_add(1, Ordering::SeqCst) + 1))
+                }),
+            );
 
             let provider = get_provider(&app, "provider");
             let first = provider.get_immediate::<usize>().expect("first").as_ref().clone();

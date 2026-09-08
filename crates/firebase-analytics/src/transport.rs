@@ -1,13 +1,9 @@
 use std::collections::BTreeMap;
-#[cfg(target_arch = "wasm32")]
-#[allow(unused_imports)]
-use std::time::Duration;
-#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
-use reqwest::Client;
-use reqwest::StatusCode;
+use firebase_core::platform::http::{HttpClient, HttpRequest};
 use serde::Serialize;
+use url::Url;
 
 use crate::error::{internal_error, invalid_argument, network_error, AnalyticsResult};
 
@@ -40,7 +36,8 @@ impl MeasurementProtocolConfig {
         self
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    /// The per-request timeout. It applies in the browser too: the shared HTTP client times a
+    /// request out itself rather than relying on the transport underneath.
     pub(crate) fn timeout(&self) -> Duration {
         self.timeout
     }
@@ -77,7 +74,7 @@ impl MeasurementProtocolEndpoint {
 
 #[derive(Clone, Debug)]
 pub struct MeasurementProtocolDispatcher {
-    client: Client,
+    client: HttpClient,
     config: MeasurementProtocolConfig,
 }
 
@@ -90,18 +87,10 @@ impl MeasurementProtocolDispatcher {
         if config.api_secret().trim().is_empty() {
             return Err(invalid_argument("measurement protocol api_secret must not be empty"));
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        let client = Client::builder()
-            .timeout(config.timeout())
-            .build()
-            .map_err(|err| internal_error(format!("failed to build HTTP client: {err}")))?;
-
-        #[cfg(target_arch = "wasm32")]
-        let client = Client::builder()
-            .build()
-            .map_err(|err| internal_error(format!("failed to build HTTP client: {err}")))?;
-
-        Ok(Self { client, config })
+        Ok(Self {
+            client: HttpClient::new(),
+            config,
+        })
     }
 
     /// Sends a single analytics event via the measurement protocol.
@@ -122,41 +111,34 @@ impl MeasurementProtocolDispatcher {
             }],
         };
 
-        let body = serde_json::to_vec(&payload)
-            .map_err(|err| internal_error(format!("failed to serialise analytics payload: {err}")))?;
+        let mut endpoint = Url::parse(self.config.endpoint.as_str())
+            .map_err(|err| internal_error(format!("invalid measurement protocol endpoint: {err}")))?;
+        endpoint
+            .query_pairs_mut()
+            .append_pair("measurement_id", self.config.measurement_id())
+            .append_pair("api_secret", self.config.api_secret());
 
-        let endpoint = self.config.endpoint.as_str().to_owned();
-        let measurement_id = self.config.measurement_id().to_owned();
-        let api_secret = self.config.api_secret().to_owned();
-        let client = self.client.clone();
+        let request = HttpRequest::post(endpoint)
+            .json(&payload)
+            .map_err(|err| internal_error(format!("failed to serialise analytics payload: {err}")))?
+            .timeout(self.config.timeout());
 
-        let response = client
-            .post(&endpoint)
-            .query(&[
-                ("measurement_id", measurement_id.as_str()),
-                ("api_secret", api_secret.as_str()),
-            ])
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
+        let response = self
+            .client
+            .send(request)
             .await
             .map_err(|err| network_error(format!("failed to send analytics event: {err}")))?;
 
-        if response.status().is_success() {
+        if response.is_success() {
             return Ok(());
         }
 
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unavailable response body>".to_string());
-
-        let message = match status {
-            StatusCode::BAD_REQUEST => {
-                format!("measurement protocol rejected the event (400). Response: {body}")
-            }
-            _ => format!("measurement protocol request failed with status {status}. Response: {body}"),
+        let body = response.text();
+        let message = if status == 400 {
+            format!("measurement protocol rejected the event (400). Response: {body}")
+        } else {
+            format!("measurement protocol request failed with status {status}. Response: {body}")
         };
 
         Err(network_error(message))

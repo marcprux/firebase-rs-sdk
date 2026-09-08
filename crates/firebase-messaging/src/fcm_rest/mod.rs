@@ -1,18 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::constants::FCM_RETRY_BASE_DELAY_MS;
 use crate::error::{
     token_subscribe_failed, token_subscribe_no_token, token_update_failed, token_update_no_token, MessagingResult,
 };
-use rand::{thread_rng, Rng};
-
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::Duration;
-
-#[cfg(any(
-    not(all(target_arch = "wasm32", feature = "wasm-web")),
-    all(target_arch = "wasm32", feature = "wasm-web", feature = "experimental-indexed-db")
-))]
 pub const FCM_API_URL: &str = "https://fcmregistrations.googleapis.com/v1";
 
 #[allow(dead_code)]
@@ -61,20 +51,18 @@ pub struct FcmUpdateRequest<'a> {
     pub registration: FcmRegistrationRequest<'a>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-mod native;
-#[cfg(not(target_arch = "wasm32"))]
-pub use native::FcmClient;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm-web", feature = "experimental-indexed-db"))]
-mod wasm;
-#[cfg(all(target_arch = "wasm32", feature = "wasm-web", feature = "experimental-indexed-db"))]
-pub use wasm::FcmClient;
-
-#[cfg(all(target_arch = "wasm32", not(feature = "wasm-web")))]
-compile_error!(
-    "Building firebase-rs-sdk for wasm32 requires enabling the `wasm-web` feature for the messaging module."
-);
+// The browser build only registers tokens when IndexedDB is on, so the client goes unused there.
+#[cfg_attr(
+    all(
+        target_arch = "wasm32",
+        feature = "wasm-web",
+        not(feature = "experimental-indexed-db")
+    ),
+    allow(dead_code)
+)]
+mod client;
+#[allow(unused_imports)]
+pub use client::FcmClient;
 
 #[allow(dead_code)]
 #[cfg_attr(
@@ -219,46 +207,4 @@ mod tests;
 )]
 fn is_retriable_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 503 | 504)
-}
-
-#[cfg_attr(
-    all(
-        target_arch = "wasm32",
-        feature = "wasm-web",
-        not(feature = "experimental-indexed-db")
-    ),
-    allow(dead_code)
-)]
-fn backoff_delay_ms(attempt: u32) -> u64 {
-    let base = FCM_RETRY_BASE_DELAY_MS;
-    let capped = attempt.min(5);
-    let multiplier = 1u64 << capped;
-    let jitter: u64 = thread_rng().gen_range(0..=base);
-    base.saturating_mul(multiplier).saturating_add(jitter)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-async fn sleep_ms(ms: u64) {
-    tokio::time::sleep(Duration::from_millis(ms)).await;
-}
-
-#[cfg(all(feature = "wasm-web", target_arch = "wasm32", feature = "experimental-indexed-db"))]
-async fn sleep_ms(ms: u64) {
-    use wasm_bindgen::closure::Closure;
-    use wasm_bindgen::JsCast;
-    use wasm_bindgen::JsValue;
-    use wasm_bindgen_futures::JsFuture;
-
-    let promise = js_sys::Promise::new(&mut move |resolve, _reject| {
-        let window = web_sys::window().expect("window");
-        let closure = Closure::once(move || {
-            let _ = resolve.call0(&JsValue::UNDEFINED);
-        });
-        window
-            .set_timeout_with_callback_and_timeout_and_arguments_0(closure.as_ref().unchecked_ref(), ms as i32)
-            .expect("setTimeout");
-        closure.forget();
-    });
-
-    let _ = JsFuture::from(promise).await;
 }

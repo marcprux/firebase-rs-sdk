@@ -1,11 +1,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
-use reqwest::Url;
+use firebase_core::platform::http::{HttpClient, HttpRequest};
 use serde::Deserialize;
 use serde_json::Value;
+use url::Url;
+
+use firebase_core::platform::credentials::AppCredentials;
 
 use crate::config::{DataConnectOptions, TransportOptions};
 use crate::error::{
@@ -31,19 +33,6 @@ impl Default for CallerSdkType {
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait RequestTokenProvider: Send + Sync {
-    async fn auth_token(&self) -> DataConnectResult<Option<String>>;
-    async fn app_check_headers(&self) -> DataConnectResult<Option<AppCheckHeaders>>;
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct AppCheckHeaders {
-    pub token: String,
-    pub heartbeat: Option<String>,
-}
-
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait DataConnectTransport: Send + Sync {
     async fn invoke_query(&self, operation: &str, variables: &Value) -> DataConnectResult<Value>;
     async fn invoke_mutation(&self, operation: &str, variables: &Value) -> DataConnectResult<Value>;
@@ -53,11 +42,11 @@ pub trait DataConnectTransport: Send + Sync {
 }
 
 pub struct RestTransport {
-    client: reqwest::Client,
+    client: HttpClient,
     options: DataConnectOptions,
     api_key: Option<String>,
     app_id: Option<String>,
-    token_provider: Arc<dyn RequestTokenProvider>,
+    credentials: AppCredentials,
     state: Mutex<TransportState>,
     generated_sdk: AtomicBool,
     caller_sdk_type: Mutex<CallerSdkType>,
@@ -73,14 +62,14 @@ impl RestTransport {
         options: DataConnectOptions,
         api_key: Option<String>,
         app_id: Option<String>,
-        token_provider: Arc<dyn RequestTokenProvider>,
+        credentials: AppCredentials,
     ) -> DataConnectResult<Self> {
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: HttpClient::new(),
             options,
             api_key,
             app_id,
-            token_provider,
+            credentials,
             state: Mutex::new(TransportState {
                 transport: TransportOptions::default(),
                 is_emulator: false,
@@ -133,69 +122,52 @@ impl RestTransport {
         body.insert("operationName".to_string(), Value::String(operation.to_string()));
         body.insert("variables".to_string(), variables.clone());
 
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            "X-Goog-Api-Client",
-            HeaderValue::from_str(&self.goog_api_client_header()).map_err(|err| internal_error(err.to_string()))?,
-        );
+        let mut request = HttpRequest::post(self.endpoint_url(action)?)
+            .header("X-Goog-Api-Client", self.goog_api_client_header())
+            .json(&body)
+            .map_err(|err| internal_error(err.to_string()))?;
 
         if let Some(app_id) = &self.app_id {
             if !app_id.is_empty() {
-                headers.insert(
-                    "X-Firebase-GMPID",
-                    HeaderValue::from_str(app_id).map_err(|err| internal_error(err.to_string()))?,
-                );
+                request = request.header("X-Firebase-GMPID", app_id);
             }
         }
 
-        if let Some(token) = self.token_provider.auth_token().await? {
-            if !token.is_empty() {
-                headers.insert(
-                    "X-Firebase-Auth-Token",
-                    HeaderValue::from_str(&token).map_err(|err| internal_error(err.to_string()))?,
-                );
-            }
+        // Data Connect spells the user's token in its own header rather than in `Authorization`,
+        // so the resolved credentials are attached by hand instead of through
+        // `CredentialHeaders::apply`.
+        let credentials = self
+            .credentials
+            .headers()
+            .await
+            .map_err(|err| internal_error(format!("failed to obtain credentials: {err}")))?;
+        if let Some(token) = credentials.auth_token {
+            request = request.header("X-Firebase-Auth-Token", token);
+        }
+        if let Some(token) = credentials.app_check_token {
+            request = request.header("X-Firebase-AppCheck", token);
+        }
+        if let Some(heartbeat) = credentials.heartbeat {
+            request = request.header("X-Firebase-Client", heartbeat);
         }
 
-        if let Some(app_check) = self.token_provider.app_check_headers().await? {
-            if !app_check.token.is_empty() {
-                headers.insert(
-                    "X-Firebase-AppCheck",
-                    HeaderValue::from_str(&app_check.token).map_err(|err| internal_error(err.to_string()))?,
-                );
-            }
-            if let Some(heartbeat) = &app_check.heartbeat {
-                if !heartbeat.is_empty() {
-                    headers.insert(
-                        "X-Firebase-Client",
-                        HeaderValue::from_str(heartbeat).map_err(|err| internal_error(err.to_string()))?,
-                    );
-                }
-            }
-        }
-
-        let url = self.endpoint_url(action)?;
         let response = self
             .client
-            .post(url)
-            .headers(headers)
-            .json(&body)
-            .send()
+            .send(request)
             .await
             .map_err(|err| internal_error(err.to_string()))?;
 
-        if response.status().as_u16() == 401 {
+        if response.status() == 401 {
             return Err(unauthorized("Request unauthorized"));
         }
-        if !response.status().is_success() {
+        if !response.is_success() {
             return Err(internal_error(format!(
                 "Data Connect request failed with status {}",
                 response.status()
             )));
         }
 
-        let graph_response: GraphQlResponse = response.json().await.map_err(|err| internal_error(err.to_string()))?;
+        let graph_response: GraphQlResponse = response.json().map_err(|err| internal_error(err.to_string()))?;
         if !graph_response.errors.is_empty() {
             let response = DataConnectOperationFailureResponse {
                 data: graph_response.data,

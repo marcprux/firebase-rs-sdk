@@ -12,13 +12,11 @@ categories = ["api-bindings", "web-programming"]
 
 [features]
 default = []
-wasm-web = ["firebase-core/wasm-web", "firebase-auth/wasm-web", "firebase-app-check/wasm-web"]
-experimental-indexed-db = ["firebase-core/experimental-indexed-db", "firebase-auth/experimental-indexed-db", "firebase-app-check/experimental-indexed-db"]
+wasm-web = ["firebase-core/wasm-web"]
+experimental-indexed-db = ["firebase-core/experimental-indexed-db"]
 
 [dependencies]
 firebase-core.workspace = true
-firebase-auth = { path = "../firebase-auth", version = "1.34.1" }
-firebase-app-check = { path = "../firebase-app-check", version = "1.34.1" }
 async-trait.workspace = true
 serde_json.workspace = true
 url.workspace = true

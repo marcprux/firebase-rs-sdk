@@ -804,10 +804,7 @@ mod tests {
             ..Default::default()
         };
         let app = initialize_app(options, Some(unique_settings())).await.unwrap();
-        let container = app.container();
-        let auth_provider = container.get_provider("auth-internal");
-        let app_check_provider = container.get_provider("app-check-internal");
-        let storage = FirebaseStorageImpl::new(app, auth_provider, app_check_provider, None, None).unwrap();
+        let storage = FirebaseStorageImpl::new(app, None, None).unwrap();
         storage.root_reference().unwrap().child(path)
     }
 

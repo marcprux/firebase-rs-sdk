@@ -2,6 +2,14 @@ use crate::app::types::{PlatformLoggerService, VersionService};
 use crate::component::types::ComponentType;
 use crate::component::ComponentContainer;
 
+/// Built eagerly with the app: it reports every registered library's version, and does so by
+/// walking the container, so it has to exist before anyone asks.
+impl crate::component::Service for PlatformLoggerServiceImpl {
+    const NAME: &'static str = "platform-logger";
+    const INSTANTIATION_MODE: crate::component::InstantiationMode = crate::component::InstantiationMode::Eager;
+    const COMPONENT_TYPE: crate::component::ComponentType = crate::component::ComponentType::Private;
+}
+
 pub struct PlatformLoggerServiceImpl {
     container: ComponentContainer,
 }

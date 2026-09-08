@@ -43,9 +43,9 @@ use crate::{
     RedirectOperation, RedirectPersistence,
 };
 use crate::{PhoneAuthCredential, PHONE_PROVIDER_ID};
-use firebase_core::app::{register_component, AppError, FirebaseApp, LOGGER as APP_LOGGER};
-use firebase_core::component::types::{ComponentError, DynService, InstanceFactoryOptions, InstantiationMode};
-use firebase_core::component::{Component, ComponentContainer, ComponentType};
+use firebase_core::app::{register_service, AppError, FirebaseApp, LOGGER as APP_LOGGER};
+use firebase_core::component::types::{ComponentError, InstanceFactoryOptions};
+use firebase_core::component::{ComponentContainer, Service};
 //#[cfg(feature = "firestore")]
 use account::{
     apply_action_code, confirm_password_reset, delete_account, fetch_sign_in_methods_for_email, get_account_info,
@@ -53,6 +53,7 @@ use account::{
     send_verify_and_change_email, update_account, verify_password, UpdateAccountRequest, UpdateAccountResponse,
     UpdateString,
 };
+use firebase_core::platform::credentials::AuthTokenSource;
 use firebase_core::platform::runtime::{sleep as runtime_sleep, spawn_detached};
 use firebase_core::platform::token::TokenProviderArc;
 use firebase_core::util::PartialObserver;
@@ -2888,31 +2889,21 @@ fn emulator_endpoints_for_host(host: &str) -> Option<(String, String)> {
     ))
 }
 
-/// Registers the Auth component so apps can resolve `Auth` instances.
-/// The public `auth` component, built once.
-fn auth_component() -> Component {
-    static PUBLIC: LazyLock<Component> = LazyLock::new(|| {
-        Component::new("auth", Arc::new(auth_factory), ComponentType::Public)
-            .with_instantiation_mode(InstantiationMode::Lazy)
-    });
-    PUBLIC.clone()
+impl Service for Auth {
+    const NAME: &'static str = "auth";
 }
 
-/// The private `auth-internal` component other services (Storage, Functions, Firestore) resolve
-/// the user's token through, exactly as in the JS SDK's `registerAuth`.
-fn auth_internal_component() -> Component {
-    static INTERNAL: LazyLock<Component> = LazyLock::new(|| {
-        Component::new("auth-internal", Arc::new(auth_internal_factory), ComponentType::Private)
-            .with_instantiation_mode(InstantiationMode::Lazy)
-    });
-    INTERNAL.clone()
-}
-
+/// Registers the public `auth` service and the `auth-token` credential source every product
+/// reads the user's token through.
+///
+/// The credential source publishes Auth as a `firebase-core` type, which is what lets Firestore,
+/// Storage, Functions and the rest attach an ID token without depending on this crate. It replaces
+/// the JS SDK's `auth-internal`, whose only purpose was the same.
 pub fn register_auth_component() {
     // Registration is idempotent and cheap, so it runs on every call: a registry that lost the
     // components (or an app created before this module was first used) still ends up working.
-    let _ = register_component(auth_component());
-    let _ = register_component(auth_internal_component());
+    register_service::<Auth, _>(auth_factory);
+    register_service::<AuthTokenSource, _>(auth_token_factory);
 }
 
 /// Persistence backends installed by [`initialize_auth`], keyed by app name. The component
@@ -2961,8 +2952,8 @@ pub async fn initialize_auth(
 ) -> AuthResult<Arc<Auth>> {
     register_auth_component();
 
-    let provider = app.container().get_provider("auth");
-    // `get_immediate` would create the instance, which is exactly what this check must avoid.
+    let provider = app.container().service::<Auth>();
+    // Asking for the service would create it, which is exactly what this check must avoid.
     if provider.is_initialized(None) {
         return Err(AuthError::App(AppError::ComponentFailure {
             component: "auth".to_string(),
@@ -2982,16 +2973,11 @@ pub async fn initialize_auth(
     Ok(auth)
 }
 
-fn auth_factory(
-    container: &ComponentContainer,
-    _options: InstanceFactoryOptions,
-) -> Result<DynService, ComponentError> {
-    let app = container
-        .root_service::<FirebaseApp>()
-        .ok_or_else(|| ComponentError::InitializationFailed {
-            name: "auth".to_string(),
-            reason: "Firebase app not attached to component container".to_string(),
-        })?;
+fn auth_factory(container: &ComponentContainer, _options: InstanceFactoryOptions) -> Result<Arc<Auth>, ComponentError> {
+    let app = container.app().ok_or_else(|| ComponentError::InitializationFailed {
+        name: "auth".to_string(),
+        reason: "Firebase app not attached to component container".to_string(),
+    })?;
     let auth = match persistence_override(app.name()) {
         Some(persistence) => Auth::new_with_persistence((*app).clone(), persistence),
         None => Auth::new((*app).clone()),
@@ -3005,7 +2991,7 @@ fn auth_factory(
         name: "auth".to_string(),
         reason: err.to_string(),
     })?;
-    Ok(auth as DynService)
+    Ok(auth)
 }
 
 /// Formats a decimal millisecond timestamp as the UTC string the JS SDK uses for
@@ -3054,20 +3040,22 @@ pub fn parse_id_token_result(token: &str) -> AuthResult<IdTokenResult> {
     })
 }
 
-fn auth_internal_factory(
+fn auth_token_factory(
     container: &ComponentContainer,
     _options: InstanceFactoryOptions,
-) -> Result<DynService, ComponentError> {
-    // Share the public `auth` instance so both components observe the same signed-in user.
-    let provider = container.get_provider("auth");
-    match provider.get_immediate_with_options::<Auth>(None, false) {
-        Ok(Some(auth)) => Ok(auth as DynService),
+) -> Result<Arc<AuthTokenSource>, ComponentError> {
+    // Shares the public `auth` instance, so an invalidation from a rejected request and a
+    // `signOut` from the application act on the same state.
+    match container.service::<Auth>().try_get(None) {
+        Ok(Some(auth)) => Ok(Arc::new(AuthTokenSource::new(crate::token_provider::auth_token_provider_arc(
+            auth,
+        )))),
         Ok(None) => Err(ComponentError::InitializationFailed {
-            name: "auth-internal".to_string(),
+            name: AuthTokenSource::NAME.to_string(),
             reason: "auth component is not registered".to_string(),
         }),
         Err(err) => Err(ComponentError::InitializationFailed {
-            name: "auth-internal".to_string(),
+            name: AuthTokenSource::NAME.to_string(),
             reason: err.to_string(),
         }),
     }
@@ -3096,12 +3084,12 @@ pub fn auth_for_app(app: FirebaseApp) -> AuthResult<Arc<Auth>> {
     // service accessors. Global registration only reaches apps the registry knows about, so an app
     // built directly (as tests do) has the component attached to its container here.
     register_auth_component();
-    let provider = app.container().get_provider("auth");
-    if !provider.is_component_set() {
-        firebase_core::app::add_component(&app, &auth_component());
-        firebase_core::app::add_component(&app, &auth_internal_component());
+    let provider = app.container().service::<Auth>();
+    if !provider.is_registered() {
+        firebase_core::app::attach_service::<Auth>(&app);
+        firebase_core::app::attach_service::<AuthTokenSource>(&app);
     }
-    match provider.get_immediate_with_options::<Auth>(None, false) {
+    match provider.try_get(None) {
         Ok(Some(auth)) => Ok(auth),
         Ok(None) => Err(AuthError::App(AppError::ComponentFailure {
             component: "auth".to_string(),
@@ -3240,21 +3228,21 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn an_app_outside_the_registry_still_resolves_auth() {
         // Same guarantee as Firestore: an app that never entered the global registry (tests build
-        // these directly) still gets a working Auth, including the private `auth-internal` view
-        // that Storage, Functions and Firestore resolve the user's token through.
+        // these directly) still gets a working Auth, and with it the credential source that
+        // Storage, Functions and Firestore resolve the user's token through.
         let app = test_firebase_app_with_api_key(TEST_API_KEY);
 
         let public = auth_for_app(app.clone()).expect("auth for a detached app");
-        let internal = app
-            .container()
-            .get_provider("auth-internal")
-            .get_immediate::<Auth>()
-            .expect("auth-internal resolves");
-        assert!(Arc::ptr_eq(&public, &internal));
+        let resolved = app.container().get::<Auth>().expect("auth resolves");
+        assert!(Arc::ptr_eq(&public, &resolved));
+        assert!(
+            app.container().get::<AuthTokenSource>().is_some(),
+            "the credential source resolves too"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn auth_internal_component_shares_the_public_auth_instance() {
+    async fn the_credential_source_shares_the_public_auth_instance() {
         use firebase_core::app::{initialize_app, FirebaseAppSettings, FirebaseOptions};
         register_auth_component();
         let options = FirebaseOptions {
@@ -3268,12 +3256,12 @@ mod tests {
         };
         let app = initialize_app(options, Some(settings)).await.expect("app");
         let public = auth_for_app(app.clone()).expect("auth");
-        let internal = app
-            .container()
-            .get_provider("auth-internal")
-            .get_immediate::<Auth>()
-            .expect("auth-internal resolves");
-        assert!(Arc::ptr_eq(&public, &internal), "both components must expose one Auth");
+
+        // Resolving the credential source must not build a second Auth: the token it hands out
+        // has to come from the instance the application signs in and out of.
+        assert!(app.container().get::<AuthTokenSource>().is_some(), "the source resolves");
+        let resolved = app.container().get::<Auth>().expect("auth resolves");
+        assert!(Arc::ptr_eq(&public, &resolved), "one Auth backs both");
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -21,7 +21,13 @@ impl Default for BackoffConfig {
 }
 
 pub fn calculate_backoff_millis(backoff_count: u32) -> u64 {
-    calculate_backoff_with_rng(backoff_count, BackoffConfig::default(), &mut rand::thread_rng())
+    calculate_backoff_with(backoff_count, BackoffConfig::default())
+}
+
+/// The same jittered exponential delay against a caller's own interval and factor: FCM waits five
+/// seconds before its first retry where the default is one.
+pub fn calculate_backoff_with(backoff_count: u32, config: BackoffConfig) -> u64 {
+    calculate_backoff_with_rng(backoff_count, config, &mut rand::thread_rng())
 }
 
 fn calculate_backoff_with_rng<R: Rng + ?Sized>(backoff_count: u32, config: BackoffConfig, rng: &mut R) -> u64 {

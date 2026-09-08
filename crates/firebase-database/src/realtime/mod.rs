@@ -7,10 +7,8 @@ use futures::future::BoxFuture;
 use futures::future::LocalBoxFuture;
 
 use crate::error::{internal_error, DatabaseResult};
-use firebase_app_check::{FirebaseAppCheckInternal, APP_CHECK_INTERNAL_COMPONENT_NAME};
-use firebase_auth::Auth;
 use firebase_core::app::FirebaseApp;
-use reqwest::StatusCode;
+use firebase_core::platform::credentials::AppCredentials;
 use serde_json::Value as JsonValue;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -341,28 +339,10 @@ impl RealtimeTransport for NoopTransport {
 }
 
 async fn fetch_auth_token(app: &FirebaseApp) -> DatabaseResult<Option<String>> {
-    let container = app.container();
-    let auth_or_none = container
-        .get_provider("auth-internal")
-        .get_immediate_with_options::<Auth>(None, true)
-        .map_err(|err| internal_error(format!("failed to resolve auth provider: {err}")))?;
-    let auth = match auth_or_none {
-        Some(auth) => Some(auth),
-        None => container
-            .get_provider("auth")
-            .get_immediate_with_options::<Auth>(None, true)
-            .map_err(|err| internal_error(format!("failed to resolve auth provider: {err}")))?,
-    };
-    let Some(auth) = auth else {
-        return Ok(None);
-    };
-
-    match auth.get_token(false).await {
-        Ok(Some(token)) if token.is_empty() => Ok(None),
-        Ok(Some(token)) => Ok(Some(token)),
-        Ok(None) => Ok(None),
-        Err(err) => Err(internal_error(format!("failed to obtain auth token: {err}"))),
-    }
+    AppCredentials::for_app(app)
+        .auth_token()
+        .await
+        .map_err(|err| internal_error(format!("failed to obtain auth token: {err}")))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -373,35 +353,14 @@ struct AppCheckMetadata {
 }
 
 async fn fetch_app_check_metadata(app: &FirebaseApp) -> DatabaseResult<AppCheckMetadata> {
-    let container = app.container();
-    let app_check = container
-        .get_provider(APP_CHECK_INTERNAL_COMPONENT_NAME)
-        .get_immediate_with_options::<FirebaseAppCheckInternal>(None, true)
-        .map_err(|err| internal_error(format!("failed to resolve app check provider: {err}")))?;
-    let Some(app_check) = app_check else {
-        return Ok(AppCheckMetadata::default());
-    };
-
-    let token = match app_check.get_token(false).await {
-        Ok(result) => result.token,
-        Err(err) => {
-            if let Some(cached) = err.cached_token() {
-                cached.token.clone()
-            } else {
-                return Err(internal_error(format!("failed to obtain App Check token: {err}")));
-            }
-        }
-    };
-
-    if token.is_empty() {
-        return Ok(AppCheckMetadata::default());
-    }
-
-    let heartbeat = app_check.heartbeat_header().await.ok().flatten();
+    let headers = AppCredentials::for_app(app)
+        .headers()
+        .await
+        .map_err(|err| internal_error(format!("failed to obtain App Check token: {err}")))?;
 
     Ok(AppCheckMetadata {
-        token: Some(token),
-        heartbeat,
+        token: headers.app_check_token,
+        heartbeat: headers.heartbeat,
     })
 }
 
@@ -905,8 +864,8 @@ mod native {
 }
 
 #[allow(dead_code)]
-fn ensure_success(status: StatusCode, verb: &str) -> DatabaseResult<()> {
-    if status.is_success() {
+fn ensure_success(status: u16, verb: &str) -> DatabaseResult<()> {
+    if (200..300).contains(&status) {
         Ok(())
     } else {
         Err(internal_error(format!(
@@ -921,9 +880,9 @@ mod wasm {
     use crate::error::DatabaseError;
     use async_lock::Mutex as AsyncMutex;
     use firebase_core::logger::Logger;
+    use firebase_core::platform::http::{HttpClient, HttpRequest};
     use firebase_core::platform::runtime;
     use js_sys::{ArrayBuffer, Uint8Array};
-    use reqwest::{Client, StatusCode};
     use serde_json::{json, Map as JsonMap, Value as JsonValue};
     use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -1294,7 +1253,7 @@ mod wasm {
     struct WasmLongPollTransport {
         repo_info: RepoInfo,
         app: FirebaseApp,
-        client: Client,
+        client: HttpClient,
         state: Arc<WasmLongPollState>,
     }
 
@@ -1303,7 +1262,7 @@ mod wasm {
             Self {
                 repo_info,
                 app,
-                client: Client::new(),
+                client: HttpClient::new(),
                 state: Arc::new(WasmLongPollState::new(repo)),
             }
         }
@@ -1347,7 +1306,9 @@ mod wasm {
                 url.query_pairs_mut().append_pair("auth", &token);
             }
 
-            let mut request = self.client.put(url);
+            let mut request = HttpRequest::put(url)
+                .json(payload)
+                .map_err(|err| internal_error(format!("failed to encode onDisconnect payload: {err}")))?;
             let metadata = fetch_app_check_metadata(&self.app).await?;
             if let Some(token) = metadata.token {
                 request = request.header("X-Firebase-AppCheck", token);
@@ -1356,9 +1317,9 @@ mod wasm {
                 request = request.header("X-Firebase-Client", header);
             }
 
-            let response = request
-                .json(payload)
-                .send()
+            let response = self
+                .client
+                .send(request)
                 .await
                 .map_err(|err| internal_error(format!("failed to apply onDisconnect PUT: {err}")))?;
 
@@ -1375,7 +1336,9 @@ mod wasm {
                 url.query_pairs_mut().append_pair("auth", &token);
             }
 
-            let mut request = self.client.patch(url);
+            let mut request = HttpRequest::patch(url)
+                .json(map)
+                .map_err(|err| internal_error(format!("failed to encode onDisconnect payload: {err}")))?;
             let metadata = fetch_app_check_metadata(&self.app).await?;
             if let Some(token) = metadata.token {
                 request = request.header("X-Firebase-AppCheck", token);
@@ -1384,9 +1347,9 @@ mod wasm {
                 request = request.header("X-Firebase-Client", header);
             }
 
-            let response = request
-                .json(map)
-                .send()
+            let response = self
+                .client
+                .send(request)
                 .await
                 .map_err(|err| internal_error(format!("failed to apply onDisconnect PATCH: {err}")))?;
 
@@ -1543,7 +1506,7 @@ mod wasm {
         state: Arc<WasmLongPollState>,
         repo_info: RepoInfo,
         app: FirebaseApp,
-        client: Client,
+        client: HttpClient,
         spec: ListenSpec,
         control: ListenerControl,
     ) {
@@ -1575,7 +1538,7 @@ mod wasm {
     async fn poll_once(
         repo_info: &RepoInfo,
         app: &FirebaseApp,
-        client: &Client,
+        client: &HttpClient,
         control: &ListenerControl,
         spec: &ListenSpec,
     ) -> DatabaseResult<Option<JsonValue>> {
@@ -1588,8 +1551,7 @@ mod wasm {
             }
         }
 
-        let mut request = client.get(url.as_str());
-        request = request.header("X-Firebase-ETag", "true");
+        let mut request = HttpRequest::get(url.as_str()).header("X-Firebase-ETag", "true");
         if let Some(etag) = control.current_etag().await {
             request = request.header("If-None-Match", etag);
         }
@@ -1602,26 +1564,25 @@ mod wasm {
             request = request.header("X-Firebase-Client", header);
         }
 
-        let response = request
-            .send()
+        let response = client
+            .send(request)
             .await
             .map_err(|err| internal_error(format!("long-poll request failed: {err}")))?;
 
         let status = response.status();
-        if status == StatusCode::NOT_MODIFIED {
+        if status == 304 {
             return Ok(None);
         }
-        if !status.is_success() {
+        if !response.is_success() {
             return Err(internal_error(format!("long-poll request failed with status {status}")));
         }
 
-        if let Some(etag) = response.headers().get("etag").and_then(|value| value.to_str().ok()) {
+        if let Some(etag) = response.header("etag") {
             control.set_etag(Some(etag.to_string())).await;
         }
 
         let payload = response
             .json::<JsonValue>()
-            .await
             .map_err(|err| internal_error(format!("failed to decode long-poll payload: {err}")))?;
         Ok(Some(payload))
     }

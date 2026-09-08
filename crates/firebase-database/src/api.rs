@@ -15,8 +15,8 @@ use crate::realtime::{ListenSpec, Repo};
 use crate::server_value::{current_time_millis, extract_data_ref};
 use firebase_core::app;
 use firebase_core::app::FirebaseApp;
-use firebase_core::component::types::{ComponentError, DynService, InstanceFactoryOptions, InstantiationMode};
-use firebase_core::component::{Component, ComponentType};
+use firebase_core::component::types::{ComponentError, InstanceFactoryOptions};
+use firebase_core::component::{ComponentContainer, Service};
 use firebase_core::logger::Logger;
 use firebase_core::platform::runtime;
 
@@ -1784,38 +1784,33 @@ fn get_value_at_path(root: &Value, segments: &[String]) -> Option<Value> {
     Some(current.clone())
 }
 
-static DATABASE_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
-    Component::new(DATABASE_COMPONENT_NAME, Arc::new(database_factory), ComponentType::Public)
-        .with_instantiation_mode(InstantiationMode::Lazy)
-});
+impl Service for Database {
+    const NAME: &'static str = DATABASE_COMPONENT_NAME;
+}
 
 fn database_factory(
-    container: &firebase_core::component::ComponentContainer,
+    container: &ComponentContainer,
     _options: InstanceFactoryOptions,
-) -> Result<DynService, ComponentError> {
-    let app = container
-        .root_service::<FirebaseApp>()
-        .ok_or_else(|| ComponentError::InitializationFailed {
-            name: DATABASE_COMPONENT_NAME.to_string(),
-            reason: "Firebase app not attached to component container".to_string(),
-        })?;
+) -> Result<Arc<Database>, ComponentError> {
+    let app = container.app().ok_or_else(|| ComponentError::InitializationFailed {
+        name: DATABASE_COMPONENT_NAME.to_string(),
+        reason: "Firebase app not attached to component container".to_string(),
+    })?;
 
     let database = Database::new((*app).clone());
-    Ok(Arc::new(database) as DynService)
+    Ok(Arc::new(database))
 }
 
 fn ensure_registered() {
-    let component = LazyLock::force(&DATABASE_COMPONENT).clone();
-    let _ = app::register_component(component);
+    app::register_service::<Database, _>(database_factory);
 }
 
 fn ensure_component_attached(app: &FirebaseApp) {
-    let provider = app.container().get_provider(DATABASE_COMPONENT_NAME);
-    if provider.is_component_set() {
+    let provider = app.container().service::<Database>();
+    if provider.is_registered() {
         return;
     }
-    let component = LazyLock::force(&DATABASE_COMPONENT).clone();
-    app::add_component(app, &component);
+    app::attach_service::<Database>(app);
 }
 
 pub fn register_database_component() {
@@ -1858,15 +1853,15 @@ pub async fn get_database(app: Option<FirebaseApp>) -> DatabaseResult<Arc<Databa
 
     ensure_component_attached(&app);
 
-    let provider = app::get_provider(&app, DATABASE_COMPONENT_NAME);
-    if let Some(database) = provider.get_immediate::<Database>() {
+    let provider = app::service_provider::<Database>(&app);
+    if let Some(database) = provider.get() {
         return Ok(database);
     }
 
-    match provider.initialize::<Database>(Value::Null, None) {
+    match provider.initialize(Value::Null, None) {
         Ok(service) => Ok(service),
         Err(firebase_core::component::types::ComponentError::InstanceUnavailable { .. }) => provider
-            .get_immediate::<Database>()
+            .get()
             .ok_or_else(|| internal_error("Database component not available")),
         Err(err) => Err(internal_error(err.to_string())),
     }

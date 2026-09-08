@@ -11,12 +11,11 @@ use crate::error::{internal_error, invalid_argument, AiError, AiErrorCode, AiRes
 use crate::helpers::{decode_instance_identifier, encode_instance_identifier};
 use crate::public_types::{AiOptions, AiRuntimeOptions};
 use crate::requests::{ApiSettings, PreparedRequest, RequestFactory, RequestOptions, Task};
-use firebase_app_check::FirebaseAppCheckInternal;
-use firebase_auth::Auth;
 use firebase_core::app;
 use firebase_core::app::{FirebaseApp, FirebaseOptions};
-use firebase_core::component::types::{ComponentError, DynService, InstanceFactoryOptions, InstantiationMode};
-use firebase_core::component::{Component, ComponentType, Provider};
+use firebase_core::component::types::{ComponentError, InstanceFactoryOptions};
+use firebase_core::component::{ComponentContainer, Service};
+use firebase_core::platform::credentials::{AppCredentials, CredentialRequest};
 
 #[derive(Clone)]
 pub struct AiService {
@@ -37,8 +36,7 @@ struct AiInner {
     backend: Backend,
     options: Mutex<AiRuntimeOptions>,
     default_model: Option<String>,
-    auth_provider: Provider,
-    app_check_provider: Provider,
+    credentials: AppCredentials,
     transport: Mutex<Arc<dyn AiHttpTransport>>,
     #[cfg(test)]
     test_tokens: Mutex<TestTokenOverrides>,
@@ -159,8 +157,7 @@ impl AiService {
         backend: Backend,
         options: AiRuntimeOptions,
         default_model: Option<String>,
-        auth_provider: Provider,
-        app_check_provider: Provider,
+        credentials: AppCredentials,
     ) -> Self {
         Self {
             inner: Arc::new(AiInner {
@@ -168,8 +165,7 @@ impl AiService {
                 backend,
                 options: Mutex::new(options),
                 default_model,
-                auth_provider,
-                app_check_provider,
+                credentials,
                 transport: Mutex::new(Arc::new(ReqwestTransport::default())),
                 #[cfg(test)]
                 test_tokens: Mutex::new(TestTokenOverrides::default()),
@@ -230,18 +226,11 @@ impl AiService {
             return Ok(Some(token));
         }
 
-        let auth = match self.inner.auth_provider.get_immediate_with_options::<Auth>(None, true) {
-            Ok(Some(auth)) => auth,
-            Ok(None) => return Ok(None),
-            Err(err) => return Err(internal_error(format!("failed to resolve auth provider: {err}"))),
-        };
-
-        match auth.get_token(false).await {
-            Ok(Some(token)) if token.is_empty() => Ok(None),
-            Ok(Some(token)) => Ok(Some(token)),
-            Ok(None) => Ok(None),
-            Err(err) => Err(internal_error(format!("failed to obtain auth token: {err}"))),
-        }
+        self.inner
+            .credentials
+            .auth_token()
+            .await
+            .map_err(|err| internal_error(format!("failed to obtain auth token: {err}")))
     }
 
     async fn fetch_app_check_credentials(&self, limited_use: bool) -> AiResult<(Option<String>, Option<String>)> {
@@ -257,38 +246,21 @@ impl AiService {
             }
         }
 
-        let app_check = match self
-            .inner
-            .app_check_provider
-            .get_immediate_with_options::<FirebaseAppCheckInternal>(None, true)
-        {
-            Ok(Some(app_check)) => app_check,
-            Ok(None) => return Ok((None, None)),
-            Err(err) => return Err(internal_error(format!("failed to resolve App Check provider: {err}"))),
+        let request = CredentialRequest {
+            limited_use_app_check_token: limited_use,
+            include_heartbeat: true,
         };
-
-        let token = match if limited_use {
-            app_check.get_limited_use_token().await
-        } else {
-            app_check.get_token(false).await
-        } {
-            Ok(result) => Ok(result.token),
-            Err(err) => err
-                .cached_token()
-                .map(|cached| cached.token.clone())
-                .ok_or_else(|| internal_error(format!("failed to obtain App Check token: {err}"))),
-        }?;
-
-        if token.is_empty() {
-            return Ok((None, None));
-        }
-
-        let heartbeat = app_check
-            .heartbeat_header()
+        let headers = self
+            .inner
+            .credentials
+            .headers_for(request)
             .await
-            .map_err(|err| internal_error(format!("failed to obtain App Check heartbeat header: {err}")))?;
+            .map_err(|err| internal_error(format!("failed to obtain App Check token: {err}")))?;
 
-        Ok((Some(token), heartbeat))
+        match headers.app_check_token {
+            Some(token) => Ok((Some(token), headers.heartbeat)),
+            None => Ok((None, None)),
+        }
     }
 
     pub(crate) async fn api_settings(&self) -> AiResult<ApiSettings> {
@@ -492,30 +464,26 @@ impl Cache {
     }
 }
 
-static AI_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
-    Component::new(AI_COMPONENT_NAME, Arc::new(ai_factory), ComponentType::Public)
-        .with_instantiation_mode(InstantiationMode::Lazy)
-        .with_multiple_instances(true)
-});
+/// One instance per backend: the Gemini Developer API and Vertex AI are separate services on the
+/// same app, keyed by the encoded backend identifier.
+impl Service for AiService {
+    const NAME: &'static str = AI_COMPONENT_NAME;
+    const MULTIPLE_INSTANCES: bool = true;
+}
 
 fn ai_factory(
-    container: &firebase_core::component::ComponentContainer,
+    container: &ComponentContainer,
     options: InstanceFactoryOptions,
-) -> Result<DynService, ComponentError> {
-    let app = container
-        .root_service::<FirebaseApp>()
-        .ok_or_else(|| ComponentError::InitializationFailed {
-            name: AI_COMPONENT_NAME.to_string(),
-            reason: "Firebase app not attached to component container".to_string(),
-        })?;
+) -> Result<Arc<AiService>, ComponentError> {
+    let app = container.app().ok_or_else(|| ComponentError::InitializationFailed {
+        name: AI_COMPONENT_NAME.to_string(),
+        reason: "Firebase app not attached to component container".to_string(),
+    })?;
 
     let identifier_backend = options
         .instance_identifier
         .as_deref()
         .map(|identifier| decode_instance_identifier(identifier));
-
-    let auth_provider = container.get_provider("auth-internal");
-    let app_check_provider = container.get_provider("app-check-internal");
 
     let backend = match identifier_backend {
         Some(Ok(backend)) => backend,
@@ -557,14 +525,13 @@ fn ai_factory(
         backend,
         runtime_options,
         default_model,
-        auth_provider,
-        app_check_provider,
+        AppCredentials::for_app(&app),
     );
-    Ok(Arc::new(service) as DynService)
+    Ok(Arc::new(service))
 }
 
 fn ensure_registered() {
-    let _ = app::register_component(AI_COMPONENT.clone());
+    app::register_service::<AiService, _>(ai_factory);
 }
 
 /// Registers the AI component in the global registry.
@@ -624,10 +591,10 @@ pub async fn get_ai(app: Option<FirebaseApp>, options: Option<AiOptions>) -> AiR
         return Ok(service);
     }
 
-    let provider = app::get_provider(&app, AI_COMPONENT_NAME);
+    let provider = app::service_provider::<AiService>(&app);
 
     if let Some(service) = provider
-        .get_immediate_with_options::<AiService>(Some(&identifier), true)
+        .try_get(Some(&identifier))
         .map_err(|err| internal_error(err.to_string()))?
     {
         service.set_options(runtime_options.clone());
@@ -635,7 +602,7 @@ pub async fn get_ai(app: Option<FirebaseApp>, options: Option<AiOptions>) -> AiR
         return Ok(service);
     }
 
-    match provider.initialize::<AiService>(
+    match provider.initialize(
         json!({
             "backend": identifier,
             "useLimitedUseAppCheckTokens": runtime_options.use_limited_use_app_check_tokens,
@@ -649,21 +616,19 @@ pub async fn get_ai(app: Option<FirebaseApp>, options: Option<AiOptions>) -> AiR
         }
         Err(ComponentError::InstanceUnavailable { .. }) => {
             if let Some(service) = provider
-                .get_immediate_with_options::<AiService>(Some(&cache_key.identifier), true)
+                .try_get(Some(&cache_key.identifier))
                 .map_err(|err| internal_error(err.to_string()))?
             {
                 service.set_options(runtime_options.clone());
                 Cache::insert(cache_key.clone(), service.clone());
                 Ok(service)
             } else {
-                let container = app.container();
                 let fallback = Arc::new(AiService::new(
                     app.clone(),
                     backend,
                     runtime_options,
                     None,
-                    container.get_provider("auth-internal"),
-                    container.get_provider("app-check-internal"),
+                    AppCredentials::for_app(&app),
                 ));
                 Cache::insert(cache_key.clone(), fallback.clone());
                 Ok(fallback)

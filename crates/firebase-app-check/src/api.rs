@@ -2,12 +2,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
+use firebase_core::app::register_service;
 use firebase_core::app::{get_app, AppError, FirebaseApp, HeartbeatService, HeartbeatServiceImpl};
-use firebase_core::app::{get_provider, register_component};
-use firebase_core::component::types::{
-    ComponentError, ComponentType, DynService, InstanceFactoryOptions, InstantiationMode,
-};
-use firebase_core::component::{Component, ComponentContainer};
+use firebase_core::component::types::{ComponentError, ComponentType, InstanceFactoryOptions, InstantiationMode};
+use firebase_core::component::{ComponentContainer, Service};
+use firebase_core::platform::credentials::AppCheckTokenSource;
 use firebase_core::platform::runtime;
 use futures::FutureExt;
 #[cfg(any(test, feature = "test-support"))]
@@ -36,39 +35,34 @@ struct AppCheckRegistryEntry {
 static REGISTRY: LazyLock<Mutex<HashMap<Arc<str>, AppCheckRegistryEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-static APP_CHECK_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
-    Component::new(
-        super::types::APP_CHECK_COMPONENT_NAME,
-        Arc::new(app_check_factory),
-        ComponentType::Public,
-    )
-    .with_instantiation_mode(InstantiationMode::Explicit)
-});
+/// App Check exists only once the application has configured a provider for it, which is why
+/// both faces of it are explicit: resolving them before `initialize_app_check` must report
+/// "no App Check" rather than build one with no attestation provider.
+impl Service for AppCheck {
+    const NAME: &'static str = super::types::APP_CHECK_COMPONENT_NAME;
+    const INSTANTIATION_MODE: InstantiationMode = InstantiationMode::Explicit;
+}
 
-static APP_CHECK_INTERNAL_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
-    Component::new(
-        super::types::APP_CHECK_INTERNAL_COMPONENT_NAME,
-        Arc::new(app_check_internal_factory),
-        ComponentType::Private,
-    )
-    .with_instantiation_mode(InstantiationMode::Explicit)
-});
+impl Service for FirebaseAppCheckInternal {
+    const NAME: &'static str = super::types::APP_CHECK_INTERNAL_COMPONENT_NAME;
+    const INSTANTIATION_MODE: InstantiationMode = InstantiationMode::Explicit;
+    const COMPONENT_TYPE: ComponentType = ComponentType::Private;
+}
 
 fn ensure_components_registered() {
-    let _ = register_component(APP_CHECK_COMPONENT.clone());
-    let _ = register_component(APP_CHECK_INTERNAL_COMPONENT.clone());
+    register_service::<AppCheck, _>(app_check_factory);
+    register_service::<FirebaseAppCheckInternal, _>(app_check_internal_factory);
+    register_service::<AppCheckTokenSource, _>(app_check_token_factory);
 }
 
 fn app_check_factory(
     container: &ComponentContainer,
     _options: InstanceFactoryOptions,
-) -> Result<DynService, ComponentError> {
-    let app = container
-        .root_service::<FirebaseApp>()
-        .ok_or_else(|| ComponentError::InitializationFailed {
-            name: super::types::APP_CHECK_COMPONENT_NAME.to_string(),
-            reason: "Firebase app not attached to component container".to_string(),
-        })?;
+) -> Result<Arc<AppCheck>, ComponentError> {
+    let app = container.app().ok_or_else(|| ComponentError::InitializationFailed {
+        name: super::types::APP_CHECK_COMPONENT_NAME.to_string(),
+        reason: "Firebase app not attached to component container".to_string(),
+    })?;
     let app_name: Arc<str> = Arc::from(app.name().to_owned());
     let service = REGISTRY
         .lock()
@@ -79,19 +73,17 @@ fn app_check_factory(
             name: super::types::APP_CHECK_COMPONENT_NAME.to_string(),
             reason: "App Check has not been initialized".to_string(),
         })?;
-    Ok(Arc::new(service) as DynService)
+    Ok(Arc::new(service))
 }
 
 fn app_check_internal_factory(
     container: &ComponentContainer,
     _options: InstanceFactoryOptions,
-) -> Result<DynService, ComponentError> {
-    let app = container
-        .root_service::<FirebaseApp>()
-        .ok_or_else(|| ComponentError::InitializationFailed {
-            name: super::types::APP_CHECK_INTERNAL_COMPONENT_NAME.to_string(),
-            reason: "Firebase app not attached to component container".to_string(),
-        })?;
+) -> Result<Arc<FirebaseAppCheckInternal>, ComponentError> {
+    let app = container.app().ok_or_else(|| ComponentError::InitializationFailed {
+        name: super::types::APP_CHECK_INTERNAL_COMPONENT_NAME.to_string(),
+        reason: "Firebase app not attached to component container".to_string(),
+    })?;
     let app_name: Arc<str> = Arc::from(app.name().to_owned());
     let internal = REGISTRY
         .lock()
@@ -102,7 +94,30 @@ fn app_check_internal_factory(
             name: super::types::APP_CHECK_INTERNAL_COMPONENT_NAME.to_string(),
             reason: "App Check has not been initialized".to_string(),
         })?;
-    Ok(Arc::new(internal) as DynService)
+    Ok(Arc::new(internal))
+}
+
+fn app_check_token_factory(
+    container: &ComponentContainer,
+    _options: InstanceFactoryOptions,
+) -> Result<Arc<AppCheckTokenSource>, ComponentError> {
+    let app = container.app().ok_or_else(|| ComponentError::InitializationFailed {
+        name: AppCheckTokenSource::NAME.to_string(),
+        reason: "Firebase app not attached to component container".to_string(),
+    })?;
+    let app_name: Arc<str> = Arc::from(app.name().to_owned());
+    let internal = REGISTRY
+        .lock()
+        .unwrap()
+        .get(&app_name)
+        .map(|entry| entry.internal.clone())
+        .ok_or_else(|| ComponentError::InitializationFailed {
+            name: AppCheckTokenSource::NAME.to_string(),
+            reason: "App Check has not been initialized".to_string(),
+        })?;
+    Ok(Arc::new(AppCheckTokenSource::new(
+        super::token_provider::app_check_token_provider_arc(internal),
+    )))
 }
 
 /// Registers Firebase App Check for the given app using the supplied options.
@@ -147,8 +162,7 @@ pub async fn initialize_app_check(app: Option<FirebaseApp>, options: AppCheckOpt
 
     let app_name: Arc<str> = Arc::from(app.name().to_owned());
 
-    let heartbeat = get_provider(&app, "heartbeat")
-        .get_immediate::<HeartbeatServiceImpl>()
+    let heartbeat = firebase_core::app::service::<HeartbeatServiceImpl>(&app)
         .map(|service| -> Arc<dyn HeartbeatService> { service });
 
     if let Some(service) = &heartbeat {
@@ -198,37 +212,51 @@ pub async fn initialize_app_check(app: Option<FirebaseApp>, options: AppCheckOpt
         },
     );
 
-    // Both components are registered as `Explicit`, so nothing instantiates them on demand: other
-    // services resolve App Check through `get_immediate`, which would keep returning `None` and
-    // silently drop the token from every request. Instantiating them here is what makes the token
-    // reach Functions, Firestore and Storage, and mirrors the JS `initializeAppCheck`.
+    // All three components are `Explicit`, so nothing instantiates them on demand: a product
+    // asking the container for App Check would keep getting `None` and silently drop the token
+    // from every request. Instantiating them here is what makes the token reach Functions,
+    // Firestore and Storage, and mirrors the JS `initializeAppCheck`.
     //
     // Global registration only reaches apps the registry knows about, so an app built directly
     // gets the components attached to its own container first.
     let container = app.container();
-    if !container
-        .get_provider(super::types::APP_CHECK_COMPONENT_NAME)
-        .is_component_set()
-    {
-        firebase_core::app::add_component(&app, &APP_CHECK_COMPONENT);
+    if !container.service::<AppCheck>().is_registered() {
+        firebase_core::app::attach_service::<AppCheck>(&app);
     }
-    if !container
-        .get_provider(super::types::APP_CHECK_INTERNAL_COMPONENT_NAME)
-        .is_component_set()
-    {
-        firebase_core::app::add_component(&app, &APP_CHECK_INTERNAL_COMPONENT);
+    if !container.service::<FirebaseAppCheckInternal>().is_registered() {
+        firebase_core::app::attach_service::<FirebaseAppCheckInternal>(&app);
     }
-    if let Err(err) = container
-        .get_provider(super::types::APP_CHECK_COMPONENT_NAME)
-        .initialize::<AppCheck>(serde_json::Value::Null, None)
-    {
-        LOGGER.debug(format!("App Check component was not instantiated: {err}"));
+    if !container.service::<AppCheckTokenSource>().is_registered() {
+        firebase_core::app::attach_service::<AppCheckTokenSource>(&app);
     }
-    if let Err(err) = container
-        .get_provider(super::types::APP_CHECK_INTERNAL_COMPONENT_NAME)
-        .initialize::<FirebaseAppCheckInternal>(serde_json::Value::Null, None)
-    {
-        LOGGER.debug(format!("App Check internal component was not instantiated: {err}"));
+
+    let instantiated = [
+        (
+            "App Check",
+            container
+                .service::<AppCheck>()
+                .initialize(serde_json::Value::Null, None)
+                .err(),
+        ),
+        (
+            "App Check internal",
+            container
+                .service::<FirebaseAppCheckInternal>()
+                .initialize(serde_json::Value::Null, None)
+                .err(),
+        ),
+        (
+            "App Check token",
+            container
+                .service::<AppCheckTokenSource>()
+                .initialize(serde_json::Value::Null, None)
+                .err(),
+        ),
+    ];
+    for (label, error) in instantiated {
+        if let Some(err) = error {
+            LOGGER.debug(format!("{label} component was not instantiated: {err}"));
+        }
     }
 
     if final_auto_refresh {
@@ -600,10 +628,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn initialization_instantiates_the_components_other_services_resolve() {
-        // Both App Check components are registered as `Explicit`, so nothing creates them on
-        // demand. Functions, Firestore and Storage look the internal one up with `get_immediate`;
-        // when it was never instantiated they silently sent every request without an App Check
-        // token, which is invisible until a backend rejects it.
+        // The App Check components are registered as `Explicit`, so nothing creates them on
+        // demand. Products read the token source out of the container; when it was never
+        // instantiated they silently sent every request without an App Check token, which is
+        // invisible until a backend rejects it.
         let _guard = test_guard();
         clear_state_for_tests();
         clear_registry();
@@ -614,16 +642,10 @@ mod tests {
             .await
             .expect("initialize app check");
 
-        let internal = app
-            .container()
-            .get_provider(super::super::types::APP_CHECK_INTERNAL_COMPONENT_NAME)
-            .get_immediate::<FirebaseAppCheckInternal>();
+        let internal = app.container().get::<FirebaseAppCheckInternal>();
         assert!(internal.is_some(), "app-check-internal must resolve after initialize_app_check");
 
-        let public = app
-            .container()
-            .get_provider(super::super::types::APP_CHECK_COMPONENT_NAME)
-            .get_immediate::<AppCheck>();
+        let public = app.container().get::<AppCheck>();
         assert!(public.is_some(), "the public component must resolve as well");
 
         let token = internal

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::Method;
+use firebase_core::platform::http::HttpMethod as Method;
 
 use crate::error::{StorageError, StorageResult};
 

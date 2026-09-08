@@ -8,6 +8,7 @@ use crate::api::Performance;
 use crate::error::{internal_error, PerformanceResult};
 use crate::storage::{SerializableNetworkRequest, SerializableTrace, TraceEnvelope, TraceStoreHandle};
 use chrono::Utc;
+use firebase_core::platform::http::{HttpClient, HttpRequest};
 use firebase_core::platform::runtime;
 
 const DEFAULT_ENDPOINT: &str = "https://firebaselogging.googleapis.com/v0cc/log?format=json_proto3";
@@ -179,28 +180,22 @@ fn current_platform() -> String {
     }
 }
 
+#[derive(Default)]
 struct HttpTransportClient {
-    client: reqwest::Client,
-}
-
-impl Default for HttpTransportClient {
-    fn default() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
-    }
+    client: HttpClient,
 }
 
 impl HttpTransportClient {
     async fn send(&self, endpoint: &str, payload: &TransportPayload) -> PerformanceResult<()> {
+        let request = HttpRequest::post(endpoint)
+            .json(payload)
+            .map_err(|err| internal_error(err.to_string()))?;
         let response = self
             .client
-            .post(endpoint)
-            .json(payload)
-            .send()
+            .send(request)
             .await
             .map_err(|err| internal_error(err.to_string()))?;
-        if !response.status().is_success() {
+        if !response.is_success() {
             return Err(internal_error(format!("transport responded with status {}", response.status())));
         }
         Ok(())

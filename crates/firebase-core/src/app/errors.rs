@@ -88,6 +88,10 @@ impl From<ProviderComponentError> for AppError {
                 component: name,
                 message: "instance unavailable".to_string(),
             },
+            ProviderComponentError::MismatchingServiceType { name, expected, found } => AppError::ComponentFailure {
+                component: name,
+                message: format!("holds a {found}, but was looked up as a {expected}"),
+            },
         }
     }
 }

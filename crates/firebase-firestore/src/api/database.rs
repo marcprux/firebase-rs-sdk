@@ -1,4 +1,4 @@
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use crate::constants::FIRESTORE_COMPONENT_NAME;
 use crate::error::{internal_error, invalid_argument, missing_project_id, FirestoreResult};
@@ -7,8 +7,8 @@ use firebase_core::app;
 use firebase_core::app::FirebaseApp;
 use firebase_core::app::SDK_VERSION;
 use firebase_core::app::{get_app, register_version};
-use firebase_core::component::types::{ComponentError, DynService, InstanceFactoryOptions, InstantiationMode};
-use firebase_core::component::{Component, ComponentType};
+use firebase_core::component::types::{ComponentError, InstanceFactoryOptions};
+use firebase_core::component::{ComponentContainer, Service};
 
 use super::query::Query;
 use super::reference::{CollectionReference, DocumentReference};
@@ -81,22 +81,21 @@ impl Firestore {
     }
 }
 
-static FIRESTORE_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
-    Component::new(FIRESTORE_COMPONENT_NAME, Arc::new(firestore_factory), ComponentType::Public)
-        .with_instantiation_mode(InstantiationMode::Lazy)
-        .with_multiple_instances(true)
-});
+/// One instance per database: an app can address several Firestore databases, keyed by database
+/// id.
+impl Service for Firestore {
+    const NAME: &'static str = FIRESTORE_COMPONENT_NAME;
+    const MULTIPLE_INSTANCES: bool = true;
+}
 
 fn firestore_factory(
-    container: &firebase_core::component::ComponentContainer,
+    container: &ComponentContainer,
     options: InstanceFactoryOptions,
-) -> Result<DynService, ComponentError> {
-    let app = container
-        .root_service::<FirebaseApp>()
-        .ok_or_else(|| ComponentError::InitializationFailed {
-            name: FIRESTORE_COMPONENT_NAME.to_string(),
-            reason: "Firebase app not attached to component container".to_string(),
-        })?;
+) -> Result<Arc<Firestore>, ComponentError> {
+    let app = container.app().ok_or_else(|| ComponentError::InitializationFailed {
+        name: FIRESTORE_COMPONENT_NAME.to_string(),
+        reason: "Firebase app not attached to component container".to_string(),
+    })?;
 
     let database_id = match options.instance_identifier.as_deref() {
         Some(identifier) if !identifier.is_empty() => {
@@ -115,7 +114,7 @@ fn firestore_factory(
 
     register_version("@firebase/firestore", SDK_VERSION, None);
 
-    Ok(Arc::new(firestore) as DynService)
+    Ok(Arc::new(firestore))
 }
 
 fn parse_database_identifier(app: &FirebaseApp, identifier: &str) -> FirestoreResult<DatabaseId> {
@@ -136,7 +135,7 @@ fn parse_database_identifier(app: &FirebaseApp, identifier: &str) -> FirestoreRe
 }
 
 fn ensure_registered() {
-    let _ = app::register_component(FIRESTORE_COMPONENT.clone());
+    app::register_service::<Firestore, _>(firestore_factory);
 }
 
 /// Guarantees `app` can resolve Firestore.
@@ -146,12 +145,8 @@ fn ensure_registered() {
 /// this app's container as well when it is missing.
 fn ensure_registered_for(app: &FirebaseApp) {
     ensure_registered();
-    if !app
-        .container()
-        .get_provider(FIRESTORE_COMPONENT_NAME)
-        .is_component_set()
-    {
-        app::add_component(app, &FIRESTORE_COMPONENT);
+    if !app.container().service::<Firestore>().is_registered() {
+        app::attach_service::<Firestore>(app);
     }
 }
 
@@ -171,9 +166,8 @@ pub async fn get_firestore(app: Option<FirebaseApp>) -> FirestoreResult<Arc<Fire
     };
 
     ensure_registered_for(&app);
-    let provider = app::get_provider(&app, FIRESTORE_COMPONENT_NAME);
-    provider
-        .get_immediate_with_options::<Firestore>(None, false)
+    app::service_provider::<Firestore>(&app)
+        .try_get(None)
         .map_err(|err| internal_error(err.to_string()))?
         .ok_or_else(|| internal_error("Failed to obtain Firestore instance"))
 }
@@ -232,9 +226,8 @@ mod tests {
             ..Default::default()
         };
         let app = initialize_app(options, Some(unique_settings())).await.unwrap();
-        let provider = app::get_provider(&app, FIRESTORE_COMPONENT_NAME);
-        let instance = provider
-            .initialize::<Firestore>(serde_json::Value::Null, Some("projects/project/databases/custom"))
+        let instance = app::service_provider::<Firestore>(&app)
+            .initialize(serde_json::Value::Null, Some("projects/project/databases/custom"))
             .unwrap();
         assert_eq!(instance.database(), "custom");
     }

@@ -8,7 +8,7 @@ Prompt: Compare the original JS/Typescript files in ./packages/installations and
 I’m reviewing the Rust and JS implementations to compare their feature coverage. The Rust code now performs real Installation registration and token refresh via the REST API, replacing the previous stub. Persistence, concurrency coordination, and secondary APIs (delete, onIdChange) still need to be ported. Given the new network integration, coverage increases from ~5 % to roughly 15 %. I’ll reference specific file paths and lines to support this analysis and highlight the biggest gaps before crafting the final summary.
 
 
-  - Network registration and token refresh mirror the JS helpers (`packages/installations/src/functions/create-installation-request.ts`, `generate-auth-token-request.ts`) through a blocking `reqwest` client (`src/installations/rest.rs:1`).
+  - Network registration and token refresh mirror the JS helpers (`packages/installations/src/functions/create-installation-request.ts`, `generate-auth-token-request.ts`) through the shared HTTP client (`src/rest/mod.rs:1`).
   - `get_id` and `get_token` call through the REST client and cache the resulting FID/token pair like the JS `getInstallationEntry` flow (`src/installations/api.rs:23`).
   - Configuration extraction (`src/installations/config.rs:6`) validates required app options, similar to JS `extractAppConfig`.
   - Installation entries (FID + refresh/auth tokens) persist to disk between runs using the default file-backed cache (`src/installations/persistence.rs:1`).
@@ -20,7 +20,7 @@ I’m reviewing the Rust and JS implementations to compare their feature coverag
 - `get_token` drops the local entry and re-registers when the backend answers 401/404 for `authTokens:generate` (JS `refreshAuthToken` behaviour); `InstallationsError::server_code()` exposes the HTTP status.
 - Component registration exposing `get_installations` with per-app caching (`src/installations/api.rs:146`).
 - App config extraction and validation mirroring the JS helper (`src/installations/config.rs:6`).
-- Async REST client with a native `reqwest` implementation and a WASM `fetch` backend behind the `wasm-web` feature (`src/installations/rest/native.rs:1`, `src/installations/rest/wasm.rs:1`).
+- Async REST client shared by both targets, on `firebase_core::platform::http` (`src/rest/mod.rs:1`).
 - `Installations` public/internal APIs are now async, performing registration, token refresh, and delete operations without blocking (`src/installations/api.rs:112`).
 - File-backed persistence for native targets and IndexedDB + BroadcastChannel-backed persistence for wasm builds, including wasm-bindgen tests that verify round-trips when `wasm-web` and `experimental-indexed-db` are enabled (`src/installations/persistence.rs`).
 - Internal helper that surfaces the full installation entry (FID, refresh token, auth token) for other modules such as Messaging (`src/installations/api.rs:185`).

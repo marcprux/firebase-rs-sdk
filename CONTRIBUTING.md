@@ -139,13 +139,41 @@ cargo build --no-default-features --features remote-config   # what a single-pro
 
 Two rules keep the graph honest, and CI enforces both:
 
-- **Products depend on core, never on each other's internals.** Credentials are the reason this is
-  possible: `firebase_core::platform::token::TokenProvider` is implemented by Auth and App Check and
-  consumed by the products that talk to a backend, so no product has to depend on a credential
-  producer's error types. `firebase-functions` depends on `firebase-messaging` for the instance-id
-  token, which is a real dependency rather than a cycle.
+- **Products depend on core, never on each other's internals.** `firebase-functions` depends on
+  `firebase-messaging` for the instance-id token, which is a real dependency rather than a cycle;
+  apart from that, and from the products that need an installation id, a product's only Firebase
+  dependency is `firebase-core`.
 - **Each product must build on its own** (`--no-default-features --features <product>`), which is
   what stops a Remote Config user from compiling gRPC.
+
+### What core owns
+
+Four things every product needs live in `firebase-core`, and a product should reach for them
+rather than write its own:
+
+- **The service registry** — a product declares its service once by implementing
+  `component::Service` (the component name, when it is created, whether an app can hold several
+  instances), registers a factory with `app::register_service::<S, _>(factory)`, and resolves it
+  back with `app::service_provider::<S>(&app)` or `container.get::<S>()`. The name and the Rust
+  type travel together, so a lookup cannot disagree with the registration: asking for a component
+  as the wrong type is an error, where the untyped container answered `None` and looked exactly
+  like "that product is not installed". Nothing outside core builds a `Component` or calls
+  `get_provider` by hand.
+
+- **Credentials** — `platform::credentials::AppCredentials::for_app(&app)` resolves the user's ID
+  token and the App Check token from the app's component container, per request. Auth and App Check
+  publish themselves into that container as a `TokenSource`, which is what lets Firestore, Storage,
+  Functions and the rest attach a token without depending on the crate that produced it. Never look
+  up `auth-internal` or `app-check-internal` from a product.
+- **Transport** — `platform::http::HttpClient` is the SDK's HTTP client: one implementation for
+  native and the browser, with headers, timeouts and a retry policy. A product writes its own
+  request code only for something the shared client deliberately does not do — gRPC (Firestore's
+  `Listen`), websockets (the Realtime Database), a streaming response body (Storage downloads,
+  streaming callables), or a client the caller supplies (the AI request builder).
+- **Errors** — `util::status::StatusCode` and `GoogleApiError::from_response` read what a Firebase
+  backend said: the canonical `google.rpc` status, the message, and the `{"error": {…}}` envelope
+  (including the array wrapper Firestore's streaming RPCs use). Products keep their own public
+  error types and map the status onto them.
 
 ## Coverage table
 

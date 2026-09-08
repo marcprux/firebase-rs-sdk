@@ -2,7 +2,7 @@
 
 This module ports core pieces of the Firebase Storage Web SDK to Rust so applications
 can discover buckets, navigate object paths, and perform common download, metadata,
-and upload operations using an async `reqwest` client that works on native and wasm targets.
+and upload operations using the SDK's shared async HTTP client, which works on native and wasm targets.
 
 It provides functionality to interact with Firebase Storage, including
 uploading and downloading files, managing metadata, and handling storage references.

@@ -2,12 +2,14 @@ mod component;
 pub mod constants;
 pub mod container;
 pub mod provider;
+pub mod service;
 pub mod types;
 
 pub use component::Component;
 pub use constants::DEFAULT_ENTRY_NAME;
 pub use container::ComponentContainer;
 pub use provider::Provider;
+pub use service::{Service, ServiceProvider};
 pub use types::{ComponentError, ComponentType, InstanceFactory, InstanceFactoryOptions, InstantiationMode};
 
 use std::collections::HashMap;

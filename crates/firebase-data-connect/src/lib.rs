@@ -44,4 +44,4 @@ pub use reference::{
 };
 
 #[doc(inline)]
-pub use transport::{AppCheckHeaders, CallerSdkType, DataConnectTransport, RequestTokenProvider, RestTransport};
+pub use transport::{CallerSdkType, DataConnectTransport, RestTransport};

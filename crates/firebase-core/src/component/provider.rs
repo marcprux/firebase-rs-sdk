@@ -38,6 +38,16 @@ impl Provider {
         &self.inner.name
     }
 
+    /// The Rust type this provider's component publishes, once one is set.
+    pub(crate) fn service_type(&self) -> Option<(std::any::TypeId, &'static str)> {
+        self.inner
+            .component
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|component| component.service_type())
+    }
+
     pub fn component_type(&self) -> Option<crate::component::types::ComponentType> {
         self.inner
             .component
@@ -68,14 +78,14 @@ impl Provider {
         Ok(())
     }
 
-    pub fn get_immediate<T>(&self) -> Option<Arc<T>>
+    pub(crate) fn get_immediate<T>(&self) -> Option<Arc<T>>
     where
         T: Any + Send + Sync + 'static,
     {
         self.get_immediate_with_options::<T>(None, true).ok().flatten()
     }
 
-    pub fn get_immediate_with_options<T>(
+    pub(crate) fn get_immediate_with_options<T>(
         &self,
         identifier: Option<&str>,
         optional: bool,
@@ -99,7 +109,7 @@ impl Provider {
         }
     }
 
-    pub fn initialize<T>(&self, options: Value, identifier: Option<&str>) -> Result<Arc<T>, ComponentError>
+    pub(crate) fn initialize<T>(&self, options: Value, identifier: Option<&str>) -> Result<Arc<T>, ComponentError>
     where
         T: Any + Send + Sync + 'static,
     {

@@ -85,7 +85,7 @@ DISCLAIMER: This is not an official Firebase product, nor it is guaranteed that 
 - Authentication and App Check headers are now injected automatically: emulator overrides feed `Authorization`
   headers, while live environments consult the Auth/App Check providers to emit `Authorization`,
   `X-Firebase-AppCheck`, `X-Firebase-Storage-Version`, and `X-Firebase-GMPID` metadata on every request.
-- Unified async transport built on `reqwest::Client`, so native and wasm targets share the same retry logic while
+- Unified async transport built on `firebase_core::platform::http`, so native and wasm targets share the same retry logic while
   exposing an `async` public API.
 - Added runnable examples under `examples/` (`storage_get_stream.rs`, `storage_upload_string.rs`) covering streaming
   downloads and string uploads to make the new APIs easier to adopt.

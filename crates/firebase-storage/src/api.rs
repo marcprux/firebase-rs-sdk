@@ -1,4 +1,4 @@
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use crate::constants::STORAGE_TYPE;
 use crate::error::{internal_error, StorageResult};
@@ -6,34 +6,28 @@ use crate::reference::StorageReference;
 use crate::service::FirebaseStorageImpl;
 use crate::util::is_url;
 use firebase_core::app::FirebaseApp;
-use firebase_core::app::{get_app, get_provider, register_component, SDK_VERSION};
-use firebase_core::component::types::{ComponentError, DynService, InstanceFactoryOptions, InstantiationMode};
-use firebase_core::component::{Component, ComponentType};
+use firebase_core::app::{get_app, SDK_VERSION};
+use firebase_core::component::types::{ComponentError, InstanceFactoryOptions};
+use firebase_core::component::{ComponentContainer, Service};
 
-static STORAGE_COMPONENT_REGISTERED: LazyLock<Component> = LazyLock::new(|| {
-    Component::new(STORAGE_TYPE, Arc::new(storage_factory), ComponentType::Public)
-        .with_instantiation_mode(InstantiationMode::Lazy)
-        .with_multiple_instances(true)
-});
+/// One instance per bucket: `getStorage(app, "gs://other-bucket")` is a second service on the
+/// same app, keyed by the bucket URL.
+impl Service for FirebaseStorageImpl {
+    const NAME: &'static str = STORAGE_TYPE;
+    const MULTIPLE_INSTANCES: bool = true;
+}
 
 fn storage_factory(
-    container: &firebase_core::component::ComponentContainer,
+    container: &ComponentContainer,
     options: InstanceFactoryOptions,
-) -> Result<DynService, ComponentError> {
-    let app = container
-        .root_service::<FirebaseApp>()
-        .ok_or_else(|| ComponentError::InitializationFailed {
-            name: STORAGE_TYPE.to_string(),
-            reason: "Firebase app not attached to component container".to_string(),
-        })?;
-
-    let auth_provider = container.get_provider("auth-internal");
-    let app_check_provider = container.get_provider("app-check-internal");
+) -> Result<Arc<FirebaseStorageImpl>, ComponentError> {
+    let app = container.app().ok_or_else(|| ComponentError::InitializationFailed {
+        name: STORAGE_TYPE.to_string(),
+        reason: "Firebase app not attached to component container".to_string(),
+    })?;
 
     let storage = FirebaseStorageImpl::new(
         (*app).clone(),
-        auth_provider,
-        app_check_provider,
         options.instance_identifier.clone(),
         Some(SDK_VERSION.to_string()),
     )
@@ -42,11 +36,11 @@ fn storage_factory(
         reason: err.to_string(),
     })?;
 
-    Ok(Arc::new(storage) as DynService)
+    Ok(Arc::new(storage))
 }
 
 fn ensure_registered() {
-    let _ = register_component(STORAGE_COMPONENT_REGISTERED.clone());
+    firebase_core::app::register_service::<FirebaseStorageImpl, _>(storage_factory);
 }
 
 pub fn register_storage_component() {
@@ -63,9 +57,8 @@ pub async fn get_storage_for_app(
         None => get_app(None).await.map_err(|err| internal_error(err.to_string()))?,
     };
 
-    let provider = get_provider(&app, STORAGE_TYPE);
-    let storage = provider
-        .get_immediate_with_options::<FirebaseStorageImpl>(bucket_url, false)
+    let storage = firebase_core::app::service_provider::<FirebaseStorageImpl>(&app)
+        .try_get(bucket_url)
         .map_err(|err| internal_error(err.to_string()))?
         .ok_or_else(|| internal_error("Storage component did not return an instance"))?;
 

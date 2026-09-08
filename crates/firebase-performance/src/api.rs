@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, LazyLock, Mutex as StdMutex, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_lock::Mutex;
@@ -15,15 +15,15 @@ use crate::error::{internal_error, invalid_argument, PerformanceResult};
 use crate::instrumentation;
 use crate::storage::{create_trace_store, TraceEnvelope, TraceStoreHandle};
 use crate::transport::{TransportController, TransportOptions};
-use firebase_app_check::{AppCheckTokenError, AppCheckTokenResult, FirebaseAppCheckInternal};
-use firebase_auth::FirebaseAuth;
 use firebase_core::app;
 use firebase_core::app::FirebaseApp;
-use firebase_core::component::types::{ComponentError, DynService, InstanceFactoryOptions, InstantiationMode};
-use firebase_core::component::{Component, ComponentType};
+use firebase_core::component::types::{ComponentError, InstanceFactoryOptions};
+use firebase_core::component::{ComponentContainer, Service};
+use firebase_core::platform::credentials::AppCredentials;
 #[cfg(all(target_arch = "wasm32", feature = "wasm-web"))]
 use firebase_core::platform::environment;
 use firebase_core::platform::runtime;
+use firebase_core::platform::token::TokenProviderArc;
 use firebase_installations::get_installations;
 use log::debug;
 
@@ -100,7 +100,8 @@ struct PerformanceInner {
     traces: Mutex<HashMap<String, PerformanceTrace>>,
     network_requests: Mutex<Vec<NetworkRequestRecord>>,
     settings: RwLock<PerformanceRuntimeSettings>,
-    app_check: StdMutex<Option<FirebaseAppCheckInternal>>,
+    credentials: AppCredentials,
+    app_check_override: StdMutex<Option<TokenProviderArc>>,
     auth: StdMutex<Option<AuthContext>>,
     trace_store: TraceStoreHandle,
     transport: StdMutex<Option<Arc<TransportController>>>,
@@ -222,16 +223,22 @@ enum NetworkLifecycle {
     Completed,
 }
 
+/// Reads the signed-in user's id when a trace is recorded.
+///
+/// Performance does not need Firebase Auth, it needs a user id, so it takes the id as a callback:
+/// `perf.attach_user_id_source(Arc::new(move || auth.current_user().map(|u| u.uid().to_string())))`.
+pub type UserIdSource = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 #[derive(Clone)]
 enum AuthContext {
-    Firebase(FirebaseAuth),
+    Source(UserIdSource),
     Static(String),
 }
 
 impl AuthContext {
     fn current_uid(&self) -> Option<String> {
         match self {
-            AuthContext::Firebase(auth) => auth.current_user().map(|user| user.uid().to_string()),
+            AuthContext::Source(source) => source().filter(|uid| !uid.is_empty()),
             AuthContext::Static(uid) if uid.is_empty() => None,
             AuthContext::Static(uid) => Some(uid.clone()),
         }
@@ -243,12 +250,14 @@ impl Performance {
         let resolved = PerformanceRuntimeSettings::resolve(&app, settings.as_ref());
         let trace_store = create_trace_store(&app);
         let transport_options = Arc::new(RwLock::new(TransportOptions::default()));
+        let credentials = AppCredentials::for_app(&app);
         let inner = PerformanceInner {
             app,
             traces: Mutex::new(HashMap::new()),
             network_requests: Mutex::new(Vec::new()),
             settings: RwLock::new(resolved),
-            app_check: StdMutex::new(None),
+            credentials,
+            app_check_override: StdMutex::new(None),
             auth: StdMutex::new(None),
             trace_store,
             transport: StdMutex::new(None),
@@ -319,24 +328,26 @@ impl Performance {
         self.settings().instrumentation_enabled()
     }
 
-    /// Associates an App Check instance whose tokens will be attached to
-    /// outgoing network trace records.
-    pub fn attach_app_check(&self, app_check: FirebaseAppCheckInternal) {
-        let mut guard = self.inner.app_check.lock().expect("app_check lock");
-        *guard = Some(app_check);
+    /// Overrides where the App Check token attached to network traces comes from.
+    ///
+    /// Initialising App Check is enough on its own — the token is read from the app's component
+    /// container — so this is only for wiring a source of your own.
+    pub fn attach_app_check(&self, provider: TokenProviderArc) {
+        let mut guard = self.inner.app_check_override.lock().expect("app_check lock");
+        *guard = Some(provider);
     }
 
-    /// Removes any App Check integration.
+    /// Drops an override installed by [`attach_app_check`](Self::attach_app_check), returning to
+    /// the app's own App Check token.
     pub fn clear_app_check(&self) {
-        let mut guard = self.inner.app_check.lock().expect("app_check lock");
+        let mut guard = self.inner.app_check_override.lock().expect("app_check lock");
         guard.take();
     }
 
-    /// Associates a [`FirebaseAuth`] instance so recorded traces can capture
-    /// the active user ID (mirrors the JS SDK's `setUserId`).
-    pub fn attach_auth(&self, auth: FirebaseAuth) {
+    /// Supplies the signed-in user's id, so recorded traces can carry it (the JS SDK's `setUserId`).
+    pub fn attach_user_id_source(&self, source: UserIdSource) {
         let mut guard = self.inner.auth.lock().expect("auth lock");
-        *guard = Some(AuthContext::Firebase(auth));
+        *guard = Some(AuthContext::Source(source));
     }
 
     /// Manually overrides the authenticated user ID attribute that will be
@@ -529,10 +540,16 @@ impl Performance {
     }
 
     async fn app_check_token(&self) -> Option<String> {
-        let provider = self.inner.app_check.lock().ok().and_then(|guard| guard.clone())?;
-        match provider.get_token(false).await {
-            Ok(result) => normalize_token_result(result),
-            Err(err) => cached_token_from_error(&err),
+        let provider = self
+            .inner
+            .app_check_override
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+
+        match provider {
+            Some(provider) => provider.get_token().await.ok().flatten().filter(|t| !t.is_empty()),
+            None => self.inner.credentials.app_check_token().await.ok().flatten(),
         }
     }
 }
@@ -541,24 +558,6 @@ impl fmt::Debug for Performance {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Performance").field("app", self.app()).finish()
     }
-}
-
-fn normalize_token_result(result: AppCheckTokenResult) -> Option<String> {
-    if result.token.is_empty() {
-        None
-    } else {
-        Some(result.token)
-    }
-}
-
-fn cached_token_from_error(error: &AppCheckTokenError) -> Option<String> {
-    error.cached_token().and_then(|token| {
-        if token.token.is_empty() {
-            None
-        } else {
-            Some(token.token.clone())
-        }
-    })
 }
 
 impl TraceHandle {
@@ -850,21 +849,18 @@ pub fn is_supported() -> bool {
     }
 }
 
-static PERFORMANCE_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
-    Component::new(PERFORMANCE_COMPONENT_NAME, Arc::new(performance_factory), ComponentType::Public)
-        .with_instantiation_mode(InstantiationMode::Lazy)
-});
+impl Service for Performance {
+    const NAME: &'static str = PERFORMANCE_COMPONENT_NAME;
+}
 
 fn performance_factory(
-    container: &firebase_core::component::ComponentContainer,
+    container: &ComponentContainer,
     options: InstanceFactoryOptions,
-) -> Result<DynService, ComponentError> {
-    let app = container
-        .root_service::<FirebaseApp>()
-        .ok_or_else(|| ComponentError::InitializationFailed {
-            name: PERFORMANCE_COMPONENT_NAME.to_string(),
-            reason: "Firebase app not attached to component container".to_string(),
-        })?;
+) -> Result<Arc<Performance>, ComponentError> {
+    let app = container.app().ok_or_else(|| ComponentError::InitializationFailed {
+        name: PERFORMANCE_COMPONENT_NAME.to_string(),
+        reason: "Firebase app not attached to component container".to_string(),
+    })?;
 
     let settings = match options.options {
         Value::Null => None,
@@ -877,11 +873,11 @@ fn performance_factory(
     };
 
     let performance = Performance::new((*app).clone(), settings);
-    Ok(Arc::new(performance) as DynService)
+    Ok(Arc::new(performance))
 }
 
 fn ensure_registered() {
-    let _ = app::register_component(PERFORMANCE_COMPONENT.clone());
+    app::register_service::<Performance, _>(performance_factory);
 }
 
 /// Registers the performance component in the shared container (normally invoked automatically).
@@ -897,20 +893,18 @@ pub async fn initialize_performance(
     settings: Option<PerformanceSettings>,
 ) -> PerformanceResult<Arc<Performance>> {
     ensure_registered();
-    let provider = app::get_provider(&app, PERFORMANCE_COMPONENT_NAME);
+    let provider = app::service_provider::<Performance>(&app);
     let options_value = match settings {
         Some(settings) => serde_json::to_value(&settings)
             .map_err(|err| internal_error(format!("failed to serialize settings: {err}")))?,
         None => Value::Null,
     };
-    provider
-        .initialize::<Performance>(options_value, None)
-        .map_err(|err| match err {
-            ComponentError::InstanceAlreadyInitialized { .. } => {
-                invalid_argument("Performance has already been initialized for this app")
-            }
-            other => internal_error(other.to_string()),
-        })
+    provider.initialize(options_value, None).map_err(|err| match err {
+        ComponentError::InstanceAlreadyInitialized { .. } => {
+            invalid_argument("Performance has already been initialized for this app")
+        }
+        other => internal_error(other.to_string()),
+    })
 }
 
 /// Resolves (or lazily creates) the [`Performance`] instance for the provided
@@ -924,15 +918,15 @@ pub async fn get_performance(app: Option<FirebaseApp>) -> PerformanceResult<Arc<
             .map_err(|err| internal_error(err.to_string()))?,
     };
 
-    let provider = app::get_provider(&app, PERFORMANCE_COMPONENT_NAME);
-    if let Some(perf) = provider.get_immediate::<Performance>() {
+    let provider = app::service_provider::<Performance>(&app);
+    if let Some(perf) = provider.get() {
         return Ok(perf);
     }
 
-    match provider.initialize::<Performance>(Value::Null, None) {
+    match provider.initialize(Value::Null, None) {
         Ok(perf) => Ok(perf),
         Err(ComponentError::InstanceUnavailable { .. }) => provider
-            .get_immediate::<Performance>()
+            .get()
             .ok_or_else(|| internal_error("Performance component not available")),
         Err(err) => Err(internal_error(err.to_string())),
     }
@@ -1044,12 +1038,13 @@ mod tests {
         }
     }
 
-    async fn attach_app_check(performance: &Performance, app: &FirebaseApp) {
+    /// Initialising App Check is all the wiring there is: Performance reads the token from the
+    /// app's component container.
+    async fn attach_app_check(_performance: &Performance, app: &FirebaseApp) {
         let options = AppCheckOptions::new(Arc::new(StaticAppCheckProvider));
-        let app_check = initialize_app_check(Some(app.clone()), options)
+        initialize_app_check(Some(app.clone()), options)
             .await
             .expect("initialize app check");
-        performance.attach_app_check(FirebaseAppCheckInternal::new(app_check));
     }
 
     #[tokio::test(flavor = "current_thread")]

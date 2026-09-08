@@ -19,8 +19,8 @@ use crate::rest::{RegisteredInstallation, RestClient};
 use crate::types::{InstallationEntryData, InstallationToken};
 use firebase_core::app;
 use firebase_core::app::FirebaseApp;
-use firebase_core::component::types::{ComponentError, DynService, InstanceFactoryOptions, InstantiationMode};
-use firebase_core::component::{Component, ComponentType};
+use firebase_core::component::types::{ComponentError, ComponentType, InstanceFactoryOptions};
+use firebase_core::component::{ComponentContainer, Service};
 use firebase_core::platform::runtime;
 
 #[derive(Clone, Debug)]
@@ -468,44 +468,35 @@ fn generate_fid() -> InstallationsResult<String> {
     Err(internal_error("Failed to generate a valid Firebase Installation ID"))
 }
 
-static INSTALLATIONS_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
-    Component::new(
-        INSTALLATIONS_COMPONENT_NAME,
-        Arc::new(installations_factory),
-        ComponentType::Public,
-    )
-    .with_instantiation_mode(InstantiationMode::Lazy)
-});
+impl Service for Installations {
+    const NAME: &'static str = INSTALLATIONS_COMPONENT_NAME;
+}
 
-static INSTALLATIONS_INTERNAL_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
-    Component::new(
-        INSTALLATIONS_INTERNAL_COMPONENT_NAME,
-        Arc::new(installations_internal_factory),
-        ComponentType::Private,
-    )
-    .with_instantiation_mode(InstantiationMode::Lazy)
-});
+/// The private face other products (Messaging, Remote Config, Performance) resolve the
+/// installation id and its token through.
+impl Service for InstallationsInternal {
+    const NAME: &'static str = INSTALLATIONS_INTERNAL_COMPONENT_NAME;
+    const COMPONENT_TYPE: ComponentType = ComponentType::Private;
+}
 
 fn installations_factory(
-    container: &firebase_core::component::ComponentContainer,
+    container: &ComponentContainer,
     _options: InstanceFactoryOptions,
-) -> Result<DynService, ComponentError> {
-    let app = container
-        .root_service::<FirebaseApp>()
-        .ok_or_else(|| ComponentError::InitializationFailed {
-            name: INSTALLATIONS_COMPONENT_NAME.to_string(),
-            reason: "Firebase app not attached to component container".to_string(),
-        })?;
+) -> Result<Arc<Installations>, ComponentError> {
+    let app = container.app().ok_or_else(|| ComponentError::InitializationFailed {
+        name: INSTALLATIONS_COMPONENT_NAME.to_string(),
+        reason: "Firebase app not attached to component container".to_string(),
+    })?;
     let installations = Installations::new((*app).clone()).map_err(|err| ComponentError::InitializationFailed {
         name: INSTALLATIONS_COMPONENT_NAME.to_string(),
         reason: err.to_string(),
     })?;
-    Ok(Arc::new(installations) as DynService)
+    Ok(Arc::new(installations))
 }
 
 fn ensure_registered() {
-    let _ = app::register_component(INSTALLATIONS_COMPONENT.clone());
-    let _ = app::register_component(INSTALLATIONS_INTERNAL_COMPONENT.clone());
+    app::register_service::<Installations, _>(installations_factory);
+    app::register_service::<InstallationsInternal, _>(installations_internal_factory);
 }
 
 pub fn register_installations_component() {
@@ -535,8 +526,8 @@ pub fn get_installations(app: Option<FirebaseApp>) -> InstallationsResult<Arc<In
         return Ok(service);
     }
 
-    let provider = app::get_provider(&app, INSTALLATIONS_COMPONENT_NAME);
-    if let Some(installations) = provider.get_immediate::<Installations>() {
+    let provider = app::service_provider::<Installations>(&app);
+    if let Some(installations) = provider.get() {
         INSTALLATIONS_CACHE
             .lock()
             .unwrap()
@@ -544,7 +535,7 @@ pub fn get_installations(app: Option<FirebaseApp>) -> InstallationsResult<Arc<In
         return Ok(installations);
     }
 
-    match provider.initialize::<Installations>(serde_json::Value::Null, None) {
+    match provider.initialize(serde_json::Value::Null, None) {
         Ok(instance) => {
             INSTALLATIONS_CACHE
                 .lock()
@@ -553,7 +544,7 @@ pub fn get_installations(app: Option<FirebaseApp>) -> InstallationsResult<Arc<In
             Ok(instance)
         }
         Err(firebase_core::component::types::ComponentError::InstanceUnavailable { .. }) => {
-            if let Some(instance) = provider.get_immediate::<Installations>() {
+            if let Some(instance) = provider.get() {
                 INSTALLATIONS_CACHE
                     .lock()
                     .unwrap()
@@ -598,30 +589,28 @@ pub fn get_installations_internal(app: Option<FirebaseApp>) -> InstallationsResu
         }
     };
 
-    let provider = app::get_provider(&app, INSTALLATIONS_INTERNAL_COMPONENT_NAME);
-    if let Some(internal) = provider.get_immediate::<InstallationsInternal>() {
+    let provider = app::service_provider::<InstallationsInternal>(&app);
+    if let Some(internal) = provider.get() {
         return Ok(internal);
     }
 
-    match provider.initialize::<InstallationsInternal>(serde_json::Value::Null, None) {
+    match provider.initialize(serde_json::Value::Null, None) {
         Ok(instance) => Ok(instance),
         Err(firebase_core::component::types::ComponentError::InstanceUnavailable { .. }) => provider
-            .get_immediate::<InstallationsInternal>()
+            .get()
             .ok_or_else(|| internal_error("Installations internal component unavailable")),
         Err(err) => Err(internal_error(err.to_string())),
     }
 }
 
 fn installations_internal_factory(
-    container: &firebase_core::component::ComponentContainer,
+    container: &ComponentContainer,
     _options: InstanceFactoryOptions,
-) -> Result<DynService, ComponentError> {
-    let app = container
-        .root_service::<FirebaseApp>()
-        .ok_or_else(|| ComponentError::InitializationFailed {
-            name: INSTALLATIONS_INTERNAL_COMPONENT_NAME.to_string(),
-            reason: "Firebase app not attached to component container".to_string(),
-        })?;
+) -> Result<Arc<InstallationsInternal>, ComponentError> {
+    let app = container.app().ok_or_else(|| ComponentError::InitializationFailed {
+        name: INSTALLATIONS_INTERNAL_COMPONENT_NAME.to_string(),
+        reason: "Firebase app not attached to component container".to_string(),
+    })?;
 
     let installations =
         get_installations(Some((*app).clone())).map_err(|err| ComponentError::InitializationFailed {
@@ -631,7 +620,7 @@ fn installations_internal_factory(
 
     let internal = InstallationsInternal { installations };
 
-    Ok(Arc::new(internal) as DynService)
+    Ok(Arc::new(internal))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

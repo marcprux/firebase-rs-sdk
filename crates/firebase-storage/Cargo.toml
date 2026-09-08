@@ -12,13 +12,11 @@ categories = ["api-bindings", "web-programming"]
 
 [features]
 default = []
-wasm-web = ["firebase-core/wasm-web", "firebase-auth/wasm-web", "firebase-app-check/wasm-web", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys"]
-experimental-indexed-db = ["firebase-core/experimental-indexed-db", "firebase-auth/experimental-indexed-db", "firebase-app-check/experimental-indexed-db"]
+wasm-web = ["firebase-core/wasm-web", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys"]
+experimental-indexed-db = ["firebase-core/experimental-indexed-db"]
 
 [dependencies]
 firebase-core.workspace = true
-firebase-auth = { path = "../firebase-auth", version = "1.34.1" }
-firebase-app-check = { path = "../firebase-app-check", version = "1.34.1" }
 base64.workspace = true
 bytes.workspace = true
 futures.workspace = true
@@ -33,14 +31,18 @@ wasm-bindgen-futures = { workspace = true, optional = true }
 web-sys = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Only the streaming download talks to reqwest directly; everything else goes through
+# `firebase_core::platform::http`.
 reqwest.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-reqwest = { version = "0.11", default-features = false, features = ["json"] }
 
 [dev-dependencies]
+# Credentials arrive through the component container, so the producers are needed only to
+# prove that end of the wiring in tests.
+firebase-auth = { path = "../firebase-auth", version = "1.34.1" }
+firebase-app-check = { path = "../firebase-app-check", version = "1.34.1", features = ["test-support"] }
 firebase-core = { workspace = true, features = ["test-support"] }
 
 # httpmock and the multi-threaded runtime are native-only; the wasm test runner needs neither, and

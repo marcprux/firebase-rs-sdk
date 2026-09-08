@@ -1,4 +1,4 @@
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::constants::FUNCTIONS_COMPONENT_NAME;
@@ -7,8 +7,8 @@ use crate::error::{internal_error, invalid_argument, FunctionsResult};
 use crate::transport::{invoke_callable_async, CallableRequest};
 use firebase_core::app;
 use firebase_core::app::FirebaseApp;
-use firebase_core::component::types::{ComponentError, DynService, InstanceFactoryOptions, InstantiationMode};
-use firebase_core::component::{Component, ComponentType};
+use firebase_core::component::types::{ComponentError, InstanceFactoryOptions};
+use firebase_core::component::{ComponentContainer, Service};
 use serde_json::{json, Value as JsonValue};
 use url::Url;
 
@@ -549,30 +549,29 @@ impl Default for Endpoint {
     }
 }
 
-static FUNCTIONS_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
-    Component::new(FUNCTIONS_COMPONENT_NAME, Arc::new(functions_factory), ComponentType::Public)
-        .with_instantiation_mode(InstantiationMode::Lazy)
-        .with_multiple_instances(true)
-});
+/// One instance per region or custom domain: `getFunctions(app, "europe-west1")` is a second
+/// service on the same app.
+impl Service for Functions {
+    const NAME: &'static str = FUNCTIONS_COMPONENT_NAME;
+    const MULTIPLE_INSTANCES: bool = true;
+}
 
 fn functions_factory(
-    container: &firebase_core::component::ComponentContainer,
+    container: &ComponentContainer,
     options: InstanceFactoryOptions,
-) -> Result<DynService, ComponentError> {
-    let app = container
-        .root_service::<FirebaseApp>()
-        .ok_or_else(|| ComponentError::InitializationFailed {
-            name: FUNCTIONS_COMPONENT_NAME.to_string(),
-            reason: "Firebase app not attached to component container".to_string(),
-        })?;
+) -> Result<Arc<Functions>, ComponentError> {
+    let app = container.app().ok_or_else(|| ComponentError::InitializationFailed {
+        name: FUNCTIONS_COMPONENT_NAME.to_string(),
+        reason: "Firebase app not attached to component container".to_string(),
+    })?;
 
     let endpoint = Endpoint::new(options.instance_identifier.clone());
     let functions = Functions::new((*app).clone(), endpoint);
-    Ok(Arc::new(functions) as DynService)
+    Ok(Arc::new(functions))
 }
 
 fn ensure_registered() {
-    let _ = app::register_component(FUNCTIONS_COMPONENT.clone());
+    app::register_service::<Functions, _>(functions_factory);
 }
 
 /// Registers the Functions component with the global app container.
@@ -600,14 +599,14 @@ pub async fn get_functions(
             .map_err(|err| internal_error(err.to_string()))?,
     };
 
-    let provider = app::get_provider(&app, FUNCTIONS_COMPONENT_NAME);
+    let provider = app::service_provider::<Functions>(&app);
     if let Some(identifier) = region_or_domain {
         provider
-            .initialize::<Functions>(serde_json::Value::Null, Some(identifier))
+            .initialize(serde_json::Value::Null, Some(identifier))
             .map_err(|err| internal_error(err.to_string()))
     } else {
         provider
-            .get_immediate::<Functions>()
+            .get()
             .ok_or_else(|| internal_error("Functions component not available"))
     }
 }

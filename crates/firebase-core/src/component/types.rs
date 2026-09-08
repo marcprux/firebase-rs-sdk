@@ -42,12 +42,33 @@ pub type OnInstanceCreatedCallback = Arc<dyn Fn(&ComponentContainer, &str, &DynS
 
 #[derive(Debug)]
 pub enum ComponentError {
-    MismatchingComponent { expected: String, found: String },
-    ComponentAlreadyProvided { name: String },
-    ComponentNotRegistered { name: String },
-    InstanceAlreadyInitialized { name: String, identifier: String },
-    InitializationFailed { name: String, reason: String },
-    InstanceUnavailable { name: String },
+    MismatchingComponent {
+        expected: String,
+        found: String,
+    },
+    ComponentAlreadyProvided {
+        name: String,
+    },
+    ComponentNotRegistered {
+        name: String,
+    },
+    InstanceAlreadyInitialized {
+        name: String,
+        identifier: String,
+    },
+    InitializationFailed {
+        name: String,
+        reason: String,
+    },
+    InstanceUnavailable {
+        name: String,
+    },
+    /// Two crates disagree about which Rust type a component name holds.
+    MismatchingServiceType {
+        name: String,
+        expected: String,
+        found: String,
+    },
 }
 
 impl fmt::Display for ComponentError {
@@ -70,6 +91,9 @@ impl fmt::Display for ComponentError {
             }
             ComponentError::InstanceUnavailable { name } => {
                 write!(f, "Service {name} is not available")
+            }
+            ComponentError::MismatchingServiceType { name, expected, found } => {
+                write!(f, "Component {name} holds a {found}, but was looked up as a {expected}")
             }
         }
     }

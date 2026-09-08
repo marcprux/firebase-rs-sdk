@@ -39,6 +39,13 @@ pub trait TokenProvider: Send + Sync + 'static {
     /// The current token, or `None` when there is nothing to send (no user, no App Check).
     async fn get_token(&self) -> Result<Option<String>, TokenError>;
 
+    /// A single-use token, for the callers that ask for one (callable Functions request a
+    /// limited-use App Check token). Providers with no separate limited-use path serve the shared
+    /// token instead, which is what the JS SDK does.
+    async fn get_limited_use_token(&self) -> Result<Option<String>, TokenError> {
+        self.get_token().await
+    }
+
     /// Marks the cached token as stale, so the next call fetches a fresh one. Consumers call this
     /// after a backend rejects a request as unauthenticated.
     fn invalidate_token(&self);

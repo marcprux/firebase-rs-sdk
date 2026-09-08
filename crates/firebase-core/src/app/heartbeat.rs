@@ -27,6 +27,13 @@ const MAX_NUM_STORED_HEARTBEATS: usize = 30;
 #[allow(dead_code)]
 const MAX_HEADER_BYTES: usize = 1024;
 
+/// The heartbeat service every app carries: it records one "this SDK was used today" entry per
+/// day, which the platform logger sends along with requests.
+impl crate::component::Service for HeartbeatServiceImpl {
+    const NAME: &'static str = "heartbeat";
+    const COMPONENT_TYPE: crate::component::ComponentType = crate::component::ComponentType::Private;
+}
+
 pub struct HeartbeatServiceImpl {
     app: FirebaseApp,
     storage: Arc<dyn HeartbeatStorage>,
@@ -64,8 +71,7 @@ impl HeartbeatServiceImpl {
 
     fn platform_agent(container: &ComponentContainer) -> Option<String> {
         container
-            .get_provider("platform-logger")
-            .get_immediate::<PlatformLoggerServiceImpl>()
+            .get::<PlatformLoggerServiceImpl>()
             .map(|service| service.platform_info_string())
             .filter(|s| !s.is_empty())
     }

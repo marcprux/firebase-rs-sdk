@@ -12,6 +12,7 @@ pub mod jwt;
 pub mod obj;
 pub mod runtime;
 pub mod sha1;
+pub mod status;
 pub mod subscribe;
 
 pub use assert::{assert, assertion_error};
@@ -37,4 +38,5 @@ pub use jwt::{
 pub use obj::{deep_equal, is_empty, map_values};
 pub use runtime::block_on;
 pub use sha1::{sha1_digest, sha1_hex};
+pub use status::{GoogleApiError, StatusCode};
 pub use subscribe::{PartialObserver, Unsubscribe};

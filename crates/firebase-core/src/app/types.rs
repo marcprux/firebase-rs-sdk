@@ -444,3 +444,8 @@ mod tests {
         }
     }
 }
+
+/// The app is itself a component: a factory can ask its container which app it belongs to.
+impl crate::component::Service for FirebaseApp {
+    const NAME: &'static str = "app";
+}

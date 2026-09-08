@@ -9,9 +9,11 @@ each module against real Firebase backends (see [Coverage](#coverage) and
 
 ## Layout
 
-The SDK is a cargo workspace: `firebase-core` holds what every product needs (the app lifecycle and
-its component container, credentials, platform primitives, logging), and each Firebase product is a
-crate of its own that depends on core and nothing else it does not use.
+The SDK is a cargo workspace: `firebase-core` holds what every product needs — the app lifecycle
+and its typed service registry, the credential layer (the user's ID token and the App Check token,
+resolved from the app per request), the shared HTTP client, the canonical error statuses, logging —
+and each Firebase product is a crate of its own that depends on core and nothing else it does not
+use.
 
 | Crate | Module path | Feature |
 |---|---|---|
@@ -33,7 +35,7 @@ crate of its own that depends on core and nothing else it does not use.
 `firebase-rs-sdk` is the façade: it re-exports every product, all of them enabled by default, so
 `firebase-rs-sdk = "1"` behaves as it always has. Name the products you use to skip the rest —
 a Remote Config or Auth build then pulls no gRPC stack, no websocket stack and no Firestore proto
-bindings (168 crates down to 122):
+bindings (233 crates down to about 161):
 
 ```toml
 [dependencies]

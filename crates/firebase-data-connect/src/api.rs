@@ -15,13 +15,12 @@ use crate::error::{internal_error, DataConnectError, DataConnectErrorCode, DataC
 use crate::mutation::MutationManager;
 use crate::query::{cache_from_serialized, QueryManager, QuerySubscriptionHandle, QuerySubscriptionHandlers};
 use crate::reference::{MutationRef, OperationRef, OperationType, QueryRef, QueryResult, SerializedQuerySnapshot};
-use crate::transport::{AppCheckHeaders, CallerSdkType, DataConnectTransport, RequestTokenProvider, RestTransport};
-use firebase_app_check::FirebaseAppCheckInternal;
-use firebase_auth::Auth;
+use crate::transport::{CallerSdkType, DataConnectTransport, RestTransport};
 use firebase_core::app;
 use firebase_core::app::FirebaseApp;
-use firebase_core::component::types::{ComponentError, DynService, InstanceFactoryOptions, InstantiationMode};
-use firebase_core::component::{Component, ComponentType, Provider};
+use firebase_core::component::types::{ComponentError, InstanceFactoryOptions};
+use firebase_core::component::{ComponentContainer, Service};
+use firebase_core::platform::credentials::AppCredentials;
 
 const EMULATOR_ENV: &str = "FIREBASE_DATA_CONNECT_EMULATOR_HOST";
 
@@ -63,8 +62,7 @@ impl fmt::Debug for DataConnectService {
 struct DataConnectInner {
     app: FirebaseApp,
     options: DataConnectOptions,
-    auth_provider: Provider,
-    app_check_provider: Provider,
+    credentials: AppCredentials,
     transport: OnceCell<Arc<dyn DataConnectTransport>>,
     mutation_manager: OnceCell<MutationManager>,
     transport_override: Mutex<Option<TransportOptions>>,
@@ -76,16 +74,14 @@ impl DataConnectService {
     fn new(
         app: FirebaseApp,
         options: DataConnectOptions,
-        auth_provider: Provider,
-        app_check_provider: Provider,
+        credentials: AppCredentials,
         env_override: Option<TransportOptions>,
     ) -> Self {
         Self {
             inner: Arc::new(DataConnectInner {
                 app,
                 options,
-                auth_provider,
-                app_check_provider,
+                credentials,
                 transport: OnceCell::new(),
                 mutation_manager: OnceCell::new(),
                 transport_override: Mutex::new(env_override),
@@ -156,16 +152,12 @@ impl DataConnectService {
         self.inner
             .transport
             .get_or_try_init(|| async {
-                let token_provider = Arc::new(TokenBroker::new(
-                    self.inner.auth_provider.clone(),
-                    self.inner.app_check_provider.clone(),
-                ));
                 let firebase_options = self.inner.app.options();
                 let transport = RestTransport::new(
                     self.inner.options.clone(),
                     firebase_options.api_key,
                     firebase_options.app_id,
-                    token_provider,
+                    self.inner.credentials.clone(),
                 )?;
                 if let Some(override_options) = self.inner.transport_override.lock().unwrap().clone() {
                     transport.use_emulator(override_options);
@@ -366,18 +358,14 @@ pub fn register_data_connect_component() {
 
 /// The Data Connect component, built once and registered on every call (registration is
 /// idempotent, and re-running it heals an app that missed it).
-static DATA_CONNECT_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
-    Component::new(
-        DATA_CONNECT_COMPONENT_NAME,
-        Arc::new(data_connect_factory),
-        ComponentType::Public,
-    )
-    .with_instantiation_mode(InstantiationMode::Lazy)
-    .with_multiple_instances(true)
-});
+/// One instance per connector: an app can talk to several Data Connect connectors at once.
+impl Service for DataConnectService {
+    const NAME: &'static str = DATA_CONNECT_COMPONENT_NAME;
+    const MULTIPLE_INSTANCES: bool = true;
+}
 
 fn ensure_registered() {
-    let _ = app::register_component(DATA_CONNECT_COMPONENT.clone());
+    app::register_service::<DataConnectService, _>(data_connect_factory);
 }
 
 /// Guarantees `app` can resolve Data Connect.
@@ -387,25 +375,19 @@ fn ensure_registered() {
 /// app's container as well when it is missing.
 fn ensure_registered_for(app: &FirebaseApp) {
     ensure_registered();
-    if !app
-        .container()
-        .get_provider(DATA_CONNECT_COMPONENT_NAME)
-        .is_component_set()
-    {
-        app::add_component(app, &DATA_CONNECT_COMPONENT);
+    if !app.container().service::<DataConnectService>().is_registered() {
+        app::attach_service::<DataConnectService>(app);
     }
 }
 
 fn data_connect_factory(
-    container: &firebase_core::component::ComponentContainer,
+    container: &ComponentContainer,
     options: InstanceFactoryOptions,
-) -> Result<DynService, ComponentError> {
-    let app = container
-        .root_service::<FirebaseApp>()
-        .ok_or_else(|| ComponentError::InitializationFailed {
-            name: DATA_CONNECT_COMPONENT_NAME.to_string(),
-            reason: "Firebase app not attached to component container".to_string(),
-        })?;
+) -> Result<Arc<DataConnectService>, ComponentError> {
+    let app = container.app().ok_or_else(|| ComponentError::InitializationFailed {
+        name: DATA_CONNECT_COMPONENT_NAME.to_string(),
+        reason: "Firebase app not attached to component container".to_string(),
+    })?;
 
     let connector_config = if !options.options.is_null() {
         serde_json::from_value::<ConnectorConfig>(options.options.clone()).map_err(|err| {
@@ -446,16 +428,13 @@ fn data_connect_factory(
         reason: err.to_string(),
     })?;
 
-    let auth_provider = container.get_provider("auth-internal");
-    let app_check_provider = container.get_provider("app-check-internal");
     let service = Arc::new(DataConnectService::new(
         (*app).clone(),
         options,
-        auth_provider,
-        app_check_provider,
+        AppCredentials::for_app(&app),
         env_override,
     ));
-    Ok(service as DynService)
+    Ok(service)
 }
 
 fn emulator_override_from_env() -> DataConnectResult<Option<TransportOptions>> {
@@ -484,93 +463,27 @@ pub async fn get_data_connect_service(
     }
 
     ensure_registered_for(&app);
-    let provider = app::get_provider(&app, DATA_CONNECT_COMPONENT_NAME);
+    let provider = app::service_provider::<DataConnectService>(&app);
     let identifier = config.identifier();
-    if let Some(service) = provider
-        .get_immediate_with_options::<DataConnectService>(Some(&identifier), true)
-        .unwrap_or(None)
-    {
+    if let Some(service) = provider.get_instance(Some(&identifier)) {
         DATA_CONNECT_CACHE.lock().unwrap().insert(cache_key, service.clone());
         return Ok(service);
     }
 
     let options_value = serde_json::to_value(&config).map_err(|err| internal_error(err.to_string()))?;
-    match provider.initialize::<DataConnectService>(options_value, Some(&identifier)) {
+    match provider.initialize(options_value, Some(&identifier)) {
         Ok(service) => {
             DATA_CONNECT_CACHE.lock().unwrap().insert(cache_key, service.clone());
             Ok(service)
         }
         Err(ComponentError::InstanceUnavailable { .. }) => provider
-            .get_immediate_with_options::<DataConnectService>(Some(&identifier), true)
-            .unwrap_or(None)
+            .get_instance(Some(&identifier))
             .ok_or_else(|| internal_error("Data Connect instance unavailable"))
             .map(|service| {
                 DATA_CONNECT_CACHE.lock().unwrap().insert(cache_key, service.clone());
                 service
             }),
         Err(err) => Err(internal_error(err.to_string())),
-    }
-}
-
-struct TokenBroker {
-    auth_provider: Provider,
-    app_check_provider: Provider,
-}
-
-impl TokenBroker {
-    fn new(auth_provider: Provider, app_check_provider: Provider) -> Self {
-        Self {
-            auth_provider,
-            app_check_provider,
-        }
-    }
-}
-
-#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-impl RequestTokenProvider for TokenBroker {
-    async fn auth_token(&self) -> DataConnectResult<Option<String>> {
-        let auth = match self.auth_provider.get_immediate_with_options::<Auth>(None, true) {
-            Ok(Some(auth)) => auth,
-            Ok(None) => return Ok(None),
-            Err(err) => return Err(internal_error(format!("failed to resolve auth provider: {err}"))),
-        };
-
-        auth.get_token(false)
-            .await
-            .map_err(|err| internal_error(err.to_string()))
-    }
-
-    async fn app_check_headers(&self) -> DataConnectResult<Option<AppCheckHeaders>> {
-        let app_check = match self
-            .app_check_provider
-            .get_immediate_with_options::<FirebaseAppCheckInternal>(None, true)
-        {
-            Ok(Some(app_check)) => app_check,
-            Ok(None) => return Ok(None),
-            Err(err) => return Err(internal_error(format!("failed to resolve app check provider: {err}"))),
-        };
-
-        let token = match app_check.get_token(false).await {
-            Ok(result) => result.token,
-            Err(err) => {
-                if let Some(cached) = err.cached_token() {
-                    cached.token.clone()
-                } else {
-                    return Err(internal_error(format!("failed to obtain App Check token: {err}")));
-                }
-            }
-        };
-
-        if token.is_empty() {
-            return Ok(None);
-        }
-
-        let heartbeat = app_check
-            .heartbeat_header()
-            .await
-            .map_err(|err| internal_error(err.to_string()))?;
-        Ok(Some(AppCheckHeaders { token, heartbeat }))
     }
 }
 
