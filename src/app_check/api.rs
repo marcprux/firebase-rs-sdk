@@ -14,7 +14,7 @@ use std::sync::MutexGuard;
 use super::errors::{AppCheckError, AppCheckResult};
 use super::interop::FirebaseAppCheckInternal;
 use super::logger::LOGGER;
-use super::providers::{CustomProvider, ReCaptchaEnterpriseProvider, ReCaptchaV3Provider};
+use super::providers::{CustomProvider, DebugTokenProvider, ReCaptchaEnterpriseProvider, ReCaptchaV3Provider};
 use super::refresher::Refresher;
 use super::state;
 use super::types::{
@@ -128,7 +128,7 @@ pub async fn initialize_app_check(app: Option<FirebaseApp>, options: AppCheckOpt
         }
     };
 
-    let provider = options.provider.clone();
+    let provider = resolve_provider(options.provider.clone(), debug_token_from_env());
     let requested_auto_refresh = options
         .is_token_auto_refresh_enabled
         .unwrap_or_else(|| app.automatic_data_collection_enabled());
@@ -195,6 +195,39 @@ pub async fn initialize_app_check(app: Option<FirebaseApp>, options: AppCheckOpt
             internal,
         },
     );
+
+    // Both components are registered as `Explicit`, so nothing instantiates them on demand: other
+    // services resolve App Check through `get_immediate`, which would keep returning `None` and
+    // silently drop the token from every request. Instantiating them here is what makes the token
+    // reach Functions, Firestore and Storage, and mirrors the JS `initializeAppCheck`.
+    //
+    // Global registration only reaches apps the registry knows about, so an app built directly
+    // gets the components attached to its own container first.
+    let container = app.container();
+    if !container
+        .get_provider(super::types::APP_CHECK_COMPONENT_NAME)
+        .is_component_set()
+    {
+        crate::app::add_component(&app, &APP_CHECK_COMPONENT);
+    }
+    if !container
+        .get_provider(super::types::APP_CHECK_INTERNAL_COMPONENT_NAME)
+        .is_component_set()
+    {
+        crate::app::add_component(&app, &APP_CHECK_INTERNAL_COMPONENT);
+    }
+    if let Err(err) = container
+        .get_provider(super::types::APP_CHECK_COMPONENT_NAME)
+        .initialize::<AppCheck>(serde_json::Value::Null, None)
+    {
+        LOGGER.debug(format!("App Check component was not instantiated: {err}"));
+    }
+    if let Err(err) = container
+        .get_provider(super::types::APP_CHECK_INTERNAL_COMPONENT_NAME)
+        .initialize::<FirebaseAppCheckInternal>(serde_json::Value::Null, None)
+    {
+        LOGGER.debug(format!("App Check internal component was not instantiated: {err}"));
+    }
 
     if final_auto_refresh {
         LOGGER.debug("App Check auto-refresh enabled");
@@ -360,6 +393,49 @@ where
     Arc::new(CustomProvider::new(callback))
 }
 
+/// Creates an App Check provider that exchanges a console-registered debug token.
+///
+/// The attestation providers need a browser, so this is how a server, a command-line tool or a
+/// test obtains real App Check tokens. Register the token under App Check -> Manage debug tokens
+/// in the Firebase console. It is a credential: anyone holding it can obtain App Check tokens for
+/// the project, so keep it out of source control.
+///
+/// Setting `FIREBASE_APPCHECK_DEBUG_TOKEN` in the environment has the same effect without changing
+/// code: [`initialize_app_check`] then uses this provider whatever provider was passed, mirroring
+/// the JS SDK's debug mode.
+pub fn debug_token_provider(debug_token: impl Into<String>) -> Arc<dyn AppCheckProvider> {
+    Arc::new(DebugTokenProvider::new(debug_token.into()))
+}
+
+/// Picks the provider to attest with: a configured debug token wins over whatever the caller
+/// passed, the way the JS SDK's `FIREBASE_APPCHECK_DEBUG_TOKEN` global does. That substitution is
+/// what makes App Check usable outside a browser.
+fn resolve_provider(configured: Arc<dyn AppCheckProvider>, debug_token: Option<String>) -> Arc<dyn AppCheckProvider> {
+    match debug_token {
+        Some(token) => {
+            LOGGER.warn(
+                "FIREBASE_APPCHECK_DEBUG_TOKEN is set: App Check will exchange the debug token instead of using \
+                 the configured provider.",
+            );
+            debug_token_provider(token)
+        }
+        None => configured,
+    }
+}
+
+/// Reads the debug token from the environment, if one is configured.
+#[cfg(not(target_arch = "wasm32"))]
+fn debug_token_from_env() -> Option<String> {
+    let token = std::env::var("FIREBASE_APPCHECK_DEBUG_TOKEN").ok()?;
+    let token = token.trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn debug_token_from_env() -> Option<String> {
+    None
+}
+
 /// Creates an App Check provider backed by reCAPTCHA v3 attestation.
 ///
 /// The provider mirrors the JS SDK implementation: it renders an invisible reCAPTCHA
@@ -518,6 +594,60 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn initialization_instantiates_the_components_other_services_resolve() {
+        // Both App Check components are registered as `Explicit`, so nothing creates them on
+        // demand. Functions, Firestore and Storage look the internal one up with `get_immediate`;
+        // when it was never instantiated they silently sent every request without an App Check
+        // token, which is invisible until a backend rejects it.
+        let _guard = test_guard();
+        clear_state_for_tests();
+        clear_registry();
+
+        let app = test_app("app-check-components", true);
+        let provider = custom_provider(|| token_with_ttl("token", Duration::from_secs(600)));
+        initialize_app_check(Some(app.clone()), AppCheckOptions::new(provider))
+            .await
+            .expect("initialize app check");
+
+        let internal = app
+            .container()
+            .get_provider(super::super::types::APP_CHECK_INTERNAL_COMPONENT_NAME)
+            .get_immediate::<FirebaseAppCheckInternal>();
+        assert!(internal.is_some(), "app-check-internal must resolve after initialize_app_check");
+
+        let public = app
+            .container()
+            .get_provider(super::super::types::APP_CHECK_COMPONENT_NAME)
+            .get_immediate::<AppCheck>();
+        assert!(public.is_some(), "the public component must resolve as well");
+
+        let token = internal
+            .expect("internal")
+            .get_token(false)
+            .await
+            .expect("token through the internal component");
+        assert_eq!(token.token, "token");
+
+        delete_app(&app).await.ok();
+    }
+
+    #[test]
+    fn a_configured_debug_token_replaces_the_provider() {
+        // `FIREBASE_APPCHECK_DEBUG_TOKEN` is how App Check is used off-browser, so it has to win
+        // over whatever provider the caller configured.
+        let configured = custom_provider(|| token_with_ttl("configured", Duration::from_secs(600)));
+
+        let unchanged = resolve_provider(Arc::clone(&configured), None);
+        assert!(Arc::ptr_eq(&unchanged, &configured), "no debug token, no substitution");
+
+        let replaced = resolve_provider(Arc::clone(&configured), Some("debug-secret".into()));
+        assert!(
+            !Arc::ptr_eq(&replaced, &configured),
+            "a debug token must replace the configured provider"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

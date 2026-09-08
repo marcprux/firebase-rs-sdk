@@ -145,6 +145,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn returns_token_string() {
+        // App Check keeps its registry and state in process globals; these tests share the guard
+        // the other App Check tests use so they cannot clear each other's state.
+        let _guard = crate::app_check::test_guard();
         let provider = Arc::new(StaticTokenProvider {
             token: "app-check-123".into(),
         });
@@ -164,6 +167,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn propagates_errors() {
+        let _guard = crate::app_check::test_guard();
         let provider = Arc::new(ErrorProvider);
         let options = AppCheckOptions::new(provider);
         let app_check = initialize_app_check(Some(test_app("app-check-err")), options)

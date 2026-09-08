@@ -51,7 +51,7 @@ percentages are estimates and deliberately stricter than the ones in each module
 | auth | 80% | real (Identity Toolkit v1/v2 + securetoken) | emulator + online | email, phone, custom-token, IdP credential and MFA flows verified end to end; sessions survive a restart through a pluggable persistence backend; typed error codes; listeners; OAuth popup/redirect UI flows still delegated to the host |
 | functions | 75% | real (`cloudfunctions.net` / custom domain / emulator) | emulator + online | callable protocol with auth, App Check and FID headers, streaming callables, URL callables, timeouts |
 | remote_config | 50% | real (`firebaseremoteconfig.googleapis.com/v1`) | yes | fetch, ETag-based activate, defaults with correct value sources, custom signals, typed getters |
-| app_check | 45% | real exchange endpoint, untested | no | custom provider and refresher only on native; reCAPTCHA is wasm-only |
+| app_check | 60% | real exchange endpoint (`content-firebaseappcheck.googleapis.com/v1`) | emulator (token delivery) + online (debug-token exchange) | debug-token provider, custom provider and refresher on native; reCAPTCHA is wasm-only |
 | firestore | 60% | real REST for one-shot ops, real gRPC `Listen` for snapshots | emulator + online | CRUD, composite queries, snapshot cursors, batches, aggregates, optimistic transactions, serde structs, `on_snapshot` for documents and queries; no offline cache or local write queue |
 | database | 55% | real REST + realtime WebSocket | emulator | reads/writes/queries, server-resolved `.sv` values, compare-and-set transactions, value/child listeners over the wire protocol; query listeners re-query instead of subscribing to a filtered view |
 | messaging | 0% native / 40% wasm | real on wasm only | no | native path returns placeholder tokens; no message delivery anywhere |
@@ -186,7 +186,9 @@ percentages are estimates and deliberately stricter than the ones in each module
 | `initializeAppCheck`, `getToken`, `getLimitedUseToken`, `onTokenChanged`, `setTokenAutoRefreshEnabled` | implemented |
 | `CustomProvider` | implemented |
 | `ReCaptchaV3Provider`, `ReCaptchaEnterpriseProvider` | wasm-only |
-| Debug token provider (`exchangeDebugToken`), native persistence | missing |
+| Debug token provider (`exchangeDebugToken`) | implemented (`debug_token_provider`); `FIREBASE_APPCHECK_DEBUG_TOKEN` replaces the configured provider like the JS SDK's debug mode, which is what makes App Check usable off-browser |
+| Token delivery to other services | implemented; the token reaches callable Functions (and Firestore/Storage, which resolve it the same way), verified against the Functions emulator. Until now the App Check components were registered but never instantiated, so every request went out without a token |
+| Native persistence of cached tokens | missing |
 | C++ equivalents (`DeviceCheck`, `AppAttest`, `PlayIntegrity`) | missing |
 
 ### data_connect

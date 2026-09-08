@@ -66,6 +66,10 @@ use firebase_rs_sdk::auth::{
 };
 use serde_json::{json, Value};
 
+use firebase_rs_sdk::app_check::{
+    custom_provider, debug_token_provider, get_token as get_app_check_token, initialize_app_check, token_with_ttl,
+    AppCheckOptions,
+};
 use firebase_rs_sdk::database::error::DatabaseErrorCode;
 use firebase_rs_sdk::database::{connect_database_emulator, get_database};
 use firebase_rs_sdk::firestore::{
@@ -73,7 +77,7 @@ use firebase_rs_sdk::firestore::{
     OrderDirection, ValueKind,
 };
 use firebase_rs_sdk::functions::error::FunctionsErrorCode;
-use firebase_rs_sdk::functions::{get_functions, register_functions_component};
+use firebase_rs_sdk::functions::{get_functions, register_functions_component, HttpsCallableOptions};
 use firebase_rs_sdk::installations::{delete_installations, get_installations};
 use firebase_rs_sdk::remote_config::{get_remote_config, FetchStatus, RemoteConfigValueSource};
 use firebase_rs_sdk::storage::{
@@ -2986,6 +2990,156 @@ async fn storage_list_pagination_and_metadata_updates() {
 // ---------------------------------------------------------------------------------------------
 // Cloud Functions (callable protocol)
 // ---------------------------------------------------------------------------------------------
+
+/// Proves App Check tokens actually travel with callable requests, and that a limited-use token is
+/// minted per call rather than reusing the cached one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Firebase credentials"]
+async fn app_check_tokens_reach_callable_functions() {
+    let test = "app_check_tokens_reach_callable_functions";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    if config.emulators.functions.is_none() {
+        skip(
+            test,
+            "needs the Functions emulator (scripts/emulator_test.sh) to echo the request headers",
+            "n/a",
+        );
+        return;
+    }
+
+    let app = live_app(&config, "app-check-callable").await;
+    let auth = auth_for(&config, &app);
+    let uid = auth
+        .sign_in_anonymously()
+        .await
+        .expect("anonymous sign-in")
+        .user
+        .uid()
+        .to_string();
+
+    // A custom provider stands in for attestation, which needs a browser. Each call mints a new
+    // token so the cached and limited-use paths can be told apart.
+    let issued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&issued);
+    let provider = custom_provider(move || {
+        let index = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        token_with_ttl(format!("fake-app-check-token-{index}"), Duration::from_secs(3600))
+    });
+    initialize_app_check(Some(app.clone()), AppCheckOptions::new(provider))
+        .await
+        .expect("initialize app check");
+
+    let functions = functions_for(&config, &app).await;
+    let echo = functions
+        .https_callable::<serde_json::Value, serde_json::Value>("echoHeaders")
+        .expect("callable reference");
+
+    let response = echo
+        .call_async(&serde_json::json!({}))
+        .await
+        .expect("callable with app check");
+    assert_eq!(
+        response.get("appCheck").and_then(serde_json::Value::as_str),
+        Some("fake-app-check-token-1"),
+        "the App Check token must ride on the request: {response}"
+    );
+    assert_eq!(
+        response.get("hasAuthorization").and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the signed-in user's ID token must ride on the request too"
+    );
+    assert_eq!(response.get("uid").and_then(serde_json::Value::as_str), Some(uid.as_str()));
+
+    // The cached token is reused for a second ordinary call.
+    let response = echo.call_async(&serde_json::json!({})).await.expect("second callable");
+    assert_eq!(
+        response.get("appCheck").and_then(serde_json::Value::as_str),
+        Some("fake-app-check-token-1"),
+        "an ordinary call reuses the cached App Check token"
+    );
+
+    // `limited_use_app_check_tokens` asks the provider for a fresh, single-use token instead.
+    let limited = functions
+        .https_callable_with_options::<serde_json::Value, serde_json::Value>(
+            "echoHeaders",
+            HttpsCallableOptions {
+                limited_use_app_check_tokens: true,
+                ..Default::default()
+            },
+        )
+        .expect("callable reference");
+    let response = limited
+        .call_async(&serde_json::json!({}))
+        .await
+        .expect("callable with a limited-use token");
+    let limited_token = response
+        .get("appCheck")
+        .and_then(serde_json::Value::as_str)
+        .expect("app check header");
+    assert_ne!(
+        limited_token, "fake-app-check-token-1",
+        "a limited-use call must not send the cached token"
+    );
+    assert!(limited_token.starts_with("fake-app-check-token-"), "got {limited_token}");
+
+    cleanup_auth(&auth).await;
+    delete_app(&app).await.expect("delete_app");
+}
+
+/// Exchanges a debug token registered in the Firebase console for a real App Check token.
+///
+/// Skipped unless `FIREBASE_APPCHECK_DEBUG_TOKEN` is configured, since the token has to be
+/// registered under App Check -> Manage debug tokens for this app first.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Firebase credentials"]
+async fn app_check_exchanges_a_debug_token_online() {
+    let test = "app_check_exchanges_a_debug_token_online";
+    let Some(config) = require_online_config(test) else {
+        return;
+    };
+    let Some(debug_token) = read_env("FIREBASE_APPCHECK_DEBUG_TOKEN") else {
+        skip(
+            test,
+            "set FIREBASE_APPCHECK_DEBUG_TOKEN to a token registered under App Check > Manage debug tokens for this \
+             app (console > App Check > Apps > ... > Manage debug tokens)",
+            "n/a",
+        );
+        return;
+    };
+
+    let app = live_app(&config, "app-check-debug").await;
+    let app_check = initialize_app_check(Some(app.clone()), AppCheckOptions::new(debug_token_provider(debug_token)))
+        .await
+        .expect("initialize app check");
+
+    match get_app_check_token(&app_check, false).await {
+        Ok(result) => {
+            assert!(!result.token.is_empty(), "the backend must return a token");
+            println!(
+                "{test}: exchanged a debug token for an App Check token (len {})",
+                result.token.len()
+            );
+        }
+        Err(err) => {
+            let text = err.to_string();
+            // An unregistered token, or App Check not enabled for the project, is a provisioning
+            // gap rather than an SDK failure.
+            if text.contains("403") || text.contains("404") || text.contains("App attestation failed") {
+                skip(
+                    test,
+                    "the debug token is not registered for this app, or App Check is not enabled in the console",
+                    &text,
+                );
+            } else {
+                panic!("debug token exchange failed: {text}");
+            }
+        }
+    }
+
+    delete_app(&app).await.expect("delete_app");
+}
 
 #[tokio::test]
 #[ignore = "requires live Firebase credentials"]

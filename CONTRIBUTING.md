@@ -173,6 +173,22 @@ The harness reads the standard `FIREBASE_AUTH_EMULATOR_HOST`, `FIRESTORE_EMULATO
 `FIREBASE_DATABASE_EMULATOR_HOST`, `FIREBASE_STORAGE_EMULATOR_HOST` and
 `FIREBASE_FUNCTIONS_EMULATOR_HOST` variables, so any other way of starting the emulators works too.
 
+### App Check
+
+App Check attestation needs a browser, so tests use the debug-token flow. The emulator tests need
+nothing: they install a custom provider and check the token arrives on a callable (the `echoHeaders`
+fixture reports the headers it received). To exercise the real exchange endpoint against the online
+project, register a debug token under App Check > Apps > Manage debug tokens in the console and
+export it:
+
+```bash
+export FIREBASE_APPCHECK_DEBUG_TOKEN=<the token from the console>
+```
+
+The variable also switches any `initialize_app_check` call over to the debug provider, mirroring the
+JS SDK's debug mode. Treat it as a credential: anyone holding it can mint App Check tokens for the
+project.
+
 ### Against the online project (Installations, Remote Config)
 
 Installations and Remote Config have no emulator. They run only when credentials for a real

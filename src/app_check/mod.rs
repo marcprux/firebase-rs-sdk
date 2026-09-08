@@ -18,7 +18,7 @@ mod util;
 //pub(super) fn on_token_stored
 #[doc(inline)]
 pub use api::{
-    add_token_listener, custom_provider, get_limited_use_token, get_token, initialize_app_check,
+    add_token_listener, custom_provider, debug_token_provider, get_limited_use_token, get_token, initialize_app_check,
     recaptcha_enterprise_provider, recaptcha_v3_provider, remove_token_listener, set_token_auto_refresh_enabled,
     token_with_ttl,
 };
@@ -28,7 +28,8 @@ pub(crate) use api::{clear_registry, clear_state_for_tests, test_guard};
 
 #[doc(inline)]
 pub use client::{
-    exchange_token, get_exchange_recaptcha_enterprise_request, get_exchange_recaptcha_v3_request, ExchangeRequest,
+    exchange_token, get_exchange_debug_token_request, get_exchange_recaptcha_enterprise_request,
+    get_exchange_recaptcha_v3_request, ExchangeRequest,
 };
 
 #[cfg(test)]
@@ -42,7 +43,9 @@ pub use errors::{AppCheckError, AppCheckResult};
 pub use interop::FirebaseAppCheckInternal;
 
 #[doc(inline)]
-pub use providers::{CustomProvider, CustomProviderOptions, ReCaptchaEnterpriseProvider, ReCaptchaV3Provider};
+pub use providers::{
+    CustomProvider, CustomProviderOptions, DebugTokenProvider, ReCaptchaEnterpriseProvider, ReCaptchaV3Provider,
+};
 
 //#[cfg(feature = "firestore")]
 #[doc(inline)]

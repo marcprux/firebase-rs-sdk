@@ -11,6 +11,20 @@ exports.helloWorld = functions.https.onCall((data, context) => {
   };
 });
 
+// Reports the credential headers the callable request arrived with, so tests can prove the SDK
+// actually attaches them. The App Check token is echoed verbatim (it is a fake token minted by the
+// test); the ID token is only reported as present, never echoed.
+exports.echoHeaders = functions.https.onCall((data, context) => {
+  const headers = (context.rawRequest && context.rawRequest.headers) || {};
+  const authorization = headers["authorization"] || "";
+  return {
+    appCheck: headers["x-firebase-appcheck"] || null,
+    hasAuthorization: authorization.startsWith("Bearer ") && authorization.length > "Bearer ".length,
+    uid: context.auth ? context.auth.uid : null,
+    instanceIdToken: headers["firebase-instance-id-token"] ? true : false,
+  };
+});
+
 // Always fails with a typed error so the SDK's error mapping can be exercised.
 exports.alwaysFails = functions.https.onCall(() => {
   throw new functions.https.HttpsError("failed-precondition", "This callable always fails", {

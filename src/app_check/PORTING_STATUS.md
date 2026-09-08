@@ -5,6 +5,35 @@
 Significant parity milestones are now in place: App Check registers with the component system, background refresh follows the JS proactive-refresh heuristics (issued/expiry timestamps, jitter, exponential backoff), tokens persist across reloads on wasm targets, and storage, analytics, and other modules can request App Check tokens via the shared internal provider. ReCAPTCHA flows, debug tooling, and heartbeat integration remain unported, but the primary token lifecycle is functional and covered by tests.
 
 
+## 2026-09-08 update: App Check tokens actually reach the backend
+
+The module had no test that ever spoke to a server, and that hid a bug that made the whole feature
+a no-op:
+
+- **The components were registered but never instantiated.** Both App Check components use
+  `InstantiationMode::Explicit`, and Functions, Firestore and Storage resolve the internal one with
+  `get_immediate`, which does not create an explicit component. It therefore always returned `None`
+  and every request went out with no `X-Firebase-AppCheck` header — silently, since a missing token
+  only shows up when a backend starts enforcing App Check. `initialize_app_check` now instantiates
+  both components (and attaches them to the app's own container first, for apps the global registry
+  does not know about). Regression test:
+  `initialization_instantiates_the_components_other_services_resolve`.
+- **Debug tokens are supported** (`exchangeDebugToken`, `debug_token_provider`). Attestation needs a
+  browser, so this is the flow that works from a server, a CLI or a test. Setting
+  `FIREBASE_APPCHECK_DEBUG_TOKEN` replaces the configured provider, mirroring the JS SDK's debug
+  mode. Failures back off exactly like the reCAPTCHA providers.
+- **The exchange has HTTP coverage** at last: request shape, response and TTL parsing, and the
+  status mapping the throttling relies on, all against a local server.
+- **End-to-end proof**: `app_check_tokens_reach_callable_functions` calls a new `echoHeaders`
+  fixture on the Functions emulator and asserts the token arrives, that a second ordinary call
+  reuses the cached token, and that `limited_use_app_check_tokens` mints a fresh one instead. The
+  emulator confirms it with `"app": "VALID"` in its verification log.
+- `app_check_exchanges_a_debug_token_online` exchanges a real debug token against the production
+  endpoint; it skips with instructions unless `FIREBASE_APPCHECK_DEBUG_TOKEN` names a token
+  registered in the console.
+
+Still missing: native persistence of cached tokens, and the reCAPTCHA flows remain wasm-only.
+
 ## Implemented
 
 - **Component registration & interop** (`api.rs`, `interop.rs`)

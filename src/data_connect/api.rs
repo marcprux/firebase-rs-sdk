@@ -372,15 +372,36 @@ pub fn register_data_connect_component() {
     ensure_registered();
 }
 
-fn ensure_registered() {
-    let component = Component::new(
+/// The Data Connect component, built once and registered on every call (registration is
+/// idempotent, and re-running it heals an app that missed it).
+static DATA_CONNECT_COMPONENT: LazyLock<Component> = LazyLock::new(|| {
+    Component::new(
         DATA_CONNECT_COMPONENT_NAME,
         Arc::new(data_connect_factory),
         ComponentType::Public,
     )
     .with_instantiation_mode(InstantiationMode::Lazy)
-    .with_multiple_instances(true);
-    let _ = app::register_component(component);
+    .with_multiple_instances(true)
+});
+
+fn ensure_registered() {
+    let _ = app::register_component(DATA_CONNECT_COMPONENT.clone());
+}
+
+/// Guarantees `app` can resolve Data Connect.
+///
+/// Global registration propagates only to apps the registry knows about, which leaves out apps
+/// built directly (as tests do) or removed concurrently, so the component is attached to this
+/// app's container as well when it is missing.
+fn ensure_registered_for(app: &FirebaseApp) {
+    ensure_registered();
+    if !app
+        .container()
+        .get_provider(DATA_CONNECT_COMPONENT_NAME)
+        .is_component_set()
+    {
+        app::add_component(app, &DATA_CONNECT_COMPONENT);
+    }
 }
 
 fn data_connect_factory(
@@ -470,6 +491,7 @@ pub async fn get_data_connect_service(
         return Ok(service);
     }
 
+    ensure_registered_for(&app);
     let provider = app::get_provider(&app, DATA_CONNECT_COMPONENT_NAME);
     let identifier = config.identifier();
     if let Some(service) = provider

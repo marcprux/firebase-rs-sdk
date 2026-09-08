@@ -7,7 +7,8 @@ use crate::util::calculate_backoff_millis;
 use super::errors::{AppCheckError, AppCheckResult};
 use super::types::{box_app_check_future, AppCheckProvider, AppCheckProviderFuture, AppCheckToken};
 use crate::app_check::client::{
-    exchange_token, get_exchange_recaptcha_enterprise_request, get_exchange_recaptcha_v3_request,
+    exchange_token, get_exchange_debug_token_request, get_exchange_recaptcha_enterprise_request,
+    get_exchange_recaptcha_v3_request,
 };
 use crate::app_check::recaptcha::{self, RecaptchaFlow};
 
@@ -171,6 +172,79 @@ impl RecaptchaProviderCore {
             }
             Err(err) => Err(err),
         }
+    }
+}
+
+/// Exchanges a debug token registered in the Firebase console for an App Check token.
+///
+/// Mirrors the JS SDK's debug mode: attestation providers need a browser, so this is the flow that
+/// works from a server, a command-line tool or a test. Register the token under App Check ->
+/// Manage debug tokens in the console; anyone holding it can obtain App Check tokens for the
+/// project, so treat it like a credential.
+pub struct DebugTokenProvider {
+    debug_token: String,
+    state: Mutex<ProviderState>,
+}
+
+impl DebugTokenProvider {
+    pub fn new(debug_token: String) -> Self {
+        Self {
+            debug_token,
+            state: Mutex::new(ProviderState::new()),
+        }
+    }
+
+    async fn exchange(&self) -> AppCheckResult<AppCheckToken> {
+        let (app, heartbeat) = {
+            let mut guard = self.state.lock().unwrap();
+            throw_if_throttled(&mut guard.throttle)?;
+            let app = guard.app.clone().ok_or_else(|| AppCheckError::ProviderError {
+                message: "debug token provider used before initialize()".into(),
+            })?;
+            (app, guard.heartbeat.clone())
+        };
+
+        let request = get_exchange_debug_token_request(&app, self.debug_token.clone())?;
+
+        match exchange_token(request, heartbeat).await {
+            Ok(token) => {
+                self.state.lock().unwrap().throttle = None;
+                Ok(token)
+            }
+            // The backend rate-limits repeated failures; back off exactly like the reCAPTCHA
+            // providers do so a wrong debug token cannot turn into a request loop.
+            Err(AppCheckError::FetchStatusError { http_status }) => {
+                let mut guard = self.state.lock().unwrap();
+                let previous = guard.throttle.take();
+                let throttle = set_backoff(http_status, previous);
+                let retry_after = throttle
+                    .allow_requests_after
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or_else(|| Duration::from_millis(0));
+                guard.throttle = Some(throttle);
+                Err(AppCheckError::InitialThrottle {
+                    http_status,
+                    retry_after,
+                })
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+impl AppCheckProvider for DebugTokenProvider {
+    fn initialize(&self, app: &FirebaseApp) {
+        let heartbeat = get_provider(app, "heartbeat")
+            .get_immediate::<HeartbeatServiceImpl>()
+            .map(|service| -> Arc<dyn HeartbeatService> { service });
+
+        let mut guard = self.state.lock().unwrap();
+        guard.app = Some(app.clone());
+        guard.heartbeat = heartbeat;
+    }
+
+    fn get_token(&self) -> AppCheckProviderFuture<'_, AppCheckResult<AppCheckToken>> {
+        box_app_check_future(async move { self.exchange().await })
     }
 }
 
