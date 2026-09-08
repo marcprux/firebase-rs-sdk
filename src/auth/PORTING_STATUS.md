@@ -10,6 +10,33 @@
 Based on the current codebase, I’d put parity with the Firebase Auth JS SDK at roughly 85 %. All of the core sign-in flows (email/password, custom token, anonymous, phone, TOTP, passkey), multi-factor resolver/linking, OAuth scaffolding (with PKCE and built-in providers), persistence, and token refresh logic are in place. The remaining  gap is mostly around browser-specific ceremony glue (popup/redirect adapters, conditional UI), advanced admin/tenant tooling, and a handful of higher-level provider conveniences that the JS SDK ships out of the box.
 
 
+## 2026-09-08 update: sessions that survive a restart
+
+The persistence machinery existed (`AuthPersistence`, `FilePersistence`, restore-on-start,
+proactive refresh) but nothing could reach it: the component factory always built `Auth::new`,
+which uses in-memory storage on native, and there was no way to swap the backend afterwards. A
+native application therefore forgot the signed-in user every time the process exited.
+
+- `initialize_auth(app, persistence)` creates the app's `Auth` on a chosen backend and restores the
+  session it holds, mirroring `initializeAuth(app, { persistence })`. Calling it after the instance
+  exists reports the JS SDK's `already-initialized` condition instead of silently doing nothing.
+- `Auth::set_persistence` moves a live session to another store and empties the old one, mirroring
+  `setPersistence`.
+- `Auth::restore_session` validates a restored session against the backend: the refresh token is
+  exchanged and the profile reloaded, and a session the backend no longer honours is cleared with
+  listeners notified. `initialize_auth` does this for you.
+- The persisted state now carries the profile (display name, photo, phone, provider) plus the
+  anonymous and email-verified flags, so a restored user is the real one rather than a uid-only
+  stub. Older state still loads (every new field is `#[serde(default)]`).
+- `FIREBASE_AUTH_EMULATOR_HOST` is honoured at construction on native, the way the Admin SDKs do,
+  so anything the Firebase CLI starts reaches the emulator without a code change.
+- `INVALID_REFRESH_TOKEN` and `MISSING_REFRESH_TOKEN` are typed error codes now; they used to fall
+  through to `AuthErrorCode::Other`, which is what hid a revoked session behind an opaque error.
+
+Verified against the Auth emulator by `auth_emulator_session_survives_a_restart`,
+`auth_emulator_restored_session_is_dropped_when_the_account_is_gone` and
+`auth_emulator_set_persistence_moves_the_session` in `tests/live_endpoints.rs`.
+
 ## What's Implemented
 - Emulator-verified flows (tests/live_endpoints.rs): password reset, email verification + `reload`, email-link sign-in, custom tokens with claims + `get_id_token_result`, profile/password/email updates with reauthentication and `verify_before_update_email`, `on_id_token_changed`, Google credential sign-in/link/unlink/reauth (`GoogleAuthProvider::credential`), `fetch_sign_in_methods_for_email`, anonymous upgrade via `link_with_email_and_password`, phone sign-in/link, phone MFA enrol/challenge/unenrol (`Auth::multi_factor_resolver`). Fixes: MFA endpoints now use `v2`; IdP reauthentication sends `autoCreate:false` without `idToken` and checks the uid; profile updates keep the current tokens when the backend omits new ones; custom-token sign-in falls back to the token `sub` when `localId` is absent; `User` carries `metadata` and `provider_data`.
 

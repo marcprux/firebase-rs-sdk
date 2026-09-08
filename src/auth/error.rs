@@ -139,6 +139,10 @@ pub enum AuthErrorCode {
     UserNotFound,
     /// `auth/user-token-expired`: the refresh token is no longer valid.
     UserTokenExpired,
+    /// `auth/invalid-refresh-token`: the stored refresh token was revoked or never existed.
+    InvalidRefreshToken,
+    /// `auth/missing-refresh-token`.
+    MissingRefreshToken,
     /// `auth/wrong-password`.
     WrongPassword,
     /// Any other backend code, normalised to the JS form (e.g. `configuration-not-found`).
@@ -184,6 +188,8 @@ impl AuthErrorCode {
             AuthErrorCode::UserDisabled => "user-disabled",
             AuthErrorCode::UserNotFound => "user-not-found",
             AuthErrorCode::UserTokenExpired => "user-token-expired",
+            AuthErrorCode::InvalidRefreshToken => "invalid-refresh-token",
+            AuthErrorCode::MissingRefreshToken => "missing-refresh-token",
             AuthErrorCode::WrongPassword => "wrong-password",
             AuthErrorCode::Other(code) => code.as_str(),
         }
@@ -230,6 +236,9 @@ impl AuthErrorCode {
             "CREDENTIAL_TOO_OLD_LOGIN_AGAIN" => AuthErrorCode::RequiresRecentLogin,
             "INVALID_ID_TOKEN" => AuthErrorCode::InvalidUserToken,
             "TOKEN_EXPIRED" | "USER_NOT_FOUND" => AuthErrorCode::UserTokenExpired,
+            // The secure token endpoint reports a revoked or unknown refresh token this way.
+            "INVALID_REFRESH_TOKEN" => AuthErrorCode::InvalidRefreshToken,
+            "MISSING_REFRESH_TOKEN" => AuthErrorCode::MissingRefreshToken,
             "USER_DISABLED" => AuthErrorCode::UserDisabled,
             "PASSWORD_DOES_NOT_MEET_REQUIREMENTS" => AuthErrorCode::PasswordDoesNotMeetRequirements,
             // Phone auth errors.

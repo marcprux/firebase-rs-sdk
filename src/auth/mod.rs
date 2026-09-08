@@ -13,8 +13,8 @@ mod types;
 
 #[doc(inline)]
 pub use api::{
-    auth_for_app, connect_auth_emulator, parse_id_token_result, refresh_id_token, refresh_id_token_with_endpoint,
-    register_auth_component, Auth, AuthBuilder, RefreshTokenResponse,
+    auth_for_app, connect_auth_emulator, initialize_auth, parse_id_token_result, refresh_id_token,
+    refresh_id_token_with_endpoint, register_auth_component, Auth, AuthBuilder, RefreshTokenResponse,
 };
 
 #[allow(unused_imports)]

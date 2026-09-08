@@ -1,6 +1,7 @@
 use std::cmp::Ordering as CmpOrdering;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
@@ -18,7 +19,7 @@ pub(crate) use token::DEFAULT_SECURE_TOKEN_ENDPOINT;
 pub use token::{refresh_id_token, refresh_id_token_with_endpoint, RefreshTokenResponse};
 
 use crate::app::{register_component, AppError, FirebaseApp, LOGGER as APP_LOGGER};
-use crate::auth::error::{map_server_error, AuthError, AuthResult};
+use crate::auth::error::{map_server_error, AuthError, AuthErrorCode, AuthResult};
 use crate::auth::model::MfaEnrollmentInfo;
 use crate::auth::model::{
     AuthConfig, AuthCredential, AuthStateListeners, EmailAuthProvider, GetAccountInfoResponse,
@@ -113,7 +114,8 @@ pub struct Auth {
     id_token_listeners: AuthStateListeners,
     rest_client: Client,
     token_refresh_tolerance: Duration,
-    persistence: Arc<dyn AuthPersistence + Send + Sync>,
+    /// Swappable so `set_persistence` can move a live session to another store.
+    persistence: RwLock<Arc<dyn AuthPersistence + Send + Sync>>,
     persisted_state_cache: Mutex<Option<PersistedAuthState>>,
     persistence_subscription: Mutex<Option<PersistenceSubscription>>,
     popup_handler: Mutex<Option<Arc<dyn OAuthPopupHandler>>>,
@@ -177,10 +179,21 @@ impl Auth {
             .clone()
             .ok_or_else(|| AuthError::InvalidCredential("Missing API key".into()))?;
 
+        // `FIREBASE_AUTH_EMULATOR_HOST` is the variable the Firebase CLI exports for anything it
+        // runs, so honouring it means an app started under `firebase emulators:exec` talks to the
+        // emulator without a code change. An explicit `connect_emulator` call still wins.
+        let (identity_toolkit_endpoint, secure_token_endpoint) = match emulator_endpoints_from_env() {
+            Some(endpoints) => endpoints,
+            None => (
+                DEFAULT_IDENTITY_TOOLKIT_ENDPOINT.to_string(),
+                token::DEFAULT_SECURE_TOKEN_ENDPOINT.to_string(),
+            ),
+        };
+
         let config = AuthConfig {
             api_key: Some(api_key),
-            identity_toolkit_endpoint: Some(DEFAULT_IDENTITY_TOOLKIT_ENDPOINT.to_string()),
-            secure_token_endpoint: Some(token::DEFAULT_SECURE_TOKEN_ENDPOINT.to_string()),
+            identity_toolkit_endpoint: Some(identity_toolkit_endpoint.clone()),
+            secure_token_endpoint: Some(secure_token_endpoint.clone()),
         };
 
         Ok(Self {
@@ -191,18 +204,93 @@ impl Auth {
             id_token_listeners: AuthStateListeners::default(),
             rest_client: Client::new(),
             token_refresh_tolerance: Duration::from_secs(5 * 60),
-            persistence,
+            persistence: RwLock::new(persistence),
             persisted_state_cache: Mutex::new(None),
             persistence_subscription: Mutex::new(None),
             popup_handler: Mutex::new(None),
             redirect_handler: Mutex::new(None),
             redirect_persistence: Mutex::new(InMemoryRedirectPersistence::shared()),
             oauth_request_uri: Mutex::new(DEFAULT_OAUTH_REQUEST_URI.to_string()),
-            identity_toolkit_endpoint: Mutex::new(DEFAULT_IDENTITY_TOOLKIT_ENDPOINT.to_string()),
-            secure_token_endpoint: Mutex::new(token::DEFAULT_SECURE_TOKEN_ENDPOINT.to_string()),
+            identity_toolkit_endpoint: Mutex::new(identity_toolkit_endpoint),
+            secure_token_endpoint: Mutex::new(secure_token_endpoint),
             refresh_cancel: Mutex::new(None),
             self_ref: Mutex::new(Weak::new()),
         })
+    }
+
+    /// The persistence backend currently in use.
+    fn persistence(&self) -> AuthResult<Arc<dyn AuthPersistence + Send + Sync>> {
+        Ok(self
+            .persistence
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone())
+    }
+
+    /// Moves the session to a different persistence backend, mirroring `setPersistence(auth, ...)`.
+    ///
+    /// The user that is signed in right now is written to the new store and removed from the old
+    /// one, and future sign-ins persist there. Like the JS SDK, this does not adopt a session that
+    /// the new store happens to hold: use [`initialize_auth`] for that, which restores at startup.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use firebase_rs_sdk::auth::{Auth, FilePersistence};
+    /// # fn demo(auth: &Arc<Auth>) -> Result<(), Box<dyn std::error::Error>> {
+    /// auth.set_persistence(Arc::new(FilePersistence::new("/var/lib/myapp/auth.json")))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_persistence(self: &Arc<Self>, persistence: Arc<dyn AuthPersistence + Send + Sync>) -> AuthResult<()> {
+        let previous = self.persistence()?;
+        let state = {
+            let cache = self.persisted_state_cache.lock().unwrap();
+            cache.clone()
+        };
+
+        persistence.set(state)?;
+        {
+            let mut guard = self
+                .persistence
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = persistence;
+        }
+        // Drop the old store's change subscription before clearing it, so the removal is not read
+        // back as "somebody signed out in another process".
+        *self.persistence_subscription.lock().unwrap() = None;
+        let _ = previous.set(None);
+        self.install_persistence_subscription()
+    }
+
+    /// Validates the session restored from persistence, returning the signed-in user.
+    ///
+    /// Restoring only reads the stored refresh token; this asks the backend to turn it into a
+    /// fresh ID token and reloads the profile. A session the backend no longer honours (the token
+    /// was revoked, or the account was deleted or disabled) is cleared and `Ok(None)` is returned,
+    /// with auth-state listeners notified, so callers never act on a dead session.
+    pub async fn restore_session(self: &Arc<Self>) -> AuthResult<Option<Arc<User>>> {
+        let Some(user) = self.current_user() else {
+            return Ok(None);
+        };
+
+        match self.refresh_id_token_for_user(&user).await {
+            Ok(_) => {}
+            Err(err) if is_dead_session_error(&err) => {
+                self.sign_out();
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        }
+
+        match self.reload().await {
+            Ok(user) => Ok(Some(user)),
+            Err(err) if is_dead_session_error(&err) => {
+                self.sign_out();
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Finishes initialization by restoring persisted state and wiring listeners.
@@ -2339,7 +2427,7 @@ impl Auth {
     }
 
     fn restore_from_persistence(&self) -> AuthResult<()> {
-        let state = self.persistence.get()?;
+        let state = self.persistence()?.get()?;
         let notify = state.is_some();
         self.sync_from_persistence(state, notify)
     }
@@ -2365,12 +2453,19 @@ impl Auth {
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs() as i64);
 
+        let info = user.info();
         let state = PersistedAuthState {
             user_id: user.uid().to_string(),
-            email: user.info().email.clone(),
+            email: info.email.clone(),
             refresh_token,
             access_token: user.token_manager().access_token(),
             expires_at,
+            display_name: info.display_name.clone(),
+            photo_url: info.photo_url.clone(),
+            phone_number: info.phone_number.clone(),
+            provider_id: Some(info.provider_id.clone()),
+            is_anonymous: user.is_anonymous(),
+            email_verified: user.email_verified(),
         };
         self.set_persisted_state(Some(state))
     }
@@ -2384,7 +2479,7 @@ impl Auth {
         }
 
         let previous = self.update_cached_state(state.clone());
-        if let Err(err) = self.persistence.set(state) {
+        if let Err(err) = self.persistence()?.set(state) {
             self.update_cached_state(previous);
             return Err(err);
         }
@@ -2406,7 +2501,7 @@ impl Auth {
             }
         });
 
-        let subscription = self.persistence.subscribe(listener)?;
+        let subscription = self.persistence()?.subscribe(listener)?;
         *self.persistence_subscription.lock().unwrap() = Some(subscription);
         Ok(())
     }
@@ -2442,16 +2537,25 @@ impl Auth {
     }
 
     fn build_user_from_persisted_state(&self, state: &PersistedAuthState) -> Arc<User> {
+        let provider_id = state.provider_id.clone().unwrap_or_else(|| {
+            if state.is_anonymous {
+                "anonymous".to_string()
+            } else {
+                EmailAuthProvider::PROVIDER_ID.to_string()
+            }
+        });
         let info = UserInfo {
             uid: state.user_id.clone(),
-            display_name: None,
+            display_name: state.display_name.clone(),
             email: state.email.clone(),
-            phone_number: None,
-            photo_url: None,
-            provider_id: EmailAuthProvider::PROVIDER_ID.to_string(),
+            phone_number: state.phone_number.clone(),
+            photo_url: state.photo_url.clone(),
+            provider_id,
         };
 
-        let user = User::new(self.app.clone(), info);
+        let mut user = User::new(self.app.clone(), info);
+        user.set_anonymous(state.is_anonymous);
+        user.set_email_verified(state.email_verified);
         let expiration_time = state.expires_at.and_then(|seconds| {
             if seconds <= 0 {
                 None
@@ -2764,6 +2868,39 @@ impl AuthBuilder {
     }
 }
 
+/// Reads `FIREBASE_AUTH_EMULATOR_HOST` and turns it into the endpoint pair the emulator serves.
+///
+/// The variable holds a bare `host:port` (that is what the Firebase CLI exports), but a full URL is
+/// accepted too.
+fn emulator_endpoints_from_env() -> Option<(String, String)> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        emulator_endpoints_for_host(&std::env::var("FIREBASE_AUTH_EMULATOR_HOST").ok()?)
+    }
+}
+
+/// Splits an emulator host (`127.0.0.1:9099` or a full URL) into the two endpoints Auth talks to.
+fn emulator_endpoints_for_host(host: &str) -> Option<(String, String)> {
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let origin = if host.starts_with("http://") || host.starts_with("https://") {
+        host.trim_end_matches('/').to_string()
+    } else {
+        format!("http://{}", host.trim_end_matches('/'))
+    };
+    Some((
+        format!("{origin}/identitytoolkit.googleapis.com/v1"),
+        format!("{origin}/securetoken.googleapis.com/v1/token"),
+    ))
+}
+
 /// Registers the Auth component so apps can resolve `Auth` instances.
 pub fn register_auth_component() {
     use std::sync::LazyLock;
@@ -2780,6 +2917,73 @@ pub fn register_auth_component() {
     LazyLock::force(&REGISTERED);
 }
 
+/// Persistence backends installed by [`initialize_auth`], keyed by app name. The component
+/// factory reads them so an `Auth` created through the registry (the usual path) can use a store
+/// other than the in-memory default.
+static PERSISTENCE_OVERRIDES: LazyLock<Mutex<HashMap<String, Arc<dyn AuthPersistence + Send + Sync>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn persistence_override(app_name: &str) -> Option<Arc<dyn AuthPersistence + Send + Sync>> {
+    PERSISTENCE_OVERRIDES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(app_name)
+        .cloned()
+}
+
+/// Creates the `Auth` instance for `app` on a caller-chosen persistence backend and restores any
+/// session it holds, mirroring `initializeAuth(app, { persistence })` in the JS SDK.
+///
+/// This is how a native application stays signed in across restarts: the default backend keeps the
+/// session in memory only, so a process that exits forgets it. Pass a
+/// [`FilePersistence`](crate::auth::FilePersistence) (or your own
+/// [`AuthPersistence`](crate::auth::AuthPersistence)) pointing at a location only your application
+/// can read — it holds the refresh token, which is enough to act as the user.
+///
+/// The restored session is validated against the backend before it is returned, so a revoked or
+/// expired refresh token results in a signed-out `Auth` rather than a user that cannot do anything.
+/// Call this before [`auth_for_app`]; an `Auth` that already exists for the app is left alone and
+/// an error is returned, matching the JS SDK's `auth/already-initialized`.
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use firebase_rs_sdk::app::FirebaseApp;
+/// # use firebase_rs_sdk::auth::{initialize_auth, FilePersistence};
+/// # async fn demo(app: FirebaseApp) -> Result<(), Box<dyn std::error::Error>> {
+/// let auth = initialize_auth(app, Arc::new(FilePersistence::new("/var/lib/myapp/auth.json"))).await?;
+/// if let Some(user) = auth.current_user() {
+///     println!("still signed in as {}", user.uid());
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub async fn initialize_auth(
+    app: FirebaseApp,
+    persistence: Arc<dyn AuthPersistence + Send + Sync>,
+) -> AuthResult<Arc<Auth>> {
+    register_auth_component();
+
+    let provider = app.container().get_provider("auth");
+    // `get_immediate` would create the instance, which is exactly what this check must avoid.
+    if provider.is_initialized(None) {
+        return Err(AuthError::App(AppError::ComponentFailure {
+            component: "auth".to_string(),
+            message: "Auth has already been initialized for this app; call initialize_auth before \
+                      auth_for_app or get_auth"
+                .to_string(),
+        }));
+    }
+
+    PERSISTENCE_OVERRIDES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(app.name().to_string(), persistence);
+
+    let auth = auth_for_app(app)?;
+    auth.restore_session().await?;
+    Ok(auth)
+}
+
 fn auth_factory(
     container: &ComponentContainer,
     _options: InstanceFactoryOptions,
@@ -2790,7 +2994,11 @@ fn auth_factory(
             name: "auth".to_string(),
             reason: "Firebase app not attached to component container".to_string(),
         })?;
-    let auth = Auth::new((*app).clone()).map_err(|err| ComponentError::InitializationFailed {
+    let auth = match persistence_override(app.name()) {
+        Some(persistence) => Auth::new_with_persistence((*app).clone(), persistence),
+        None => Auth::new((*app).clone()),
+    }
+    .map_err(|err| ComponentError::InitializationFailed {
         name: "auth".to_string(),
         reason: err.to_string(),
     })?;
@@ -2868,6 +3076,22 @@ fn auth_internal_factory(
 }
 
 /// Retrieves the `Auth` service for the provided app, initializing if needed.
+/// True for the errors that mean a stored session is gone for good rather than temporarily
+/// unreachable: the refresh token was revoked or expired, or the account no longer exists.
+fn is_dead_session_error(error: &AuthError) -> bool {
+    matches!(
+        error.code(),
+        Some(
+            AuthErrorCode::UserTokenExpired
+                | AuthErrorCode::UserNotFound
+                | AuthErrorCode::UserDisabled
+                | AuthErrorCode::InvalidUserToken
+                | AuthErrorCode::InvalidRefreshToken
+                | AuthErrorCode::MissingRefreshToken
+        )
+    )
+}
+
 pub fn auth_for_app(app: FirebaseApp) -> AuthResult<Arc<Auth>> {
     let provider = app.container().get_provider("auth");
     match provider.get_immediate_with_options::<Auth>(None, false) {
@@ -5300,6 +5524,104 @@ mod tests {
             }
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn emulator_hosts_become_endpoint_pairs() {
+        let (identity, token) = emulator_endpoints_for_host("127.0.0.1:9099").expect("endpoints");
+        assert_eq!(identity, "http://127.0.0.1:9099/identitytoolkit.googleapis.com/v1");
+        assert_eq!(token, "http://127.0.0.1:9099/securetoken.googleapis.com/v1/token");
+
+        // A full URL (with a stray trailing slash) is accepted too.
+        let (identity, _) = emulator_endpoints_for_host("http://localhost:9099/").expect("endpoints");
+        assert_eq!(identity, "http://localhost:9099/identitytoolkit.googleapis.com/v1");
+
+        assert!(emulator_endpoints_for_host("   ").is_none());
+    }
+
+    #[test]
+    fn dead_sessions_are_told_apart_from_transient_failures() {
+        let dead = |code: &str| AuthError::Server(crate::auth::error::AuthServerError::new(code, None, Some(400)));
+
+        assert!(is_dead_session_error(&dead("TOKEN_EXPIRED")));
+        assert!(is_dead_session_error(&dead("USER_DISABLED")));
+        assert!(is_dead_session_error(&dead("INVALID_REFRESH_TOKEN")));
+        assert!(!is_dead_session_error(&dead("TOO_MANY_ATTEMPTS_TRY_LATER")));
+        assert!(!is_dead_session_error(&AuthError::Network("offline".into())));
+    }
+
+    #[tokio::test]
+    async fn set_persistence_moves_the_stored_session_and_clears_the_old_store() {
+        let app = test_firebase_app_with_api_key("key");
+        let first = Arc::new(InMemoryPersistence::default());
+        first
+            .set(Some(PersistedAuthState {
+                user_id: "user-1".into(),
+                email: Some("user@example.com".into()),
+                refresh_token: Some("refresh".into()),
+                access_token: Some("access".into()),
+                expires_at: None,
+                display_name: Some("Ada".into()),
+                photo_url: None,
+                phone_number: None,
+                provider_id: Some("password".into()),
+                is_anonymous: false,
+                email_verified: true,
+            }))
+            .unwrap();
+
+        let auth = Arc::new(Auth::new_with_persistence(app, first.clone()).unwrap());
+        auth.initialize().unwrap();
+        assert_eq!(
+            auth.current_user().map(|user| user.uid().to_string()),
+            Some("user-1".to_string()),
+            "the session in the store is adopted at startup"
+        );
+
+        let second = Arc::new(InMemoryPersistence::default());
+        auth.set_persistence(second.clone()).unwrap();
+
+        let moved = second.get().unwrap().expect("the session moves to the new store");
+        assert_eq!(moved.user_id, "user-1");
+        assert_eq!(moved.display_name.as_deref(), Some("Ada"));
+        assert!(first.get().unwrap().is_none(), "the old store is emptied");
+        assert_eq!(
+            auth.current_user().map(|user| user.uid().to_string()),
+            Some("user-1".to_string()),
+            "moving stores does not sign the user out"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restored_user_carries_the_persisted_profile() {
+        let app = test_firebase_app_with_api_key("key");
+        let persistence = Arc::new(InMemoryPersistence::default());
+        persistence
+            .set(Some(PersistedAuthState {
+                user_id: "anon-1".into(),
+                email: None,
+                refresh_token: Some("refresh".into()),
+                access_token: Some("access".into()),
+                expires_at: None,
+                display_name: None,
+                photo_url: None,
+                phone_number: None,
+                provider_id: None,
+                is_anonymous: true,
+                email_verified: false,
+            }))
+            .unwrap();
+
+        let auth = Arc::new(Auth::new_with_persistence(app, persistence).unwrap());
+        auth.initialize().unwrap();
+
+        let user = auth.current_user().expect("restored user");
+        assert!(user.is_anonymous(), "anonymous sessions restore as anonymous");
+        assert_eq!(
+            user.info().provider_id,
+            "anonymous",
+            "the provider is inferred when the stored state predates the field"
+        );
     }
 }
 

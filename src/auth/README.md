@@ -6,7 +6,7 @@ It provides functionality to interact with Firebase Authentication, allowing use
 
 It includes error handling, configuration options, and integration with Firebase apps.
 
-Porting status: 85% `[######### ]` ([details](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/auth/PORTING_STATUS.md))
+Porting status: 88% `[######### ]` ([details](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/auth/PORTING_STATUS.md))
 
 
 ## Features

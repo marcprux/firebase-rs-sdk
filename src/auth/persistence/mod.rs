@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::error::AuthResult;
 
+/// The signed-in session as it is written to storage.
+///
+/// Everything here is what the Web SDK keeps in its persisted user object, so a restored session
+/// reports the same profile the user had before the process exited instead of a stub that only
+/// carries a uid. Fields added after the first release are `#[serde(default)]`, so state written by
+/// an older version still loads.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct PersistedAuthState {
     pub user_id: String,
@@ -13,6 +19,19 @@ pub struct PersistedAuthState {
     pub access_token: Option<String>,
     /// Expiration timestamp in seconds since the Unix epoch.
     pub expires_at: Option<i64>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub photo_url: Option<String>,
+    #[serde(default)]
+    pub phone_number: Option<String>,
+    /// The provider the user signed in with (`password`, `google.com`, `anonymous`, ...).
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub is_anonymous: bool,
+    #[serde(default)]
+    pub email_verified: bool,
 }
 
 pub type PersistenceListener = Arc<dyn Fn(Option<PersistedAuthState>) + Send + Sync>;

@@ -114,6 +114,25 @@ mod tests {
     }
 
     #[test]
+    fn state_written_before_the_profile_fields_existed_still_loads() {
+        // Sessions persisted by an older version of the crate must survive an upgrade.
+        let path = temp_path("legacy");
+        std::fs::write(
+            &path,
+            r#"{"user_id":"user","email":"user@example.com","refresh_token":"refresh","access_token":"access","expires_at":1234}"#,
+        )
+        .unwrap();
+
+        let loaded = FilePersistence::new(&path).get().unwrap().expect("state");
+        assert_eq!(loaded.user_id, "user");
+        assert_eq!(loaded.refresh_token.as_deref(), Some("refresh"));
+        assert_eq!(loaded.display_name, None);
+        assert!(!loaded.is_anonymous);
+
+        let _ = remove_file(path);
+    }
+
+    #[test]
     fn roundtrip_persistence() {
         let path = temp_path("roundtrip");
         let persistence = FilePersistence::new(&path);
@@ -123,6 +142,12 @@ mod tests {
             refresh_token: Some("refresh".into()),
             access_token: Some("access".into()),
             expires_at: Some(1234),
+            display_name: Some("Ada".into()),
+            photo_url: Some("https://example.com/ada.png".into()),
+            phone_number: None,
+            provider_id: Some("password".into()),
+            is_anonymous: false,
+            email_verified: true,
         };
 
         persistence.set(Some(state.clone())).unwrap();

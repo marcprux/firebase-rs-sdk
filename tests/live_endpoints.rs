@@ -60,7 +60,10 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use firebase_rs_sdk::app::{delete_app, initialize_app, FirebaseApp, FirebaseAppSettings, FirebaseOptions};
-use firebase_rs_sdk::auth::{auth_for_app, register_auth_component, AuthError, AuthErrorCode, User};
+use firebase_rs_sdk::auth::{
+    auth_for_app, initialize_auth, register_auth_component, AuthError, AuthErrorCode, AuthPersistence, FilePersistence,
+    User,
+};
 use serde_json::{json, Value};
 
 use firebase_rs_sdk::database::error::DatabaseErrorCode;
@@ -3171,6 +3174,24 @@ struct SmsCode {
 }
 
 impl EmulatorAuthAdmin {
+    /// Deletes an account the way an administrator would, without touching the SDK's state.
+    async fn delete_account(&self, uid: &str) {
+        let url = format!(
+            "{}/accounts:delete",
+            self.base
+                .replace("/emulator/v1/projects/", "/identitytoolkit.googleapis.com/v1/projects/")
+        );
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", "Bearer owner")
+            .json(&serde_json::json!({ "localId": uid }))
+            .send()
+            .await
+            .expect("delete account");
+        assert!(response.status().is_success(), "failed to delete {uid}: {}", response.status());
+    }
+
     fn new(config: &LiveConfig) -> Option<Self> {
         let host = config.emulators.auth.as_ref()?;
         Some(Self {
@@ -3272,6 +3293,196 @@ fn emulator_google_credential(sub: &str, email: &str, name: &str) -> firebase_rs
 
 /// Common setup for the emulator-only auth tests. Returns `None` (after printing a skip) when
 /// the Auth emulator is not running.
+/// A signed-in session written to disk must come back after the process that created it is gone.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Firebase credentials"]
+async fn auth_emulator_session_survives_a_restart() {
+    let test = "auth_emulator_session_survives_a_restart";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    if config.emulators.auth.is_none() {
+        skip(test, "needs the Auth emulator (scripts/emulator_test.sh)", "n/a");
+        return;
+    }
+
+    let store = temp_auth_store("restart");
+    let email = format!("persist-{}@example.com", nonce());
+    let password = "correct-horse-battery";
+
+    // --- first run: sign in and let persistence record the session ---------------------------
+    let first_app = live_app(&config, "auth-persist-first").await;
+    let first_auth = initialize_auth(first_app.clone(), Arc::new(FilePersistence::new(&store)))
+        .await
+        .expect("initialize auth");
+    first_auth.connect_emulator(&format!("http://{}", config.emulators.auth.clone().unwrap()));
+    let credential = first_auth
+        .create_user_with_email_and_password(&email, password)
+        .await
+        .expect("create user");
+    first_auth
+        .update_profile(Some("Ada Lovelace"), None)
+        .await
+        .expect("update profile");
+    let uid = credential.user.uid().to_string();
+    assert!(store.exists(), "signing in must write the session to {store:?}");
+    delete_app(&first_app).await.expect("delete_app");
+
+    // --- second run: a brand new app reading the same store ------------------------------------
+    let second_app = live_app(&config, "auth-persist-second").await;
+    let restored_events: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let second_auth = initialize_auth(second_app.clone(), Arc::new(FilePersistence::new(&store)))
+        .await
+        .expect("initialize auth");
+
+    let user = second_auth.current_user().expect("the session must be restored");
+    assert_eq!(user.uid(), uid, "the same account must come back");
+    assert_eq!(
+        user.info().email.as_deref(),
+        Some(email.as_str()),
+        "the restored profile is the real one, not a stub"
+    );
+    assert_eq!(user.info().display_name.as_deref(), Some("Ada Lovelace"));
+    assert!(!user.is_anonymous());
+
+    // The restored session is usable: a cached token is available and can be refreshed.
+    let token = user.get_id_token(false).await.expect("cached id token");
+    assert!(!token.is_empty());
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let refreshed = user.get_id_token(true).await.expect("forced refresh");
+    assert!(!refreshed.is_empty());
+
+    // Listeners attached after the restore see the signed-in user straight away.
+    let recorder = Arc::clone(&restored_events);
+    let unsubscribe = second_auth.on_auth_state_changed(move |user: &Option<Arc<User>>| {
+        recorder
+            .lock()
+            .expect("lock")
+            .push(user.as_ref().map(|user| user.uid().to_string()));
+    });
+    assert_eq!(
+        restored_events.lock().expect("lock").first().cloned(),
+        Some(Some(uid.clone())),
+        "a new listener is told about the restored user"
+    );
+    unsubscribe();
+
+    // --- signing out clears the store, so the next start is signed out -------------------------
+    second_auth.delete_user().await.expect("delete user");
+    delete_app(&second_app).await.expect("delete_app");
+
+    let third_app = live_app(&config, "auth-persist-third").await;
+    let third_auth = initialize_auth(third_app.clone(), Arc::new(FilePersistence::new(&store)))
+        .await
+        .expect("initialize auth");
+    assert!(
+        third_auth.current_user().is_none(),
+        "after signing out there is nothing to restore"
+    );
+    delete_app(&third_app).await.expect("delete_app");
+    let _ = std::fs::remove_file(&store);
+}
+
+/// A stored session whose account is gone must not come back as a signed-in user.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Firebase credentials"]
+async fn auth_emulator_restored_session_is_dropped_when_the_account_is_gone() {
+    let test = "auth_emulator_restored_session_is_dropped_when_the_account_is_gone";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    let Some(admin) = EmulatorAuthAdmin::new(&config) else {
+        skip(test, "needs the Auth emulator (scripts/emulator_test.sh)", "n/a");
+        return;
+    };
+
+    let store = temp_auth_store("revoked");
+    let email = format!("revoked-{}@example.com", nonce());
+
+    let first_app = live_app(&config, "auth-revoked-first").await;
+    let first_auth = initialize_auth(first_app.clone(), Arc::new(FilePersistence::new(&store)))
+        .await
+        .expect("initialize auth");
+    first_auth.connect_emulator(&format!("http://{}", config.emulators.auth.clone().unwrap()));
+    let credential = first_auth
+        .create_user_with_email_and_password(&email, "correct-horse-battery")
+        .await
+        .expect("create user");
+    let uid = credential.user.uid().to_string();
+    assert!(store.exists());
+    delete_app(&first_app).await.expect("delete_app");
+
+    // Delete the account behind the SDK's back, the way an administrator would.
+    admin.delete_account(&uid).await;
+
+    let second_app = live_app(&config, "auth-revoked-second").await;
+    let second_auth = initialize_auth(second_app.clone(), Arc::new(FilePersistence::new(&store)))
+        .await
+        .expect("initialize auth");
+    assert!(
+        second_auth.current_user().is_none(),
+        "a session the backend no longer honours must not be restored"
+    );
+    assert!(
+        FilePersistence::new(&store).get().expect("read store").is_none(),
+        "the dead session must be cleared from storage as well"
+    );
+
+    delete_app(&second_app).await.expect("delete_app");
+    let _ = std::fs::remove_file(&store);
+}
+
+/// `set_persistence` moves a live session to another store.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Firebase credentials"]
+async fn auth_emulator_set_persistence_moves_the_session() {
+    let test = "auth_emulator_set_persistence_moves_the_session";
+    let Some(config) = require_config(test) else {
+        return;
+    };
+    if config.emulators.auth.is_none() {
+        skip(test, "needs the Auth emulator (scripts/emulator_test.sh)", "n/a");
+        return;
+    }
+
+    let store = temp_auth_store("moved");
+    let app = live_app(&config, "auth-move-store").await;
+    let auth = auth_for(&config, &app);
+    auth.sign_in_anonymously().await.expect("anonymous sign-in");
+    let uid = auth.current_user().expect("user").uid().to_string();
+    assert!(!store.exists(), "the default backend keeps the session in memory only");
+
+    auth.set_persistence(Arc::new(FilePersistence::new(&store)))
+        .expect("set_persistence");
+    let stored = FilePersistence::new(&store)
+        .get()
+        .expect("read store")
+        .expect("the current session moves to the new store");
+    assert_eq!(stored.user_id, uid);
+    assert!(stored.is_anonymous, "anonymous sessions restore as anonymous");
+
+    // And a fresh app started against that store picks the same user back up.
+    let next_app = live_app(&config, "auth-move-store-next").await;
+    let next_auth = initialize_auth(next_app.clone(), Arc::new(FilePersistence::new(&store)))
+        .await
+        .expect("initialize auth");
+    let restored = next_auth.current_user().expect("restored user");
+    assert_eq!(restored.uid(), uid);
+    assert!(restored.is_anonymous());
+
+    next_auth.delete_user().await.expect("delete user");
+    delete_app(&next_app).await.expect("delete_app");
+    delete_app(&app).await.expect("delete_app");
+    let _ = std::fs::remove_file(&store);
+}
+
+/// A scratch file for one persistence test, in the system temp directory.
+fn temp_auth_store(label: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!("firebase-rs-sdk-auth-{label}-{}.json", nonce()));
+    path
+}
+
 async fn emulator_auth(
     test: &str,
 ) -> Option<(

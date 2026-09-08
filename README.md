@@ -48,7 +48,7 @@ percentages are estimates and deliberately stricter than the ones in each module
 | storage | 85% | real (`firebasestorage.googleapis.com/v0`) | emulator | uploads, downloads, metadata, paginated list, delete, resumable uploads with progress/pause/resume/cancel, JS error codes and `encodeURIComponent` paths |
 | app | 70% | n/a | yes | app lifecycle, options, component container, heartbeat header |
 | data_connect | 65% | real (`firebasedataconnect.googleapis.com/v1`) | no | executeQuery / executeMutation, emulator, subscriptions |
-| auth | 75% | real (Identity Toolkit v1/v2 + securetoken) | emulator + online | email, phone, custom-token, IdP credential and MFA flows verified end to end; typed error codes; listeners; OAuth popup/redirect UI flows still delegated to the host |
+| auth | 80% | real (Identity Toolkit v1/v2 + securetoken) | emulator + online | email, phone, custom-token, IdP credential and MFA flows verified end to end; sessions survive a restart through a pluggable persistence backend; typed error codes; listeners; OAuth popup/redirect UI flows still delegated to the host |
 | functions | 75% | real (`cloudfunctions.net` / custom domain / emulator) | emulator + online | callable protocol with auth, App Check and FID headers, streaming callables, URL callables, timeouts |
 | remote_config | 50% | real (`firebaseremoteconfig.googleapis.com/v1`) | yes | fetch, ETag-based activate, defaults with correct value sources, custom signals, typed getters |
 | app_check | 45% | real exchange endpoint, untested | no | custom provider and refresher only on native; reCAPTCHA is wasm-only |
@@ -82,7 +82,9 @@ percentages are estimates and deliberately stricter than the ones in each module
 | `getIdToken` (`User::get_id_token(force_refresh)` and `Auth::get_token`), `getIdTokenResult` (decoded claims, `sign_in_provider`, `sign_in_second_factor`), token refresh through `securetoken.googleapis.com` | implemented; custom claims verified via unsigned custom tokens on the emulator |
 | `signInWithPopup`, `signInWithRedirect`, `linkWithPopup`, `getRedirectResult` | partial, delegates to a caller-supplied handler; no built-in flow |
 | `onAuthStateChanged` | implemented; emits `Some(user)` / `None`, primes with the current state, fires only when the uid changes, unsubscribe removes the observer |
-| `setPersistence` | partial, constructor-time only |
+| `setPersistence`, `initializeAuth(app, { persistence })` | implemented: `Auth::set_persistence` moves a live session to another store, `initialize_auth(app, persistence)` creates the app's Auth on a chosen backend and restores the session it holds. `FilePersistence` keeps a native app signed in across restarts; the restored session is validated against the backend, so a revoked or deleted account signs out instead of coming back broken |
+| Persisted session contents | the uid, profile (display name, photo, phone, provider), anonymous and email-verified flags, and the refresh token, so a restored user is the real one rather than a stub; state written by older versions still loads |
+| `FIREBASE_AUTH_EMULATOR_HOST` | honoured on native at construction, so anything started by the Firebase CLI talks to the emulator without a code change (an explicit `connect_emulator` still wins) |
 | Typed error codes (`auth/wrong-password`, `auth/user-not-found`, `auth/too-many-requests`, ...) | implemented; `AuthError::Server` carries an `AuthErrorCode` mapped with the JS `SERVER_ERROR_MAP`, unmapped codes are normalised like the JS SDK (`auth/configuration-not-found`) |
 | `reload` (email verification state, `metadata`, `providerData`, second factors), `onIdTokenChanged` | implemented |
 | `updateCurrentUser`, `beforeAuthStateChanged` | missing |
