@@ -5,7 +5,7 @@ component through the shared container, provides configurable runtime toggles, i
 instrumentation primitives, runs WASM-friendly auto instrumentation, and ships a cross-platform trace queue with an
 async transport worker so the data path mirrors the JS SDK end-to-end.
 
-Porting status: 70% `[#######..]` ([details](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/performance/PORTING_STATUS.md))
+Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`.
 
 ## Quick Start Example
 

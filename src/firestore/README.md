@@ -11,7 +11,7 @@ Snapshot listeners (`on_snapshot`) are available on native targets: they run on 
 It includes error handling, configuration options, and integration with
 Firebase apps.
 
-Porting status: 85% `[######### ]` ([details](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/firestore/PORTING_STATUS.md))
+Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`.
 
 ## Quick Start Example
 

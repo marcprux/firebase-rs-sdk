@@ -8,7 +8,7 @@ Listeners run over the Realtime Database websocket protocol, so `on_value` and t
 
 It includes error handling, configuration options, and integration with Firebase apps.
 
-Porting status: 55% `[#####+    ]` ([details](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/database/PORTING_STATUS.md))
+Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`.
 
 ## Features
 

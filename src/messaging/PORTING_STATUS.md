@@ -1,6 +1,6 @@
 ## Porting status
 
-- messaging 40% `[####      ]`
+Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`. The notes below are the porting history and are not kept in sync with that table.
 
 ## Implemented
 

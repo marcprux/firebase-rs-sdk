@@ -1,6 +1,6 @@
 ## Porting status
 
-- app_check 70% `[#######   ]`
+Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`. The notes below are the porting history and are not kept in sync with that table.
 
 Significant parity milestones are now in place: App Check registers with the component system, background refresh follows the JS proactive-refresh heuristics (issued/expiry timestamps, jitter, exponential backoff), tokens persist across reloads on wasm targets, and storage, analytics, and other modules can request App Check tokens via the shared internal provider. ReCAPTCHA flows, debug tooling, and heartbeat integration remain unported, but the primary token lifecycle is functional and covered by tests.
 

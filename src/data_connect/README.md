@@ -2,7 +2,7 @@
 
 Rust port of the Firebase Data Connect SDK. The module mirrors the modular JS surface so apps can register connectors, execute queries or mutations, and hydrate caches both natively and in WASM builds.
 
-Porting status: 80% `[########  ]` ([details](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/data-connect/PORTING_STATUS.md))
+Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`.
 
 ## Quick Start Example
 

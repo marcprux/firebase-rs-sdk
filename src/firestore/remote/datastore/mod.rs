@@ -2,10 +2,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-#[cfg(not(target_arch = "wasm32"))]
-use futures::future::BoxFuture;
-#[cfg(target_arch = "wasm32")]
-use futures::future::LocalBoxFuture;
 
 use crate::firestore::api::snapshot::DocumentSnapshot;
 use crate::firestore::error::FirestoreResult;
@@ -17,13 +13,10 @@ use crate::firestore::QueryDefinition;
 
 mod http;
 mod in_memory;
-mod streaming;
 
 // Re-export public API
 pub use http::{HttpDatastore, HttpDatastoreBuilder, RetrySettings};
 pub use in_memory::InMemoryDatastore;
-pub(crate) use streaming::box_stream_future;
-pub use streaming::{StreamingDatastoreImpl, StreamingHandleImpl};
 
 #[derive(Clone, Debug)]
 pub enum WriteOperation {
@@ -119,22 +112,6 @@ impl ConditionalWrite {
             }
         }
     }
-}
-
-#[cfg(target_arch = "wasm32")]
-pub type StreamingFuture<'a, T> = LocalBoxFuture<'a, T>;
-#[cfg(not(target_arch = "wasm32"))]
-pub type StreamingFuture<'a, T> = BoxFuture<'a, T>;
-
-pub trait StreamingDatastore: Send + Sync + 'static {
-    fn open_listen_stream(&self) -> StreamingFuture<'_, FirestoreResult<Arc<dyn StreamHandle>>>;
-    fn open_write_stream(&self) -> StreamingFuture<'_, FirestoreResult<Arc<dyn StreamHandle>>>;
-}
-
-pub trait StreamHandle: Send + Sync + 'static {
-    fn send(&self, payload: Vec<u8>) -> StreamingFuture<'_, FirestoreResult<()>>;
-    fn next(&self) -> StreamingFuture<'_, Option<FirestoreResult<Vec<u8>>>>;
-    fn close(&self) -> StreamingFuture<'_, FirestoreResult<()>>;
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]

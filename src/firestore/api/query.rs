@@ -1162,10 +1162,6 @@ impl QuerySnapshotMetadata {
     pub fn snapshot_version(&self) -> Option<&Timestamp> {
         self.snapshot_version.as_ref()
     }
-
-    pub(crate) fn set_sync_state_changed(&mut self, value: bool) {
-        self.sync_state_changed = value;
-    }
 }
 
 #[derive(Clone)]

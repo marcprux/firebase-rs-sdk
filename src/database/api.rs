@@ -1875,7 +1875,7 @@ pub async fn get_database(app: Option<FirebaseApp>) -> DatabaseResult<Arc<Databa
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::SystemTime;
 
     use crate::app::initialize_app;
     use crate::app::{FirebaseApp, FirebaseAppConfig, FirebaseAppSettings, FirebaseOptions};

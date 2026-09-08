@@ -4,7 +4,7 @@ This module is the Rust port of the Firebase Remote Config SDK. It exposes a con
 can be fetched from the Remote Config backend and activated inside a Firebase app. The current implementation offers an
 in-memory stub that wires the component into the shared container so other services can depend on it.
 
-Porting status: 25% `[###       ]` ([details](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/remote_config/PORTING_STATUS.md))
+Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`.
 
 ## Quick Start Example
 

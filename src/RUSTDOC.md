@@ -68,7 +68,7 @@ For that reason, sometimes for calls and features it might be useful to refer di
 
 (These resources are maintained by Google and the community.)
 
-If you want to contribute, donating your time and AI resources is the most valuable way to support this project. See the [`CONTRIBUTING.md`](https://github.com/dgasparri/firebase-rs-sdk/blob/main/CONTRIBUTING.md) page on how to help.
+If you want to contribute, donating your time and AI resources is the most valuable way to support this project. See the [`CONTRIBUTING.md`](https://github.com/marcprux/firebase-rs-sdk/blob/main/CONTRIBUTING.md) page on how to help.
 
 ## Example
 
@@ -149,7 +149,7 @@ fn field_as_i64(data: &BTreeMap<String, FirestoreValue>, field: &str) -> Option<
 }
 ```
 
-For further details, refer to the example [`./examples/firestore_select_documents.rs`](https://github.com/dgasparri/firebase-rs-sdk/blob/main/examples/firestore_select_documents.rs) or run `cargo run --example firestore_select_documents`.
+For further details, refer to the example [`./examples/firestore_select_documents.rs`](https://github.com/marcprux/firebase-rs-sdk/blob/main/examples/firestore_select_documents.rs) or run `cargo run --example firestore_select_documents`.
 
 ## Copyright
 
@@ -159,4 +159,4 @@ This library is distributed ‘as is’ without warranties or conditions of any 
 
 ## How to contribute
 
-The porting process is time- and AI-intensive; any help is appreciated. See [`CONTRIBUTING.md`](https://github.com/dgasparri/firebase-rs-sdk/blob/main/CONTRIBUTING.md) for details.
+The porting process is time- and AI-intensive; any help is appreciated. See [`CONTRIBUTING.md`](https://github.com/marcprux/firebase-rs-sdk/blob/main/CONTRIBUTING.md) for details.

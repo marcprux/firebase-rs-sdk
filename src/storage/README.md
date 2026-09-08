@@ -9,7 +9,7 @@ uploading and downloading files, managing metadata, and handling storage referen
 
 It includes error handling, configuration options, and integration with Firebase apps.
 
-Porting status: 85% `[########+ ]` ([details](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/storage/PORTING_STATUS.md))
+Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`.
 
 ## Features:
 

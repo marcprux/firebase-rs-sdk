@@ -1,6 +1,6 @@
 ## Porting Status
 
-- auth 85% `[######### ]`
+Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`. The notes below are the porting history and are not kept in sync with that table.
 
 - Core functionalities: Mostly implemented
 - Tests: httpmock-backed unit suite expanded (requires loopback binding when run locally)

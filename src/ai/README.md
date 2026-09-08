@@ -2,7 +2,7 @@
 
 This module hosts the Rust port of the experimental Firebase AI client. It exposes the same high-level entry points as the JavaScript SDK (`getAI`, backend configuration helpers) while adopting idiomatic Rust patterns for component registration, backend selection, and error handling. Runtime inference is currently stubbed so the surrounding Firebase app infrastructure can already depend on the public API.
 
-Porting status: 30% `[###       ]` ([detail](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/ai/PORTING_STATUS.md))
+Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`.
 
 ## Quick Start Example
 

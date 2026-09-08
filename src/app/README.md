@@ -4,7 +4,7 @@ This module ports core pieces of the Firebase App SDK to Rust.
 
 The Firebase App coordinates the communication between the different Firebase components.
 
-Porting status: 80% `[########  ]` ([details](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/app/PORTING_STATUS.md))
+Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`.
 
 ## Quick Start Example
 

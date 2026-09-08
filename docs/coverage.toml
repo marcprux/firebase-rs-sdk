@@ -1,0 +1,96 @@
+# Coverage of the Firebase API surface, per module.
+#
+# This is the single source of truth: README.md's table is generated from it by
+# scripts/coverage_table.py, and CI fails if the two drift apart. Module documentation
+# points here rather than carrying its own number.
+#
+# coverage: share of the product's public JS API that is implemented AND reaches the real
+#           backend. Deliberately strict: code that only talks to an in-memory simulation
+#           does not count.
+# backend:  which endpoints the module actually talks to.
+# verified: how the claim is checked (emulator, online, both, or no).
+# notes:    what works, and the notable gap.
+
+[installations]
+coverage = "85%"
+backend = "real (Installations REST v1)"
+verified = "yes"
+notes = "FID generation, registration, token refresh, delete, id-change listeners"
+
+[storage]
+coverage = "85%"
+backend = "real (`firebasestorage.googleapis.com/v0`)"
+verified = "emulator"
+notes = "uploads, downloads, metadata, paginated list, delete, resumable uploads with progress/pause/resume/cancel, JS error codes and `encodeURIComponent` paths"
+
+[app]
+coverage = "72%"
+backend = "n/a"
+verified = "yes"
+notes = "app lifecycle, options, component container (provider lookup is atomic and service registration is idempotent, so a service never resolves as \"not initialized\"), heartbeat header"
+
+[data_connect]
+coverage = "65%"
+backend = "real (`firebasedataconnect.googleapis.com/v1`)"
+verified = "no"
+notes = "executeQuery / executeMutation, emulator, subscriptions"
+
+[auth]
+coverage = "80%"
+backend = "real (Identity Toolkit v1/v2 + securetoken)"
+verified = "emulator + online"
+notes = "email, phone, custom-token, IdP credential and MFA flows verified end to end; sessions survive a restart through a pluggable persistence backend; typed error codes; listeners; OAuth popup/redirect UI flows still delegated to the host"
+
+[functions]
+coverage = "75%"
+backend = "real (`cloudfunctions.net` / custom domain / emulator)"
+verified = "emulator + online"
+notes = "callable protocol with auth, App Check and FID headers, streaming callables, URL callables, timeouts"
+
+[remote_config]
+coverage = "50%"
+backend = "real (`firebaseremoteconfig.googleapis.com/v1`)"
+verified = "yes"
+notes = "fetch, ETag-based activate, defaults with correct value sources, custom signals, typed getters"
+
+[app_check]
+coverage = "60%"
+backend = "real exchange endpoint (`content-firebaseappcheck.googleapis.com/v1`)"
+verified = "emulator (token delivery) + online (debug-token exchange)"
+notes = "debug-token provider, custom provider and refresher on native; reCAPTCHA is wasm-only"
+
+[firestore]
+coverage = "63%"
+backend = "real REST for one-shot ops, real gRPC `Listen` for snapshots"
+verified = "emulator + online"
+notes = "CRUD, composite queries, snapshot cursors, batches, aggregates, optimistic transactions, serde structs, `on_snapshot` for documents and queries over gRPC; no offline cache and no local write queue (the unreachable sync prototype was deleted in 2026-09)"
+
+[database]
+coverage = "55%"
+backend = "real REST + realtime WebSocket"
+verified = "emulator"
+notes = "reads/writes/queries, server-resolved `.sv` values, compare-and-set transactions, value/child listeners over the wire protocol; query listeners re-query instead of subscribing to a filtered view"
+
+[messaging]
+coverage = "0% native / 40% wasm"
+backend = "real on wasm only"
+verified = "no"
+notes = "native path returns placeholder tokens; no message delivery anywhere"
+
+[performance]
+coverage = "15%"
+backend = "trace API local; upload body not accepted by backend"
+verified = "no"
+notes = "traces and metrics are recorded but never ingested"
+
+[analytics]
+coverage = "15%"
+backend = "GA4 Measurement Protocol, not gtag"
+verified = "no"
+notes = "needs an `api_secret`; not equivalent to the JS SDK"
+
+[ai]
+coverage = "10%"
+backend = "real `generateContent` for one helper"
+verified = "no"
+notes = "request factory is correct; model, chat, streaming and Imagen missing"

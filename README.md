@@ -2,31 +2,36 @@
 
 This is an unofficial Rust SDK for Firebase.
 
+A fork of [dgasparri/firebase-rs-sdk](https://github.com/dgasparri/firebase-rs-sdk), which ported
+the Firebase JavaScript SDK to Rust; this fork continues that work, with the emphasis on verifying
+each module against real Firebase backends (see [Coverage](#coverage) and
+[Live endpoint tests](#live-endpoint-tests)).
+
 ## Modules
 
 The Firebase Rust SDK includes 14 modules, each mapping to a Firebase service:
 
-- [ai](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/ai)
-- [analytics](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/analytics)
-- [app](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/app)
-- [app_check](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/app_check)
-- [auth](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/auth)
-- [data_connect](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/data_connect)  
-- [database](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/database)
-- [firestore](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/firestore)
-- [functions](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/functions)
-- [installations](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/installations)
-- [messaging](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/messaging)
-- [performance](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/performance)
-- [remote_config](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/remote_config)
-- [storage](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/storage)
+- [ai](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/ai)
+- [analytics](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/analytics)
+- [app](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/app)
+- [app_check](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/app_check)
+- [auth](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/auth)
+- [data_connect](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/data_connect)  
+- [database](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/database)
+- [firestore](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/firestore)
+- [functions](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/functions)
+- [installations](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/installations)
+- [messaging](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/messaging)
+- [performance](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/performance)
+- [remote_config](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/remote_config)
+- [storage](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/storage)
 
 The following modules are used internally by the library and have no direct public API.
 
-- [component](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/component)
-- [logger](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/logger)
-- [platform](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/platform)
-- [util](https://github.com/dgasparri/firebase-rs-sdk/tree/main/src/util)
+- [component](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/component)
+- [logger](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/logger)
+- [platform](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/platform)
+- [util](https://github.com/marcprux/firebase-rs-sdk/tree/main/src/util)
 
 Note that this library is provided _as is_. Even the more mature modules have not been exhaustively tested. All the code published passes `cargo test`. There is an effort to port the tests of the official JavaScript SDK, but there is no guarantee that the test coverage is complete.
 
@@ -36,13 +41,18 @@ The tables below record how much of the official Firebase API surface each modul
 a September 2026 audit that compared the Rust code against the modular JavaScript SDK (v9+) and, for
 the mobile-relevant services, the Firebase C++ SDK. "Coverage" is the share of the public JS API for
 that product that is implemented and actually reaches the real backend; the "Backend" column says
-whether the module talks to the production endpoints or only to an in-memory simulation. The
-percentages are estimates and deliberately stricter than the ones in each module's
-`PORTING_STATUS.md`. `tests/live_endpoints.rs` verifies the "live" rows against a real project.
+whether the module talks to the production endpoints or only to an in-memory simulation.
+
+The summary table below is generated from `docs/coverage.toml`, which is the only place these
+numbers live; edit that file and run `scripts/coverage_table.py`. `tests/live_endpoints.rs` is what
+backs the "Verified" column: those tests run against the Firebase Local Emulator Suite, and against
+a real project for the services that have no emulator.
 
 ### Summary
 
-| Module | Coverage | Backend | Verified live | Notes |
+<!-- coverage:begin (generated from docs/coverage.toml by scripts/coverage_table.py) -->
+
+| Module | Coverage | Backend | Verified | Notes |
 |---|---:|---|:---:|---|
 | installations | 85% | real (Installations REST v1) | yes | FID generation, registration, token refresh, delete, id-change listeners |
 | storage | 85% | real (`firebasestorage.googleapis.com/v0`) | emulator | uploads, downloads, metadata, paginated list, delete, resumable uploads with progress/pause/resume/cancel, JS error codes and `encodeURIComponent` paths |
@@ -52,12 +62,14 @@ percentages are estimates and deliberately stricter than the ones in each module
 | functions | 75% | real (`cloudfunctions.net` / custom domain / emulator) | emulator + online | callable protocol with auth, App Check and FID headers, streaming callables, URL callables, timeouts |
 | remote_config | 50% | real (`firebaseremoteconfig.googleapis.com/v1`) | yes | fetch, ETag-based activate, defaults with correct value sources, custom signals, typed getters |
 | app_check | 60% | real exchange endpoint (`content-firebaseappcheck.googleapis.com/v1`) | emulator (token delivery) + online (debug-token exchange) | debug-token provider, custom provider and refresher on native; reCAPTCHA is wasm-only |
-| firestore | 63% | real REST for one-shot ops, real gRPC `Listen` for snapshots | emulator + online | CRUD, composite queries, snapshot cursors, batches, aggregates, optimistic transactions, serde structs, `on_snapshot` for documents and queries; no offline cache or local write queue |
+| firestore | 63% | real REST for one-shot ops, real gRPC `Listen` for snapshots | emulator + online | CRUD, composite queries, snapshot cursors, batches, aggregates, optimistic transactions, serde structs, `on_snapshot` for documents and queries over gRPC; no offline cache and no local write queue (the unreachable sync prototype was deleted in 2026-09) |
 | database | 55% | real REST + realtime WebSocket | emulator | reads/writes/queries, server-resolved `.sv` values, compare-and-set transactions, value/child listeners over the wire protocol; query listeners re-query instead of subscribing to a filtered view |
 | messaging | 0% native / 40% wasm | real on wasm only | no | native path returns placeholder tokens; no message delivery anywhere |
 | performance | 15% | trace API local; upload body not accepted by backend | no | traces and metrics are recorded but never ingested |
 | analytics | 15% | GA4 Measurement Protocol, not gtag | no | needs an `api_secret`; not equivalent to the JS SDK |
 | ai | 10% | real `generateContent` for one helper | no | request factory is correct; model, chat, streaming and Imagen missing |
+
+<!-- coverage:end -->
 
 ### app
 
@@ -270,7 +282,7 @@ For that reason, sometimes for calls and features it might be useful to refer di
 
 (These resources are maintained by Google and the community.)
 
-If you want to contribute, donating your time and AI resources is the most valuable way to support this project. See the [`CONTRIBUTING.md`](https://github.com/dgasparri/firebase-rs-sdk/blob/main/CONTRIBUTING.md) page on how to help.
+If you want to contribute, donating your time and AI resources is the most valuable way to support this project. See the [`CONTRIBUTING.md`](https://github.com/marcprux/firebase-rs-sdk/blob/main/CONTRIBUTING.md) page on how to help.
 
 ## Example
 
@@ -351,7 +363,7 @@ fn field_as_i64(data: &BTreeMap<String, FirestoreValue>, field: &str) -> Option<
 }
 ```
 
-For further details, refer to the example [`./examples/firestore_select_documents.rs`](https://github.com/dgasparri/firebase-rs-sdk/blob/main/examples/firestore_select_documents.rs) or run `cargo run --example firestore_select_documents`.
+For further details, refer to the example [`./examples/firestore_select_documents.rs`](https://github.com/marcprux/firebase-rs-sdk/blob/main/examples/firestore_select_documents.rs) or run `cargo run --example firestore_select_documents`.
 
 ## Live endpoint tests
 
@@ -359,7 +371,7 @@ Besides the offline unit tests, `tests/live_endpoints.rs` exercises real backend
 Realtime Database, Storage and Functions against the Firebase Local Emulator Suite (no credentials
 needed), and
 Installations and Remote Config against a real project when credentials are configured. See
-[`CONTRIBUTING.md`](https://github.com/dgasparri/firebase-rs-sdk/blob/main/CONTRIBUTING.md#live-endpoint-tests).
+[`CONTRIBUTING.md`](https://github.com/marcprux/firebase-rs-sdk/blob/main/CONTRIBUTING.md#live-endpoint-tests).
 
 ```bash
 npm install -g firebase-tools && npm ci --prefix firebase-emulator/functions   # once
@@ -374,4 +386,4 @@ This library is distributed ‘as is’ without warranties or conditions of any 
 
 ## How to contribute
 
-The porting process is time- and AI-intensive; any help is appreciated. See [`CONTRIBUTING.md`](https://github.com/dgasparri/firebase-rs-sdk/blob/main/CONTRIBUTING.md) for details.
+The porting process is time- and AI-intensive; any help is appreciated. See [`CONTRIBUTING.md`](https://github.com/marcprux/firebase-rs-sdk/blob/main/CONTRIBUTING.md) for details.

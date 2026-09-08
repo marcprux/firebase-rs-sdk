@@ -1,6 +1,6 @@
 ## Porting status
 
-- firestore 85% `[######### ]` (self-reported; the README's stricter estimate is 60%)
+Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`. The notes below are the porting history and are not kept in sync with that table.
 
 ==As of April 12th, 2026==
 
@@ -15,6 +15,22 @@ Roughly 83 % of the Firestore JS SDK now has a Rust counterpart.
 - REST and in-memory datastores can execute aggregation queries (`count`, `sum`, `average`), matching `getAggregate()`/`getCount()` from the JS SDK.
 - Remaining gaps focus on the sync engine: RemoteSyncer integration, transactions, offline persistence, cross-platform transports, and advanced bundle/listener plumbing.
 
+
+## 2026-09-08 update: the unreachable sync prototype is gone
+
+About 6,300 lines that no public API could reach were deleted: `local/` (the memory local store,
+overlay and sync engine), `remote/stream*` and `remote/network` (a hand-rolled multiplexed
+websocket framing that no Firebase backend speaks), `remote/remote_store.rs`, `remote/syncer_bridge.rs`,
+`remote/remote_syncer.rs`, `remote/mutation.rs`, and `remote/datastore/streaming.rs`. They were
+re-exported from `firestore::*`, so they read as features while being a simulation of the JS sync
+engine wired to nothing.
+
+What replaced them is already in place and verified: one-shot reads and writes over REST, and
+`on_snapshot` over the real `Listen` gRPC stream, which reuses the parts of the watch layer that
+were genuinely a port (`watch_change.rs`, `watch_change_aggregator.rs`, `remote_event.rs`).
+
+The offline story — a local cache, a mutation queue and `has_pending_writes` — is therefore not
+"partly there": it is unimplemented, and would start from `packages/firestore/src/local`.
 
 ## 2026-09-08 update: the client uses the app's credentials
 
@@ -63,9 +79,9 @@ and writes stay on REST:
 
 Not covered: wasm targets (the browser SDK uses WebChannel), `includeMetadataChanges`,
 `onSnapshotsInSync`, limbo document resolution, and `has_pending_writes` (there is no local
-mutation queue, so snapshots reflect only what the backend has). The prototype sync stack under
-`remote/stream*`, `remote/network`, `remote/remote_store.rs` and `local/` is still there and is
-still not reachable from the public API.
+mutation queue, so snapshots reflect only what the backend has). The prototype sync stack that used
+to sit under `remote/stream*`, `remote/network`, `remote/remote_store.rs` and `local/` was deleted
+on 2026-09-08 (see the entry above).
 
 ## Development status as of 5th April 2026
 

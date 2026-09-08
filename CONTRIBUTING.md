@@ -6,7 +6,7 @@ Any contribution to port additional features and create new tests is greatly app
 
 To set up the development environment, first clone the GitHub repository:
 
-> git clone <https://github.com/dgasparri/firebase-rs-sdk.git>
+> git clone <https://github.com/marcprux/firebase-rs-sdk.git>
 
 Cloning the Firebase JavaScript SDK repository is optional but helpful for reference:
 
@@ -124,6 +124,19 @@ The code you contribute MUST be licensed under Apache 2.0.
 ## Testing
 
 In the analytics module a unit test that exercises the dispatcher is skipped by default unless `FIREBASE_NETWORK_TESTS=1` is set.
+
+## Coverage table
+
+Per-module coverage lives in `docs/coverage.toml` and nothing else. README.md's table is generated
+from it:
+
+```bash
+scripts/coverage_table.py           # rewrite the table
+scripts/coverage_table.py --check   # what CI runs
+```
+
+Module `README.md` and `PORTING_STATUS.md` files carry porting history, not numbers — they used to
+carry their own percentages, which drifted from the README by as much as fifty points.
 
 ## Generated Firestore protobufs
 

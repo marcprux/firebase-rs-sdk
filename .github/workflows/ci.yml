@@ -1,0 +1,197 @@
+name: ci
+
+# One workflow, one job per thing that can break:
+#
+#   check     compiles for the host and lints (fmt, clippy)
+#   test      the offline suite: unit tests and doc tests
+#   wasm      compiles for wasm32 and runs the browser-side smoke tests
+#   emulator  the endpoint tests against the Firebase Local Emulator Suite (no secrets)
+#   live      the endpoint tests that need a real project (Installations, Remote Config)
+#
+# Everything except `live` runs for pull requests from forks; `live` needs secrets, which forks
+# cannot read.
+#
+# Required secret:
+#   FIREBASE_GOOGLE_SERVICES_JSON  - the full contents of the app's google-services.json
+#                                    (Firebase console > Project settings > Your apps > Download).
+# Optional secrets:
+#   FIREBASE_TEST_CALLABLE         - name of a deployed callable function to invoke.
+#   FIREBASE_APPCHECK_DEBUG_TOKEN  - a token registered under App Check > Manage debug tokens.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"   # weekly, catches backend drift
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: build and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # docs/coverage.toml is the only place the per-module numbers live; this fails if README.md
+      # was edited by hand instead.
+      - name: Check the generated coverage table
+        run: python3 scripts/coverage_table.py --check
+
+      - name: Build (host, all targets)
+        run: cargo build --all-targets
+
+      # Warnings are not fatal yet: the crate carries a backlog of them. Keep the output visible
+      # so new ones are obvious in review, and tighten to `-D warnings` once the backlog is gone.
+      - name: Clippy
+        run: cargo clippy --all-targets
+
+  test:
+    name: offline tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # The suite shares process-global state (the component registry, App Check state), so it is
+      # run twice: once in parallel, which is how contributors run it, and once serially, which
+      # catches ordering assumptions the parallel run can hide.
+      - name: Unit and doc tests
+        run: cargo test --all-targets
+
+      - name: Doc tests
+        run: cargo test --doc
+
+      - name: Unit tests, single threaded
+        run: cargo test --lib -- --test-threads=1
+
+  wasm:
+    name: wasm32
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Catches code that only compiles on native, including test code behind cfg(test).
+      - name: Check wasm build
+        run: cargo check --target wasm32-unknown-unknown --features wasm-web --all-targets
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Run wasm smoke tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: "30"
+        run: wasm-pack test --node --features wasm-web --test wasm_smoke
+
+  emulator:
+    name: emulator endpoints
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: firebase-emulator/functions/package-lock.json
+
+      - name: Set up Java (required by the Firestore, Database and Storage emulators)
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Cache emulator binaries
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/firebase/emulators
+          key: firebase-emulators-${{ runner.os }}-${{ hashFiles('firebase-emulator/firebase.json') }}
+
+      - name: Install Firebase CLI and the callable fixtures
+        run: |
+          npm install -g firebase-tools
+          npm ci --prefix firebase-emulator/functions
+
+      - name: Run endpoint tests against the emulators
+        run: scripts/emulator_test.sh
+
+  live:
+    name: online endpoints
+    # Fork PRs cannot read secrets; skip rather than fail.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FIREBASE_GOOGLE_SERVICES_JSON: ${{ secrets.FIREBASE_GOOGLE_SERVICES_JSON }}
+      FIREBASE_TEST_CALLABLE: ${{ secrets.FIREBASE_TEST_CALLABLE }}
+      FIREBASE_APPCHECK_DEBUG_TOKEN: ${{ secrets.FIREBASE_APPCHECK_DEBUG_TOKEN }}
+      # Fail loudly on main if the secret is missing; elsewhere the tests skip gracefully.
+      FIREBASE_LIVE_TESTS_REQUIRED: ${{ github.ref == 'refs/heads/main' && '1' || '0' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Only the services without an emulator run against the online project; everything else runs
+      # in the `emulator` job.
+      - name: Run online-only endpoint tests (Installations, Remote Config, App Check, probe)
+        env:
+          # Keep the installations cache out of the checkout (runner context is step-scoped).
+          FIREBASE_INSTALLATIONS_CACHE_DIR: ${{ runner.temp }}/firebase-installations
+        run: >-
+          cargo test --test live_endpoints -- --ignored --nocapture --test-threads=2
+          installations remote_config app_check live_project_probe

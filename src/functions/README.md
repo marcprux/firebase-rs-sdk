@@ -4,7 +4,7 @@ The `functions` module provides a Rust port of the Firebase Cloud Functions (cli
 applications can invoke HTTPS callable backends from native or WASM targets. The goal is to mirror
 the modular JavaScript API (`@firebase/functions`) while using idiomatic Rust primitives.
 
-Porting status: 25% `[###       ]` ([details](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/functions/PORTING_STATUS.md))
+Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`.
 
 ## Quick Start Example
 

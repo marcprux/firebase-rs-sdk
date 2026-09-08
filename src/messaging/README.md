@@ -2,7 +2,7 @@
 
 Rust implementation of the Firebase Cloud Messaging (FCM) web SDK surface. The goal is to mirror the `@firebase/messaging` APIs so applications can manage web push permissions, registration tokens and foreground/background notifications from Rust (including WASM builds).
 
-Porting status: 40% `[####      ]` ([details](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/messaging/PORTING_STATUS.md))
+Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`.
 
 ## Quick Start Example
 

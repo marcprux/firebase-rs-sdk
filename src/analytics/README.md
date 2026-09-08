@@ -4,7 +4,7 @@ The Analytics module ports the modular `@firebase/analytics` SDK to Rust. It wir
 system so other services can obtain an `Analytics` instance that records events and optionally forwards them to Google
 Analytics using the GA4 Measurement Protocol.
 
-Porting status: 20% `[##         ]` ([details](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/analytics/PORTING_STATUS.md))
+Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`.
 
 
 ## Quick Start Example

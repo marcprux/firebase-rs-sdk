@@ -2,7 +2,7 @@
 
 This module ports Firebase App Check to Rust so client code can obtain, cache, and refresh attestation tokens that protect backend resources from abuse. The Rust port mirrors the modular JS SDK: it exposes an App Check façade, provider implementations, proactive refresh scheduling, IndexedDB persistence for wasm builds, and an internal bridge that other services (Firestore, Storage, etc.) can depend on.
 
-Porting status: 70% `[#######   ]` ([details](https://github.com/dgasparri/firebase-rs-sdk/blob/main/src/app_check/PORTING_STATUS.md))
+Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`.
 
 
 ## Quick Start Example
