@@ -27,7 +27,9 @@ them plus listeners:
 The consequences worth knowing: `SnapshotMetadata::has_pending_writes()` is always `false`, a
 disconnected listener reports nothing rather than serving cached documents, and there is no
 `getDocFromCache`, `waitForPendingWrites` or bundle loading. See
-[`docs/js-sdk-parity.md`](https://github.com/marcprux/firebase-rs-sdk/blob/main/docs/js-sdk-parity.md).
+[`docs/js-sdk-parity.md`](https://github.com/marcprux/firebase-rs-sdk/blob/main/docs/js-sdk-parity.md),
+and [`docs/firestore-offline-design.md`](https://github.com/marcprux/firebase-rs-sdk/blob/main/docs/firestore-offline-design.md)
+for what building the other half would involve.
 
 Coverage: see the [table in the repository README](https://github.com/marcprux/firebase-rs-sdk#coverage), generated from `docs/coverage.toml`.
 

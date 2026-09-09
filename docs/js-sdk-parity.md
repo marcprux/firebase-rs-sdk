@@ -90,7 +90,9 @@ client and adds `on_snapshot` on top of the real gRPC `Listen` stream.** 66% of 
 
 That framing matters because it changes what "the gap" is. Not "our Firestore is half-finished"
 but "our Firestore is a complete-ish thin client, and the offline engine is a separate product
-decision". The consequences to be honest about:
+decision". What that decision would involve — a SQLite local store, what to copy from the Android
+and Web implementations, and what to design fresh — is worked out in
+[`firestore-offline-design.md`](firestore-offline-design.md). The consequences to be honest about:
 
 - `SnapshotMetadata::has_pending_writes` is always `false` here. In the JS SDK a local write shows
   up in listeners immediately, marked pending, before the server acknowledges it. Without a
